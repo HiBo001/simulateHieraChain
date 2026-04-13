@@ -20,7 +20,6 @@ void globalPerformanceStats::startMetrics(){
     monitor_thread.detach();
 }
 
-// 
 void globalPerformanceStats::printPerformanceStats(){
 
     while (true)

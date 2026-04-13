@@ -11,7 +11,7 @@
 using namespace std;
 
 void ShardsManager::printWorkload(){
-
+    
 
 }
 
@@ -23,7 +23,7 @@ void ShardsManager::parseWorkload(){
     std::ifstream file(WorkLoadDir);
     
     if (!file.is_open()) {
-        std::cerr << "无法打开文件: " << WorkLoadDir << std::endl;
+        std::cerr << "无法打开文件1: " << WorkLoadDir << std::endl;
         exit(1);
     }
 
@@ -222,7 +222,7 @@ ShardsManager::ShardsManager(int leafShardCount, int CoordinatorShardCount, stri
 
         std::ifstream file(accessControlListDir);  // 假设你的文本文件名为 input.txt
         if (!file.is_open()) {
-            std::cerr << "无法打开文件" << std::endl;
+            std::cerr << "无法打开文件2" << std::endl;
             exit(1);
         }
         
