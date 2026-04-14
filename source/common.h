@@ -8,19 +8,22 @@ using namespace std;
 #define COMMON_H
 
 // 声明一些全局变量
-extern int orderingCapacity;
-extern int executionCapacity;
-extern int batchFetchSize;
-extern int transactionSendRate;
+namespace Config {
+    extern int orderingCapacity;
+    extern int executionCapacity;
+    extern int batchFetchSize;
+    extern int transactionSendRate;
+    extern string accessControlListDir;
+    extern string shardsTopologyDir;
+    extern string workLoadDir;
+    extern string shardIdDir;
+}
 
 extern std::mutex globalMetricsMutex; // 整体吞吐的延迟的锁
 extern map<int, int> throughputs;
 extern map<int, pair<int, double>> latencys;
 
-extern string accessControlListDir;
-extern string shardsTopologyDir;
-extern string workLoadDir;
-extern string shardIdDir;
+
 
 // 定义交易
 struct transaction{

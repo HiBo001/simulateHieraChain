@@ -10,6 +10,10 @@
 #include <fstream>
 #include <set>
 #include <regex>
+#include <vector>
+#include <algorithm>
+#include <random>
+#include <numeric>
 
 using namespace std;
 
@@ -36,10 +40,10 @@ void Shard::printAccessControlList(){
 
 void Shard::parseAccessControlList(){
     std::map<std::string, std::vector<int>> shardMap;
-    std::ifstream file(accessControlListDir);
+    std::ifstream file(Config::accessControlListDir);
     
     if (!file.is_open()) {
-        std::cerr << "无法打开文件: " << accessControlListDir << std::endl;
+        std::cerr << "无法打开文件: " << Config::accessControlListDir << std::endl;
         exit(1);
     }
 
@@ -158,10 +162,10 @@ void Shard::parseWorkload(){
     std::vector<string> workloadDistribution;
 
     std::vector<std::string> lines;
-    std::ifstream file(workLoadDir);
+    std::ifstream file(Config::workLoadDir);
     
     if (!file.is_open()) {
-        std::cerr << "无法打开文件1: " << workLoadDir << std::endl;
+        std::cerr << "无法打开文件1: " << Config::workLoadDir << std::endl;
         exit(1);
     }
 
@@ -296,9 +300,9 @@ void Shard::printShardTopology(){
 // 这个解析拓扑结构函数需要修改一下，topologyMap 中存储的是 存储 祖先 -> 子分片 的映射，这里的子分片是指位于底层的叶子分片
 // 例如， 1和2祖先是5，3和4祖先是6，5和6的祖先是7，那么7的孩子分片应该是1 2 3 4
 void Shard::parseTopology() {
-    std::ifstream configFile(shardsTopologyDir);
+    std::ifstream configFile(Config::shardsTopologyDir);
     if (!configFile.is_open()) {
-        std::cerr << "无法打开文件: " << shardsTopologyDir << std::endl;
+        std::cerr << "无法打开文件: " << Config::shardsTopologyDir << std::endl;
         exit(1);
     }
 
@@ -391,7 +395,7 @@ void Shard::parseTopology() {
 int Shard::parseShardId(){
 
     int shardId;
-    std::ifstream file(shardIdDir);
+    std::ifstream file(Config::shardIdDir);
     if (!file.is_open()) {
         std::cerr << "无法打开文件！" << std::endl;
         exit(1);
@@ -419,10 +423,41 @@ int Shard::parseShardId(){
     return shardId;
 }
 
-void Shard::generateTransactions(vector<transaction>& txs){
+void Shard::printTransaction(transaction& tx){
+
+    std::cout << "========================================" << std::endl;
+    std::cout << "Transaction ID: " << tx.txId << std::endl;
+    
+    // 打印交易类型
+    std::cout << "Type: " << (tx.type == 1 ? "Intra-Shard" : "Cross-Shard") 
+              << " (" << tx.type << ")" << std::endl;
+
+    // 打印发送时间（保留两位小数）
+    std::cout << "Sended Time: " << std::fixed << std::setprecision(2) 
+              << tx.sendedTime << std::endl;
+
+    // 打印涉及的分片 ID
+    std::cout << "Involved Shards: [ ";
+    for (size_t i = 0; i < tx.invlovedShardIds.size(); ++i) {
+        std::cout << tx.invlovedShardIds[i] 
+                  << (i == tx.invlovedShardIds.size() - 1 ? "" : ", ");
+    }
+    std::cout << " ]" << std::endl;
+
+    // 打印读写集 (RWSet)
+    std::cout << "Read/Write Set: { ";
+    for (size_t i = 0; i < tx.RWSet.size(); ++i) {
+        std::cout << "\"" << tx.RWSet[i] << "\"" 
+                  << (i == tx.RWSet.size() - 1 ? "" : ", ");
+    }
+    std::cout << " }" << std::endl;
+    std::cout << "========================================" << std::endl;
+}
+
+void Shard::generateTransactions(vector<transaction*>& txs){
 
     // 从 intraShardTxsDistribution 和 crossShardTxsDistribution 中寻找当前分片负责生成的任务
-
+    // cout << "开始生成交易...." << endl;
     txsDistribution* myTxsDistribution;
     if (this->role == ShardRole::LEAF) {
         // 1. 在片内交易 map 中查找
@@ -442,73 +477,200 @@ void Shard::generateTransactions(vector<transaction>& txs){
     }
     
     // 开始生成交易, 每次生成 transactionSendRate 笔
-    double second = getCurrentTimestamp();
+    double currentTime = getCurrentTimestamp();
 
-    for(int i = 0; i < transactionSendRate; i++){
+    for(int i = 0; i < Config::transactionSendRate; i++){
 
         string prefixTxId = to_string(shardId) + to_string(txId);
         int type = this->role == ShardRole::LEAF ? 1 : 2;
+
+        // 从  accessControlList 中随机选择两个元素作为本次读写集
+        // 1. 初始化下标向量 [0, 1, 2, ..., n-1]
+        std::vector<size_t> indices(accessControlList.size());
+        std::iota(indices.begin(), indices.end(), 0); 
+
+        // 2. 静态随机数引擎
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+
+        // 3. 洗牌：只洗前两个元素其实就够了（为了效率），或者全洗
+        std::shuffle(indices.begin(), indices.end(), gen);
+
+        // 4. 取出前两个下标对应的元素
+        std::vector<string> rwset;
+        rwset.push_back(to_string(accessControlList[indices[0]]));
+        rwset.push_back(to_string(accessControlList[indices[1]]));
+
+        // 设置 vector<int> invlovedShardIds
+        // 如果 当前分片属于叶子分片, invlovedShard是本地分片
+        // 如果 当前分片属于协调者分片, invlovedShard是随机选中的两个状态所属的分片
+
+        vector<int> invlovedShardIds;
+        if (this->role == ShardRole::LEAF) {
+            // --- 场景 A：当前分片是叶子分片 ---
+            // 交易只涉及本地分片（片内交易）
+            type = 1; // 假设 1 表示片内交易
+            invlovedShardIds.push_back(this->shardId);
+        }else {
+            // --- 场景 B：当前分片是协调者分片 ---
+            type = 2; // 2 表示跨片交易
+            const std::vector<int>& leafPool = topologyMap[this->shardId];
+
+            if (leafPool.size() >= 2) {
+                // 随机选择算法
+                std::vector<int> shuffledPool = leafPool;
+                static std::random_device rd;
+                static std::mt19937 g(rd());
+                
+                // 打乱顺序并取前两个
+                std::shuffle(shuffledPool.begin(), shuffledPool.end(), g);
+                invlovedShardIds.push_back(shuffledPool[0]);
+                invlovedShardIds.push_back(shuffledPool[1]);
+            }
+            else if (!leafPool.empty()) {
+                // 如果管辖的叶子不足两个，则全部加入
+                invlovedShardIds = leafPool;
+            }
+        }
         
-
-
-
-
-
-
-
-
-
-
-
-        // transaction tx = {
-        //     this->role == ShardRole::LEAF:1?2, 
-        //     prefixTxId, 
-        //     {"key1", "key2"}, 
-        //     {1}, 
-        //     1648752000.0
-        // };
-
-
-        // // tx.type = 1;
-
-        // // tx.txId = prefix_txid;
-
-        // // tx.sendedTime = second;
-
-        // txs.push_back(tx);
-        // txId++;
+        transaction tx = {type, prefixTxId, rwset, invlovedShardIds, currentTime};
+        txs.push_back(&tx);
+        // printTransaction(tx);
+        txId++;
     }
-
-
-
-
-
-
+    // cout << "本轮交易生成完毕...." << endl;
 }
 
 void Shard::enqueueTransactions(){
 
-    int addThread = 80000;
+    while (true){
+        vector<transaction*> txs;
+        generateTransactions(txs); // 生成交易
 
-    while (true)
-    {
-        vector<transaction> txs;
-        generateTransactions(txs);
-
-        mempoolMutex.lock(); // 手动加锁
+        mempoolMutex.lock(); // 加锁
         int tx_size = txs.size();
         for(int i = 0; i < tx_size; i++){
-            transactionMempool.push(txs.at(i));
+            transactionMempool.push(txs.at(i)); // 交易进入交易池
         }
-        mempoolMutex.unlock(); // 手动加锁
+        mempoolMutex.unlock(); // 解锁
 
-        int remaining_per = double(addThread - tx_size) / addThread * 1000;
-        std::this_thread::sleep_for(std::chrono::milliseconds(remaining_per)); // 模拟共识过程
-        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 模拟客户端发送速度
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // 客户端每1秒发送1次(txs中包含 transactionSendRate 笔交易)
     }
 }
 
-void Shard::enqueueRemoteTransactions(vector<transaction>& txs){
+void Shard::fetchTransactions() { 
+    while (true) {
+        std::vector<transaction*> txs;
+        int remove_size = 0;
+
+        // 1. 只有从内存池提取数据时才锁定 mempool
+        mempoolMutex.lock(); 
+        if (!transactionMempool.empty()) {
+            int current_mempool_size = transactionMempool.size();
+            
+            // 每次最多拿 orderingCapacity 笔
+            remove_size = std::min(current_mempool_size, orderingCapacity);
+
+            for (int i = 0; i < remove_size; i++) {
+                auto tx = transactionMempool.front();
+                txs.push_back(tx);
+                transactionMempool.pop();
+            }
+        }
+        mempoolMutex.unlock(); // 提取完毕立即释放，允许 generateTransactions 继续存入
+
+        // // 2. 如果拿到了交易，开始处理性能统计和共识 // 这个放在执行部分
+        // if (!txs.empty()) {
+        //     // performance_mtx.lock();  // 保护统计变量
+            
+        //     double time = getCurrentTimestamp();
+        //     for (auto tx : txs) {
+        //         // 根据交易类型计算贡献度
+        //         if (tx->type == 1) {
+        //             committedTxCount += 1.0;
+        //         } else if (tx->type == 2) {
+        //             committedTxCount += 0.5; // 跨片交易可能只贡献一半工作量
+        //         }
+
+        //         double latency = time - tx->sendedTime;
+        //         totalLatency += latency;
+        //     }
+        //     committedSubTxCount += remove_size;
+            
+        //     performance_mtx.unlock(); 
+
+        //     // 3. 执行共识 (在锁外执行，避免阻塞其他线程)
+        //     runConsensus(txs);
+        // }
+
+        // 4. 模拟共识耗时 (Ordering Latency)
+        // 逻辑：如果拿得少，说明负载低，睡眠时间稍长；如果拿满了，说明负载高，处理会更快连续
+        int sleep_time = double(remove_size) / orderingCapacity * 1000;        
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time + 10)); 
+        // cout << "remove_size = "<< remove_size << ", 交易共识完毕..." << endl;
+    }
+}
+
+// void Shard::fetchTransactions(){ // 从交易池子中拿交易 (每次最多拿 orderingCapacity 笔)
+    
+//     while (true){
+//         mempoolMutex.lock(); // 手动加锁
+
+//         int remove_size = 0;
+
+//         if(!transactionMempool.empty()){
+
+//             performance_mtx.lock();  // 加锁
+
+//             // double time = getCurrentTimestamp();
+//             vector<transaction*> txs;
+//             int remaining_size = transactionMempool.size(); // 交易池中剩下的交易数
+
+//             if(remaining_size >= batchFetchSize){
+//                 remove_size = batchFetchSize;
+//             }
+//             else{
+//                 remove_size = remaining_size;
+//             }
+
+//             // int execution_workload = 0;
+//             for(int i = 0; i < remove_size; i++){
+
+//                 auto tx = transactionMempool.front();
+//                 txs.push_back(tx);
+//                 transactionMempool.pop();
+
+//                 if(tx->type == 1){
+//                     // execution_workload += 1;
+//                     committedTxCount += 1;
+//                 }
+//                 else if(tx->type == 2){
+//                     // execution_workload += 1;
+//                     committedTxCount += 0.5;
+//                 }
+
+//                 // double latency = time - tx->sendedTime;
+//                 // totalLatency += latency;
+//             }
+
+//             committedSubTxCount += remove_size;
+
+//             performance_mtx.unlock(); // 解锁
+
+//             // 调换顺序
+//             runConsensus(txs);
+//             // executionTxs(txs);
+//         }
+
+//         mempoolMutex.unlock(); // 手动释放锁
+
+//         int remaining_per = double(orderingCapacity - remove_size) / orderingCapacity * 1000;
+//         std::this_thread::sleep_for(std::chrono::milliseconds(remaining_per)); // 模拟共识过程
+//         std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 模拟共识过程
+//     }
+// }
+
+void Shard::enqueueRemoteTransactions(vector<transaction*>& txs){
 
     mempoolMutex.lock(); // 手动加锁
 
@@ -520,72 +682,13 @@ void Shard::enqueueRemoteTransactions(vector<transaction>& txs){
     mempoolMutex.unlock(); // 手动加锁
 }
 
-void Shard::fetchTransactions(){
-    while (true)
-    {
-        mempoolMutex.lock(); // 手动加锁
-
-        int remove_size = 0;
-
-        if(!transactionMempool.empty()){
-
-            performance_mtx.lock();  // 加锁
-
-            double time = getCurrentTimestamp();
-            vector<transaction> txs;
-            int remaining_size = transactionMempool.size(); // 交易池中剩下的交易数
-
-            if(remaining_size >= batchFetchSize){
-                remove_size = batchFetchSize;
-            }
-            else{
-                remove_size = remaining_size;
-            }
-
-            // int execution_workload = 0;
-            for(int i = 0; i < remove_size; i++){
-
-                auto tx = transactionMempool.front();
-                txs.push_back(tx);
-                transactionMempool.pop();
-
-                if(tx.type == 1){
-                    // execution_workload += 1;
-                    committedTxCount += 1;
-                }
-                else if(tx.type == 2){
-                    // execution_workload += 1;
-                    committedTxCount += 0.5;
-                }
-
-                double latency = time - tx.sendedTime;
-                totalLatency += latency;
-            }
-
-            committedSubTxCount += remove_size;
-
-            performance_mtx.unlock(); // 解锁
-
-            // 调换顺序
-            runConsensus(txs);
-            // executionTxs(txs);
-        }
-
-        mempoolMutex.unlock(); // 手动释放锁
-
-        int remaining_per = double(orderingCapacity - remove_size) / orderingCapacity * 1000;
-        std::this_thread::sleep_for(std::chrono::milliseconds(remaining_per)); // 模拟共识过程
-        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 模拟共识过程
-    }
-}
-
-void Shard::runConsensus(vector<transaction>& txs){
+void Shard::runConsensus(vector<transaction*>& txs){
     int tx_size = txs.size();
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     // std::this_thread::sleep_for(std::chrono::milliseconds(int((float(tx_size) / order_capability) * 500)));
 }
 
-void Shard::executeTransactions(vector<transaction>& txs){
+void Shard::executeTransactions(vector<transaction*>& txs){
 
     std::lock_guard<std::mutex> performance_lock(performance_mtx);
 
@@ -594,11 +697,11 @@ void Shard::executeTransactions(vector<transaction>& txs){
     int execution_workload = 0;
 
     for(int i = 0; i < tx_size; i++){ // 交易的总执行负载
-        if(txs.at(i).type == 1){
+        if(txs.at(i)->type == 1){
             execution_workload += 1;
             committedTxCount += 1;
         }
-        else if(txs.at(i).type == 2) {
+        else if(txs.at(i)->type == 2) {
             execution_workload += 1;
             committedTxCount += 0.5;
         }
@@ -610,7 +713,7 @@ void Shard::executeTransactions(vector<transaction>& txs){
 
     double time = getCurrentTimestamp();
     for(int i = 0; i < tx_size; i++){
-        double latency = time - txs.at(i).sendedTime;
+        double latency = time - txs.at(i)->sendedTime;
         totalLatency += latency;
     }
 }
@@ -679,10 +782,10 @@ void Shard::startMetrics(){ // 统计分片当前的交易吞吐和延迟
 
 Shard::Shard() {
 
-    this->orderingCapacity = orderingCapacity;
-    this->executionCapacity = executionCapacity;
-    this->batchFetchSize = batchFetchSize;
-    this->transactionSendRate = transactionSendRate;
+    this->orderingCapacity = Config::orderingCapacity;
+    this->executionCapacity = Config::executionCapacity;
+    this->batchFetchSize = Config::batchFetchSize;
+    this->transactionSendRate = Config::transactionSendRate;
 
     // 获取分片id
     this->shardId = parseShardId();

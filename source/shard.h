@@ -37,7 +37,7 @@ public:
     double totalLatency = 0;
 
     std::vector<int> accessControlList; // 状态权限目录
-    std::queue<transaction> transactionMempool; // 交易池
+    std::queue<transaction*> transactionMempool; // 交易池
 
     std::map<int, std::vector<int>> topologyMap; // 存储 祖先 -> 子分片 的映射
     std::map<int, int> parentMap; // 存储 子分片 -> 父分片 的反向映射，用于向上追溯
@@ -52,12 +52,14 @@ private:
 public:
     
     Shard(); // 初始化函数
-    void generateTransactions(vector<transaction>& txs); // 生成交易
+    void generateTransactions(vector<transaction*>& txs); // 生成交易
+    void printTransaction(transaction& tx);
+
     void enqueueTransactions(); // 向交易池添加一批新来的交易
-    void enqueueRemoteTransactions(vector<transaction>& txs); // 向交易池添加一份
+    void enqueueRemoteTransactions(vector<transaction*>& txs); // 向交易池添加一份
     void fetchTransactions(); // 从交易池取走一部分交易、最多processBatch个
-    void runConsensus(vector<transaction>& txs); // 对拿到的交易进行共识
-    void executeTransactions(vector<transaction>& txs); // 执行共识晚的一批交易
+    void runConsensus(vector<transaction*>& txs); // 对拿到的交易进行共识
+    void executeTransactions(vector<transaction*>& txs); // 执行共识晚的一批交易
     void printPerformanceStats();
     void startMetrics(); // 计算分片当前的交易吞吐和延迟
     void start(); // 启动分片
