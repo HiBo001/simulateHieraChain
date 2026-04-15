@@ -599,6 +599,12 @@ void Shard::runExecution(){
                 simulateExecution();
             }else{ // 跨片交易
                 
+                
+
+
+
+
+
             }
         }
 
