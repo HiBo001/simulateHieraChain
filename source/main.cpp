@@ -16,7 +16,7 @@ namespace Config {
     int executionCapacity = 8000;
     int batchFetchSize = 5000;
     int transactionSendRate = 2000;
-    string ownedStateIdsDir = "../../ownedStateIds";
+    string ownedStateIdsDir = "../../accessControlList";
     string shardsTopologyDir = "../../shardsTopology";
     string workLoadDir = "../../workloadProfile";
     string shardIdDir = "../../shardId";
