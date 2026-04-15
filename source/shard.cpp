@@ -191,13 +191,22 @@ void Shard::runExecution(){
         executionMempoolMutex.unlock();
 
         // 5. 后续处理拿到的交易
+        int executedIntraTxCount = 0;
+        double totalLatency = 0;
+        double currentTime = helper->getCurrentTimestamp();
+
+        bool existIntraTransactions = false;
         for (auto tx : txsToExecute) {
             // 因为 tx 是指针，使用 -> 访问成员
             // std::cout << "处理交易: " << tx->txId << std::endl;
             
             // 执行具体逻辑
             if (tx->type == 1) { // 片内交易
+                existIntraTransactions = true;
                 simulateExecution();
+                executedIntraTxCount++;
+                double latency = currentTime - tx->sendedTime;
+                totalLatency += latency;
             }else{ // 跨片交易
                 
                 // 核心逻辑：解析 RWSet 判定目标分片
@@ -223,9 +232,15 @@ void Shard::runExecution(){
                 if (!pendingSendQueue.empty()) {
                     // 待补充通信逻辑.....
 
-
                 }
             }
+        }
+
+        if(existIntraTransactions){ // 这里执行的时候只能统计到片内交易的信息，跨片需要协调者分片收齐commit消息后统一处理
+            performanceMetricsMutex.lock();
+            committedTxCount += executedIntraTxCount; // 调整 committedTxCount
+            committedTxTotalLatency += totalLatency;
+            performanceMetricsMutex.unlock();
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -261,48 +276,6 @@ void Shard::runConsensus() {
     }
 }
 
-void Shard::enqueueRemoteTransactions(vector<transaction*>& txs){
-
-    mempoolMutex.lock(); // 手动加锁
-
-    int tx_size = txs.size();
-    for(int i = 0; i < tx_size; i++){
-        transactionMempool.push(txs.at(i));
-    }
-
-    mempoolMutex.unlock(); // 手动加锁
-}
-
-void Shard::executeTransactions(vector<transaction*>& txs){
-
-    std::lock_guard<std::mutex> performance_lock(performance_mtx);
-
-    // 暂时假设系统中全部是片内交易
-    int tx_size = txs.size();
-    int execution_workload = 0;
-
-    for(int i = 0; i < tx_size; i++){ // 交易的总执行负载
-        if(txs.at(i)->type == 1){
-            execution_workload += 1;
-            committedTxCount += 1;
-        }
-        else if(txs.at(i)->type == 2) {
-            execution_workload += 1;
-            committedTxCount += 0.5;
-        }
-    }
-
-    // std::this_thread::sleep_for(std::chrono::milliseconds(int((float(execution_workload) / execution_capability) * 500)));
-
-    committedSubTxCount += tx_size;
-
-    double time = helper->getCurrentTimestamp();
-    for(int i = 0; i < tx_size; i++){
-        double latency = time - txs.at(i)->sendedTime;
-        totalLatency += latency;
-    }
-}
-
 void Shard::start(){
 
     // 生成交易并向交易池添加交易
@@ -335,21 +308,18 @@ void Shard::start(){
 
 void Shard::printPerformanceStats(){
 
-    std::lock_guard<std::mutex> performance_lock(performance_mtx);
+    performanceMetricsMutex.lock();
+    
+    if(committedTxCount == 0){
+        cout << "当前分片"<< shardId << ", tps = 0" << "latency = 0" << endl;
+    }else{
+        cout << "当前分片" << shardId << ", tps = "<< committedTxCount << ", latency = "<< committedTxTotalLatency / committedTxCount << endl;
+    }
 
-    // if(committedTxCount == 0){
-    //     // cout << "分片"<< shardid << "交易延迟 = 0" << endl;
-    //     // cout << "分片"<< shardid << "交易吞吐 = 0" << endl;
-    // }
-    // else{
-    //     throughputs.at(shardId) = committedTxCount;
-    //     auto latency = make_pair(committedSubTxCount, totalLatency);
-    //     latencys.at(shardId) = latency;
-    //     cout << "分片" << shardid << "交易吞吐 = "<< committedTxCount << ", 交易延迟 = "<< total_latency / committedTxCount << endl;
-    //     committedTxCount = 0;
-    //     committedSubTxCount = 0;
-    //     totalLatency = 0;
-    // }
+    committedTxTotalLatency = 0;
+    committedTxCount = 0;
+    committedSubTxCount = 0;
+    performanceMetricsMutex.unlock();
 }
 
 void Shard::startMetrics(){ // 统计分片当前的交易吞吐和延迟

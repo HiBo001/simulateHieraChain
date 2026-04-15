@@ -37,7 +37,7 @@ public:
     // 用于统计交易吞吐和延迟的变量
     double committedTxCount = 0; // 1s内提交的交易数量
     double committedSubTxCount = 0; // 1s内提交的交易数量(跨片交易按1笔交易算)
-    double totalLatency = 0;
+    double committedTxTotalLatency = 0;
 
     std::map<int, vector<int>>shardToOwnedStateIds; // shardid -> ownedStateIds
     std::vector<int> ownedStateIds; // 状态权限目录
@@ -54,7 +54,7 @@ private:
     std::unique_ptr<ShardHelper> helper;
     std::mutex mempoolMutex; // 交易池读写互斥锁
     std::mutex executionMempoolMutex; // 交易池读写互斥锁
-    std::mutex performance_mtx; // 当前分片的交易吞吐和延迟性能读写锁
+    std::mutex performanceMetricsMutex; // 当前分片的交易吞吐和延迟性能读写锁
 
 public:
     
@@ -62,17 +62,13 @@ public:
     ~Shard();
     void generateTransactions(vector<transaction*>& txs); // 生成交易
     void printTransaction(transaction& tx);
-
     void enqueueTransactions(); // 向交易池添加一批新来的交易
-    void enqueueRemoteTransactions(vector<transaction*>& txs); // 向交易池添加一份
-    
     void runExecution();
     void runConsensus(); // 从交易池取走一部分交易、最多processBatch个
-    void executeTransactions(vector<transaction*>& txs); // 执行共识晚的一批交易
     void printPerformanceStats();
     void startMetrics(); // 计算分片当前的交易吞吐和延迟
     void start(); // 启动分片
-    void simulateExecution(int complexity = 100);
+    void simulateExecution(int complexity = 500);
 };
 
 #endif // SHARD_H

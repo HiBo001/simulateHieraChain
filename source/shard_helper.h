@@ -9,7 +9,6 @@ class ShardHelper {
 public:
     explicit ShardHelper(Shard& shard);
 
-    double getCurrentTimestamp();
     int parseShardId();
     void parseTopology();
     void printShardTopology();
@@ -19,6 +18,7 @@ public:
     void parseOwnedStateIds();
     void printOwnedStateIds();
     int lookupShardByState(std::string stateId);
+    double getCurrentTimestamp();
 
 private:
     Shard& shard;
