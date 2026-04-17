@@ -20,6 +20,7 @@ namespace Config {
     string shardsTopologyDir = "../../shardsTopology";
     string workLoadDir = "../../workloadProfile";
     string shardIdDir = "../../shardId";
+    string networkConfigDir = "../../networkConfig";
 }
 
 // 全局变量

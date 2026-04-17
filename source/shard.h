@@ -5,6 +5,7 @@
 #include <iostream>
 #include <memory>
 #include "common.h"
+#include "network.h"
 
 using namespace std;
 
@@ -52,6 +53,7 @@ public:
 
 private:
     std::unique_ptr<ShardHelper> helper;
+    std::unique_ptr<NetworkManager> networkManager;
     std::mutex mempoolMutex; // 交易池读写互斥锁
     std::mutex executionMempoolMutex; // 交易池读写互斥锁
     std::mutex performanceMetricsMutex; // 当前分片的交易吞吐和延迟性能读写锁

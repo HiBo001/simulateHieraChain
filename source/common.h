@@ -17,6 +17,7 @@ namespace Config {
     extern string shardsTopologyDir;
     extern string workLoadDir;
     extern string shardIdDir;
+    extern string networkConfigDir;
 }
 
 extern std::mutex globalMetricsMutex; // 整体吞吐的延迟的锁

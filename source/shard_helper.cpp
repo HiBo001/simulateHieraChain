@@ -120,7 +120,7 @@ void ShardHelper::parseOwnedStateIds() {
             int childShardId = *it;
 
             auto subownedStateIds = shardMap[to_string(childShardId)];
-            shard.shardToOwnedStateIds.insert(make_pair(childShardId, shard.ownedStateIds));
+            shard.shardToOwnedStateIds.insert(make_pair(childShardId, subownedStateIds));
 
             // 遍历 subownedStateIds 中的每个元素
             for (std::vector<int>::iterator subIt = subownedStateIds.begin();

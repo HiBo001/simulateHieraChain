@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <random>
 #include <numeric>
+#include "message.h"
 
 using namespace std;
 
@@ -230,8 +231,29 @@ void Shard::runExecution(){
 
                 // 3. 模拟发送逻辑（将待发送集合转发给通信模块）
                 if (!pendingSendQueue.empty()) {
-                    // 待补充通信逻辑.....
+                    for (const auto& entry : pendingSendQueue) {
+                        int dstShardId = entry.first;
+                        const std::vector<transaction*>& txs = entry.second;
+                        std::ostringstream bodyStream;
+                        bodyStream << "txCount=" << txs.size() << ";txIds=";
+                        for (size_t i = 0; i < txs.size(); ++i) {
+                            bodyStream << txs[i]->txId;
+                            if (i + 1 < txs.size()) {
+                                bodyStream << ",";
+                            }
+                        }
 
+                        Message requestMsg{
+                            static_cast<int>(MessageType::MSG_CROSS_TX_REQUEST),
+                            this->shardId,
+                            dstShardId,
+                            bodyStream.str()
+                        };
+
+                        if (networkManager) {
+                            networkManager->sendMessage(requestMsg);
+                        }
+                    }
                 }
             }
         }
@@ -277,6 +299,10 @@ void Shard::runConsensus() {
 }
 
 void Shard::start(){
+    if (networkManager && !networkManager->start()) {
+        std::cerr << "分片 " << this->shardId << " 启动通信监听失败，进程退出。" << std::endl;
+        exit(1);
+    }
 
     // 生成交易并向交易池添加交易
     std::thread injectTxThread([this] {
@@ -348,8 +374,36 @@ Shard::Shard() : helper(new ShardHelper(*this)) {
 
     helper->parseWorkload(); // 解析负载
     helper->printWorkload();
+
+    networkManager = std::unique_ptr<NetworkManager>(new NetworkManager(this->shardId));
+    if (!networkManager->loadConfig(Config::networkConfigDir)) {
+        std::cerr << "加载网络配置失败: " << Config::networkConfigDir << std::endl;
+        exit(1);
+    }
+
+    networkManager->registerHandler(MessageType::MSG_CROSS_TX_REQUEST, [this](const Message& msg) {
+        std::cout << "[Shard " << this->shardId << "] 收到跨片请求, from=" << msg.srcShardId
+                  << ", body=" << msg.body << std::endl;
+
+        Message voteMsg{
+            static_cast<int>(MessageType::MSG_CROSS_TX_VOTE),
+            this->shardId,
+            msg.srcShardId,
+            "vote=ACK;requestFrom=" + std::to_string(msg.srcShardId)
+        };
+        networkManager->sendMessage(voteMsg);
+    });
+
+    networkManager->registerHandler(MessageType::MSG_CROSS_TX_VOTE, [this](const Message& msg) {
+        std::cout << "[Shard " << this->shardId << "] 收到投票响应, from=" << msg.srcShardId
+                  << ", body=" << msg.body << std::endl;
+    });
 }
 
-Shard::~Shard() {}
+Shard::~Shard() {
+    if (networkManager) {
+        networkManager->stop();
+    }
+}
 
 #endif // SHARD_CPP
