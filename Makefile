@@ -1,7 +1,7 @@
 # Makefile for building the shard project
 
 CXX = g++
-CXXFLAGS = -std=c++11 -g -Wall
+CXXFLAGS = -std=c++17 -g -Wall
 LDFLAGS = -pthread
 
 # 目录结构
@@ -86,4 +86,3 @@ help:
 
 # # Phony targets
 # .PHONY: all clean
-
