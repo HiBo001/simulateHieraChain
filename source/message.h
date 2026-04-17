@@ -5,23 +5,21 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include "common.h"
 
-enum class MessageType : int {
-    MSG_CROSS_TX_REQUEST = 1,
-    MSG_CROSS_TX_VOTE = 2,
-    MSG_CROSS_TX_COMMIT = 3,
-    MSG_HEARTBEAT = 4,
-    MSG_CUSTOM = 1000
+enum class MessageType : int { // 消息类型
+    CROSS_SHARD_TX_REQUEST = 1,
+    CROSS_SHARD_TX_COMMIT_MSG = 2
 };
 
-struct Message {
+struct Message { // 消息结构体
     int type;
     int srcShardId;
     int dstShardId;
-    std::string body;
+    vector<transaction> txs;
 };
 
-std::string serializeMessagePayload(const Message& msg);
+std::string serializeMessagePayload(const Message& msg); //
 bool deserializeMessagePayload(const std::string& payload, Message& outMessage);
 std::string messageTypeToString(int type);
 
@@ -32,12 +30,14 @@ public:
     MessageDispatcher();
     void registerHandler(MessageType type, Handler handler);
     void registerCustomHandler(int type, Handler handler);
-    void setDefaultHandler(Handler handler);
     void dispatch(const Message& message) const;
+    // void setDefaultHandler(Handler handler);
 
 private:
     void registerBuiltInDefaultHandlers();
     void defaultLogHandler(const Message& message) const;
+    void crossShardTxsHandler(const Message& message) const;
+    void crossShardCommittedMsgHandler(const Message& message) const;
 
 private:
     mutable std::mutex handlersMutex;

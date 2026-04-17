@@ -16,11 +16,11 @@ namespace Config {
     int executionCapacity = 8000;
     int batchFetchSize = 5000;
     int transactionSendRate = 8000;
-    string ownedStateIdsDir = "../../accessControlList";
-    string shardsTopologyDir = "../../shardsTopology";
-    string workLoadDir = "../../workloadProfile";
-    string shardIdDir = "../../shardId";
-    string networkConfigDir = "../../networkConfig";
+    string ownedStateIdsDir = "../accessControlList";
+    string shardsTopologyDir = "../shardsTopology";
+    string workLoadDir = "../workloadProfile";
+    string shardIdDir = "shardId";
+    string networkConfigDir = "../networkConfig";
 }
 
 // 全局变量
@@ -30,13 +30,16 @@ map<int, pair<int, double>> latencys; // 每个分片的所有交易延迟
 int main(){
 
     Shard* shard = new Shard();
-
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-
     shard->start();
 
-    // 主线程常驻
-    while (true) {
+    // 测试发送
+    if (shard->shardId == 5){
+        Message msg = {1, 5, 1, {}};
+        shard->networkManager->sendMessage(msg, 5, 10);
+    }
+
+    while (true) { // 主线程常驻
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
     

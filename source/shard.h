@@ -51,7 +51,7 @@ public:
     map<int, txsDistribution> intraShardTxsDistribution; // 片内交易负载
     map<int, txsDistribution> crossShardTxsDistribution; // 跨片交易负载 
 
-private:
+// private:
     std::unique_ptr<ShardHelper> helper;
     std::unique_ptr<NetworkManager> networkManager;
     std::mutex mempoolMutex; // 交易池读写互斥锁
@@ -71,6 +71,7 @@ public:
     void startMetrics(); // 计算分片当前的交易吞吐和延迟
     void start(); // 启动分片
     void simulateExecution(int complexity = 500);
+    void initNetwork(); // 初始化分片的网络模块
 };
 
 #endif // SHARD_H

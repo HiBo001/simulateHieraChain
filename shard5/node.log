@@ -1,0 +1,49 @@
+网络模块初始化成功: ../networkConfig
+
+========== Shard Topology Report ==========
+Ancestor ID     | Child Shard IDs
+-------------------------------------------
+5               | [ 1, 2 ]
+6               | [ 3, 4 ]
+7               | [ 1, 2, 3, 4 ]
+===========================================
+
+Access Control List for Shard 5: 72, 15, 93, 41, 28, 56, 84, 9, 63, 37, 100, 22, 78, 44, 5, 91, 68, 12, 49, 87, 33, 59, 76, 2, 96, 19, 81, 55, 30, 64, 11, 47, 8, 95, 25, 70, 39, 52, 17
+shard1_inner:2000
+shard2_inner:2000
+shard3_inner:2000
+shard4_inner:2000
+shard1_shard2:2000
+shard3_shard4:2000
+shard2_shard3:2000
+解析负载完成...
+--- Intra-Shard Txs Distribution ---
+[ID: 1] Type: Intra | Count: 2000 | Involved Shards: [1]
+[ID: 2] Type: Intra | Count: 2000 | Involved Shards: [2]
+[ID: 3] Type: Intra | Count: 2000 | Involved Shards: [3]
+[ID: 4] Type: Intra | Count: 2000 | Involved Shards: [4]
+
+--- Cross-Shard Txs Distribution ---
+[ID: 5] Type: Cross | Count: 2000 | Involved Shards: [1, 2]
+[ID: 6] Type: Cross | Count: 2000 | Involved Shards: [3, 4]
+[ID: 7] Type: Cross | Count: 2000 | Involved Shards: [2, 3]
+
+启动分片5 ...
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0

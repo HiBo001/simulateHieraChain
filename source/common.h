@@ -1,6 +1,7 @@
 #include <string>
 #include <queue>
 #include <map>
+#include <sstream>
 
 using namespace std;
 
@@ -32,6 +33,50 @@ struct transaction{
     vector<string> RWSet; // 交易读写集
     vector<int> invlovedShardIds;
     double sendedTime;
+
+    // 将 transaction 内部序列化为一个字符串
+    std::string serialize() const {
+        std::ostringstream oss;
+        oss << type << "," << txId << ",";
+        
+        // 处理 RWSet (使用 # 分隔)
+        for (size_t i = 0; i < RWSet.size(); ++i) {
+            oss << RWSet[i] << (i == RWSet.size() - 1 ? "" : "#");
+        }
+        oss << ",";
+
+        // 处理 invlovedShardIds (使用 # 分隔)
+        for (size_t i = 0; i < invlovedShardIds.size(); ++i) {
+            oss << invlovedShardIds[i] << (i == invlovedShardIds.size() - 1 ? "" : "#");
+        }
+        oss << "," << sendedTime;
+        
+        return oss.str();
+    }
+
+    // 从字符串解析回 transaction
+    static transaction deserialize(const std::string& s) {
+        std::vector<std::string> parts;
+        std::string part;
+        std::istringstream iss(s);
+        while (std::getline(iss, part, ',')) parts.push_back(part);
+
+        transaction tx;
+        tx.type = std::stoi(parts[0]);
+        tx.txId = parts[1];
+
+        // 解析 RWSet
+        std::istringstream rss(parts[2]);
+        std::string item;
+        while (std::getline(rss, item, '#')) if(!item.empty()) tx.RWSet.push_back(item);
+
+        // 解析 invlovedShardIds
+        std::istringstream iss_ids(parts[3]);
+        while (std::getline(iss_ids, item, '#')) if(!item.empty()) tx.invlovedShardIds.push_back(std::stoi(item));
+
+        tx.sendedTime = std::stod(parts[4]);
+        return tx;
+    }
 };
 
 // 定义交易

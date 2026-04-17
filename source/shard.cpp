@@ -232,27 +232,27 @@ void Shard::runExecution(){
                 // 3. 模拟发送逻辑（将待发送集合转发给通信模块）
                 if (!pendingSendQueue.empty()) {
                     for (const auto& entry : pendingSendQueue) {
-                        int dstShardId = entry.first;
-                        const std::vector<transaction*>& txs = entry.second;
-                        std::ostringstream bodyStream;
-                        bodyStream << "txCount=" << txs.size() << ";txIds=";
-                        for (size_t i = 0; i < txs.size(); ++i) {
-                            bodyStream << txs[i]->txId;
-                            if (i + 1 < txs.size()) {
-                                bodyStream << ",";
-                            }
-                        }
+                        // int dstShardId = entry.first;
+                        // const std::vector<transaction*>& txs = entry.second;
+                        // std::ostringstream bodyStream;
+                        // bodyStream << "txCount=" << txs.size() << ";txIds=";
+                        // for (size_t i = 0; i < txs.size(); ++i) {
+                        //     bodyStream << txs[i]->txId;
+                        //     if (i + 1 < txs.size()) {
+                        //         bodyStream << ",";
+                        //     }
+                        // }
 
-                        Message requestMsg{
-                            static_cast<int>(MessageType::MSG_CROSS_TX_REQUEST),
-                            this->shardId,
-                            dstShardId,
-                            bodyStream.str()
-                        };
+                        // Message requestMsg{
+                        //     static_cast<int>(MessageType::MSG_CROSS_TX_REQUEST),
+                        //     this->shardId,
+                        //     dstShardId,
+                        //     bodyStream.str()
+                        // };
 
-                        if (networkManager) {
-                            networkManager->sendMessage(requestMsg);
-                        }
+                        // if (networkManager) {
+                        //     networkManager->sendMessage(requestMsg);
+                        // }
                     }
                 }
             }
@@ -299,7 +299,7 @@ void Shard::runConsensus() {
 }
 
 void Shard::start(){
-    if (networkManager && !networkManager->start()) {
+    if (networkManager && !networkManager->start()) { // 启动网络监听线程
         std::cerr << "分片 " << this->shardId << " 启动通信监听失败，进程退出。" << std::endl;
         exit(1);
     }
@@ -337,9 +337,9 @@ void Shard::printPerformanceStats(){
     performanceMetricsMutex.lock();
     
     if(committedTxCount == 0){
-        cout << "当前分片"<< shardId << ", tps = 0" << "latency = 0" << endl;
+        cout << "当前分片"<< shardId << ", tps = 0, " << "latency = 0" << endl;
     }else{
-        cout << "当前分片" << shardId << ", tps = "<< committedTxCount << ", latency = "<< committedTxTotalLatency / committedTxCount << endl;
+        cout << "当前分片" << shardId << ", tps = "<< committedTxCount << " , latency = "<< committedTxTotalLatency / committedTxCount << endl;
     }
 
     committedTxTotalLatency = 0;
@@ -356,6 +356,36 @@ void Shard::startMetrics(){ // 统计分片当前的交易吞吐和延迟
     }
 }
 
+// 初始化分片的网络模块
+void Shard::initNetwork(){
+    
+    networkManager = std::unique_ptr<NetworkManager>(new NetworkManager(this->shardId));
+    if (!networkManager->loadConfig(Config::networkConfigDir)) {
+        std::cout << "加载网络配置失败: " << Config::networkConfigDir << std::endl;
+        exit(1);
+    }else{
+        std::cout << "网络模块初始化成功: " << Config::networkConfigDir << std::endl;
+    }
+
+    // 注册消息包处理函数
+    networkManager->registerHandler(MessageType::CROSS_SHARD_TX_REQUEST, [this](const Message& msg) {
+        std::cout << "收到了来自分片 " << msg.srcShardId << "的跨片交易" << endl;
+    
+        //     Message voteMsg{
+        //         static_cast<int>(MessageType::MSG_CROSS_TX_VOTE),
+        //         this->shardId,
+        //         msg.srcShardId,
+        //         "vote=ACK;requestFrom=" + std::to_string(msg.srcShardId)
+        //     };
+        //     networkManager->sendMessage(voteMsg);
+    });
+
+    networkManager->registerHandler(MessageType::CROSS_SHARD_TX_COMMIT_MSG, [this](const Message& msg) {
+        std::cout << "收到了来自分片 " << msg.srcShardId << "的跨片交易提交消息" << endl;
+    });
+}
+
+
 Shard::Shard() : helper(new ShardHelper(*this)) {
 
     this->orderingCapacity = Config::orderingCapacity;
@@ -365,6 +395,7 @@ Shard::Shard() : helper(new ShardHelper(*this)) {
 
     // 获取分片id
     this->shardId = helper->parseShardId();
+    initNetwork(); // 初始化网络模块
 
     helper->parseTopology(); // 解析系统拓扑
     helper->printShardTopology(); // 打印系统拓扑结构
@@ -374,30 +405,6 @@ Shard::Shard() : helper(new ShardHelper(*this)) {
 
     helper->parseWorkload(); // 解析负载
     helper->printWorkload();
-
-    networkManager = std::unique_ptr<NetworkManager>(new NetworkManager(this->shardId));
-    if (!networkManager->loadConfig(Config::networkConfigDir)) {
-        std::cerr << "加载网络配置失败: " << Config::networkConfigDir << std::endl;
-        exit(1);
-    }
-
-    networkManager->registerHandler(MessageType::MSG_CROSS_TX_REQUEST, [this](const Message& msg) {
-        std::cout << "[Shard " << this->shardId << "] 收到跨片请求, from=" << msg.srcShardId
-                  << ", body=" << msg.body << std::endl;
-
-        Message voteMsg{
-            static_cast<int>(MessageType::MSG_CROSS_TX_VOTE),
-            this->shardId,
-            msg.srcShardId,
-            "vote=ACK;requestFrom=" + std::to_string(msg.srcShardId)
-        };
-        networkManager->sendMessage(voteMsg);
-    });
-
-    networkManager->registerHandler(MessageType::MSG_CROSS_TX_VOTE, [this](const Message& msg) {
-        std::cout << "[Shard " << this->shardId << "] 收到投票响应, from=" << msg.srcShardId
-                  << ", body=" << msg.body << std::endl;
-    });
 }
 
 Shard::~Shard() {

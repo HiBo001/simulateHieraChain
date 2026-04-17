@@ -1,0 +1,50 @@
+网络模块初始化成功: ../networkConfig
+
+========== Shard Topology Report ==========
+Ancestor ID     | Child Shard IDs
+-------------------------------------------
+5               | [ 1, 2 ]
+6               | [ 3, 4 ]
+7               | [ 1, 2, 3, 4 ]
+===========================================
+
+Access Control List for Shard 1: 72, 15, 93, 41, 28, 56, 84, 9, 63, 37, 100, 22, 78, 44, 5, 91
+shard1_inner:2000
+shard2_inner:2000
+shard3_inner:2000
+shard4_inner:2000
+shard1_shard2:2000
+shard3_shard4:2000
+shard2_shard3:2000
+解析负载完成...
+--- Intra-Shard Txs Distribution ---
+[ID: 1] Type: Intra | Count: 2000 | Involved Shards: [1]
+[ID: 2] Type: Intra | Count: 2000 | Involved Shards: [2]
+[ID: 3] Type: Intra | Count: 2000 | Involved Shards: [3]
+[ID: 4] Type: Intra | Count: 2000 | Involved Shards: [4]
+
+--- Cross-Shard Txs Distribution ---
+[ID: 5] Type: Cross | Count: 2000 | Involved Shards: [1, 2]
+[ID: 6] Type: Cross | Count: 2000 | Involved Shards: [3, 4]
+[ID: 7] Type: Cross | Count: 2000 | Involved Shards: [2, 3]
+
+启动分片1 ...
+当前分片1, tps = 0, latency = 0
+收到来自分片 shard = 5的消息.....
+收到了来自分片 5的跨片交易
+当前分片1, tps = 5000 , latency = 0.060492
+当前分片1, tps = 8000 , latency = 0.80146
+当前分片1, tps = 5000 , latency = 1.24539
+当前分片1, tps = 5000 , latency = 1.62744
+当前分片1, tps = 5000 , latency = 1.79163
+当前分片1, tps = 5000 , latency = 2.383
+当前分片1, tps = 5000 , latency = 2.5648
+当前分片1, tps = 5000 , latency = 2.94481
+当前分片1, tps = 5000 , latency = 3.54088
+当前分片1, tps = 5000 , latency = 3.49196
+当前分片1, tps = 5000 , latency = 4.08397
+当前分片1, tps = 5000 , latency = 4.47154
+当前分片1, tps = 5000 , latency = 4.65137
+当前分片1, tps = 5000 , latency = 5.24866
+当前分片1, tps = 5000 , latency = 5.41966
+当前分片1, tps = 5000 , latency = 5.7966

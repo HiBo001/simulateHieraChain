@@ -4,14 +4,11 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
 #include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <sstream>
-
-using namespace std;
 
 NetworkManager::NetworkManager(int localShardId)
     : localShardId(localShardId), serverFd(-1), running(false), networkDelayMs(0) {}
@@ -111,7 +108,7 @@ bool NetworkManager::start() {
         return false;
     }
 
-    if (bind(serverFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    if (::bind(serverFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         std::cerr << "[NetworkManager] bind failed on " << it->second.ip << ":" << it->second.port << std::endl;
         close(serverFd);
         serverFd = -1;
@@ -157,7 +154,7 @@ void NetworkManager::acceptLoop() {
             continue;
         }
 
-        std::thread(&NetworkManager::handleConnection, this, clientFd).detach();
+        std::thread(&NetworkManager::handleConnection, this, clientFd).detach(); // 为每一个连接创建一个线程处理
     }
 }
 
@@ -182,7 +179,9 @@ void NetworkManager::handleConnection(int clientFd) {
 
     Message message;
     if (deserializeMessagePayload(payload, message)) {
+        cout << "收到来自分片 shard = " << message.srcShardId << "的消息....." << endl;
         dispatcher.dispatch(message);
+
     } else {
         std::cerr << "[NetworkManager] failed to parse message payload" << std::endl;
     }
@@ -266,6 +265,6 @@ void NetworkManager::registerCustomHandler(int type, MessageDispatcher::Handler 
     dispatcher.registerCustomHandler(type, handler);
 }
 
-void NetworkManager::setDefaultHandler(MessageDispatcher::Handler handler) {
-    dispatcher.setDefaultHandler(handler);
-}
+// void NetworkManager::setDefaultHandler(MessageDispatcher::Handler handler) {
+//     dispatcher.setDefaultHandler(handler);
+// }
