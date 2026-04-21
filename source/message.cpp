@@ -67,9 +67,9 @@ MessageDispatcher::MessageDispatcher(Shard& owner):m_owner(owner) {
 
 void MessageDispatcher::registerBuiltInDefaultHandlers() {
     registerHandler(MessageType::CROSS_SHARD_TX_REQUEST,
-                    [this](const Message& msg) { crossShardTxsHandler(msg); });
+                    [this](Message& msg) { crossShardTxsHandler(msg); });
     registerHandler(MessageType::CROSS_SHARD_TX_COMMIT_MSG,
-                    [this](const Message& msg) { crossShardCommittedMsgHandler(msg); });
+                    [this](Message& msg) { crossShardCommittedMsgHandler(msg); });
 }
 
 void MessageDispatcher::registerHandler(MessageType type, Handler handler) {
@@ -86,7 +86,7 @@ void MessageDispatcher::registerCustomHandler(int type, Handler handler) {
 //     fallbackHandler = handler;
 // }
 
-void MessageDispatcher::dispatch(const Message& message) const {
+void MessageDispatcher::dispatch(Message& message) {
 
     Handler handlerToRun;
     {
@@ -104,19 +104,25 @@ void MessageDispatcher::dispatch(const Message& message) const {
     }
 }
 
-void MessageDispatcher::crossShardTxsHandler(const Message& message) const{
+void MessageDispatcher::crossShardTxsHandler(Message& message){
     
     int sourceShardId = message.srcShardId;
     cout << "收到了来自分片 " << sourceShardId << "的跨片交易任务....." << endl;
     
-    auto txs = message.txs;
-    for (auto tx : txs) {
-        tx.type = 1.5; // 标记为需要立即处理的跨片交易
+    // int txSize = message.txs.size();
+    // for (int i = 0; i < txSize; i++) {
+    //     message.txs.at(i).type = 1.5; // 标记为需要立即处理的跨片交易
+    // }
+
+    auto& txs = message.txs;
+    int txSize = txs.size();
+    for (int i = 0; i < txSize; i++) {
+        txs.at(i).type = 1.5;
     }
     m_owner.enqueueTransactions(txs);
 }
 
-void MessageDispatcher::crossShardCommittedMsgHandler(const Message& message) const{
+void MessageDispatcher::crossShardCommittedMsgHandler(Message& message){
     cout << "收到了来自下层的跨片交易提交信息....." << endl;
     
 
@@ -124,7 +130,7 @@ void MessageDispatcher::crossShardCommittedMsgHandler(const Message& message) co
 }
 
 
-void MessageDispatcher::defaultLogHandler(const Message& message) const {
+void MessageDispatcher::defaultLogHandler(Message& message) {
     // std::cout << "[MessageDispatcher] receive "
     //           << messageTypeToString(message.type)
     //           << ", src=" << message.srcShardId

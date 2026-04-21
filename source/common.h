@@ -34,6 +34,16 @@ struct transaction{
     vector<int> invlovedShardIds;
     double sendedTime;
 
+    transaction(){}
+
+    // 构造函数2：带参数构造函数
+    transaction(double t, const string& id, std::vector<string> rwset, vector<int> invlovedShardIds, double time):
+        type(t),
+        txId(id), 
+        RWSet(rwset), 
+        invlovedShardIds(invlovedShardIds), 
+        sendedTime(time) {}
+
     // 将 transaction 内部序列化为一个字符串
     std::string serialize() const {
         std::ostringstream oss;

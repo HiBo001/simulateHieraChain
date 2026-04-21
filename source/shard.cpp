@@ -64,7 +64,7 @@ void Shard::printTransaction(transaction& tx){
     std::cout << "========================================" << std::endl;
 }
 
-void Shard::generateTransactions(vector<transaction*>& txs){
+void Shard::generateTransactions(vector<transaction>& txs){
 
     // 从 intraShardTxsDistribution 和 crossShardTxsDistribution 中寻找当前分片负责生成的任务
     // cout << "开始生成交易...." << endl;
@@ -143,7 +143,7 @@ void Shard::generateTransactions(vector<transaction*>& txs){
             }
         }
         
-        transaction* tx = new transaction{type, prefixTxId, rwset, invlovedShardIds, currentTime};
+        transaction tx(type, prefixTxId, rwset, invlovedShardIds, currentTime);
         txs.push_back(tx);
         txId++;
     }
@@ -154,7 +154,8 @@ void Shard::enqueueTransactions(vector<transaction>& txs){ // 将一批交易 tx
 
     mempoolMutex.lock(); // 加锁
     for(auto tx: txs){
-        transactionMempool.push(&tx); // 交易进入交易池
+        transaction* txPtr = new transaction(tx); // 堆上分配，生命周期由调用方管理
+        transactionMempool.push(txPtr); // 交易进入交易池
     }
     mempoolMutex.unlock(); // 解锁
 }
@@ -163,13 +164,17 @@ void Shard::enqueueTransactions(vector<transaction>& txs){ // 将一批交易 tx
 void Shard::enqueueTransactions(){
 
     while (true){
-        vector<transaction*> txs;
+        vector<transaction> txs;
         generateTransactions(txs); // 生成交易
 
         mempoolMutex.lock(); // 加锁
         int tx_size = txs.size();
         for(int i = 0; i < tx_size; i++){
-            transactionMempool.push(txs.at(i)); // 交易进入交易池
+
+
+
+
+            transactionMempool.push(&(txs.at(i))); // 交易进入交易池
         }
         mempoolMutex.unlock(); // 解锁
 

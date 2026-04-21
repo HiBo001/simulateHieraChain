@@ -60,7 +60,7 @@ public:
     
     Shard(); // 初始化函数
     ~Shard();
-    void generateTransactions(vector<transaction*>& txs); // 生成交易
+    void generateTransactions(vector<transaction>& txs); // 生成交易
     void printTransaction(transaction& tx);
     void enqueueTransactions(vector<transaction>& txs); // 向交易池添加一批新来的交易
     void enqueueTransactions();

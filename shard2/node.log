@@ -44,27 +44,103 @@ txsToExecute.size = 5000
 收到了来自分片 5的跨片交易任务.....
 收到了来自分片 5的跨片交易任务.....
 收到了来自分片 5的跨片交易任务.....
-当前分片2, tps = 5000 , latency = 0.0471549
+当前分片2, tps = 5000 , latency = 0.111608
 收到了来自分片 5的跨片交易任务.....
-txsToExecute.size = 3037
-Process 53523 launched: '/Users/tanghaibo_office/Desktop/Second_Work_Code/third_work/simulateHieraChain/build/bin/hierachain' (arm64)
-Process 53523 stopped
-* thread #5, stop reason = EXC_BAD_ACCESS (code=1, address=0x170142b60)
-    frame #0: 0x0000000100049870 hierachain`Shard::runExecution(this=0x0000000144605610) at shard.cpp:222:21
-   219 	        for (auto tx : txsToExecute) {
-   220 	            // 因为 tx 是指针，使用 -> 访问成员            
-   221 	            // 执行具体逻辑
--> 222 	            if (tx->type == 1) { // 片内交易
-    	                    ^
-   223 	                existIntraTransactions = true;
-   224 	                simulateExecution();
-   225 	                executedIntraTxCount++;
-Target 0: (hierachain) stopped.
-(lldb) bt
-* thread #5, stop reason = EXC_BAD_ACCESS (code=1, address=0x170142b60)
-  * frame #0: 0x0000000100049870 hierachain`Shard::runExecution(this=0x0000000144605610) at shard.cpp:222:21
-    frame #1: 0x0000000100055338 hierachain`Shard::start()::$_2::operator()(this=0x00000001451041c8) const at shard.cpp:339:9
-    frame #3: 0x00000001000552c4 hierachain`void std::__1::__thread_execute[abi:ne190102]<std::__1::unique_ptr<std::__1::__thread_struct, std::__1::default_delete<std::__1::__thread_struct>>, Shard::start()::$_2>(__t=size=2, (null)=__tuple_indices<> @ 0x000000017002af7f) at thread.h:198:3
-    frame #4: 0x0000000100054fd4 hierachain`void* std::__1::__thread_proxy[abi:ne190102]<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread_struct, std::__1::default_delete<std::__1::__thread_struct>>, Shard::start()::$_2>>(__vp=0x00000001451041c0) at thread.h:207:3
-    frame #5: 0x000000018d11fc0c libsystem_pthread.dylib`_pthread_start + 136
-(lldb) quit
+txsToExecute.size = 3045
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+txsToExecute.size = 5000
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+当前分片2, tps = 8000 , latency = -24.7844
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+txsToExecute.size = 5000
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+当前分片2, tps = 4900 , latency = -91.5903
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+收到了来自分片 5的跨片交易任务.....
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 1.6051
+txsToExecute.size = 5000
+当前分片2, tps = 4900 , latency = -91.8063
+txsToExecute.size = 5000
+当前分片2, tps = 4990 , latency = -8.64337
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 1.48014
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 0.397207
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 0.357968
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 3.38437
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 3.35008
+txsToExecute.size = 5000
+当前分片2, tps = 4488 , latency = 395898
+txsToExecute.size = 5000
+当前分片2, tps = 4488 , latency = 395899
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 5.26509
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 5.38686
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 3.44414
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 2.11923
+txsToExecute.size = 5000
+当前分片2, tps = 1648 , latency = 4.971
+txsToExecute.size = 5000
+当前分片2, tps = 3210 , latency = 6.26268
+txsToExecute.size = 5000
+当前分片2, tps = 3438 , latency = 7.2715
+txsToExecute.size = 5000
+当前分片2, tps = 4342 , latency = 4.59627
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 5.40662
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 8.21365
+txsToExecute.size = 5000
+当前分片2, tps = 2210 , latency = 9.2296
+txsToExecute.size = 5000
+当前分片2, tps = 192 , latency = 9.25405e+06
+txsToExecute.size = 5000
+当前分片2, tps = 4790 , latency = 9.13086
+txsToExecute.size = 5000
+当前分片2, tps = 3210 , latency = 10.1524
+txsToExecute.size = 5000
+当前分片2, tps = 2979 , latency = 596439
+txsToExecute.size = 5000
+当前分片2, tps = 0, latency = 0
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 2.56644
+txsToExecute.size = 5000
+当前分片2, tps = 4210 , latency = 6.46694
+当前分片2, tps = 768 , latency = 7.86148
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 7.08423
+txsToExecute.size = 5000
+当前分片2, tps = 5000 , latency = 8.50419
+txsToExecute.size = 5000
+当前分片2, tps = 210 , latency = 10.9079
+txsToExecute.size = 5000
+当前分片2, tps = 1790 , latency = 0.220089
+txsToExecute.size = 5000
+当前分片2, tps = 3976 , latency = 446880
+txsToExecute.size = 5000
+当前分片2, tps = 1210 , latency = 13.9447
+txsToExecute.size = 5000
+当前分片2, tps = 4694 , latency = 0.0776179
+txsToExecute.size = 5000

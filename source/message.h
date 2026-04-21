@@ -28,19 +28,19 @@ std::string messageTypeToString(int type);
 class MessageDispatcher {
 
 public:
-    using Handler = std::function<void(const Message&)>;
+    using Handler = std::function<void(Message&)>;
 
     MessageDispatcher(Shard& owner);
     void registerHandler(MessageType type, Handler handler);
     void registerCustomHandler(int type, Handler handler);
-    void dispatch(const Message& message) const;
+    void dispatch(Message& message);
     // void setDefaultHandler(Handler handler);
 
 private:
     void registerBuiltInDefaultHandlers();
-    void defaultLogHandler(const Message& message) const;
-    void crossShardTxsHandler(const Message& message) const;
-    void crossShardCommittedMsgHandler(const Message& message) const;
+    void defaultLogHandler(Message& message);
+    void crossShardTxsHandler(Message& message);
+    void crossShardCommittedMsgHandler(Message& message);
 
 private:
     mutable std::mutex handlersMutex;

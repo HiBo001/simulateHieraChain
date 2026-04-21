@@ -31,7 +31,7 @@ map<int, pair<int, double>> latencys; // 每个分片的所有交易延迟
 int main(){
 
     Shard* shard = new Shard();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10000)); // 等待10秒
     shard->start();
 
     // // 测试发送

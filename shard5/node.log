@@ -36,406 +36,69 @@ shard2_shard3:2000
 启动分片5 ...
 当前分片5, tps = 0, latency = 0
 txsToExecute.size = 5000
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 2 after 5 retries
-当前分片5, tps = 0, latency = 0
-[NetworkManager] failed to connect shard 1 after 5 retries
-当前分片5, tps = 0, latency = 0
+stateKey52, targetShardId = 2
+stateKey68, targetShardId = 2
+stateKey64, targetShardId = 2
+stateKey78, targetShardId = 1
+stateKey59, targetShardId = 2
+stateKey84, targetShardId = 1
+stateKey11, targetShardId = 2
+stateKey56, targetShardId = 1
+stateKey33, targetShardId = 2
+stateKey78, targetShardId = 1
+stateKey84, targetShardId = 1
+stateKey30, targetShardId = 2
+stateKey95, targetShardId = 2
+stateKey68, targetShardId = 2
+stateKey9, targetShardId = 1
+stateKey76, targetShardId = 2
+stateKey2, targetShardId = 2
+stateKey9, targetShardId = 1
+当前分片5, tps = 0, latency = 0
+stateKey39, targetShardId = 2
+stateKey72, targetShardId = 1
+当前分片5, tps = 0, latency = 0
+当前分片5, tps = 0, latency = 0
+libc++abi: terminating due to uncaught exception of type std::bad_alloc: std::bad_alloc
+Process 71343 launched: '/Users/tanghaibo_office/Desktop/Second_Work_Code/third_work/simulateHieraChain/build/bin/hierachain' (arm64)
+Process 71343 stopped
+* thread #5, stop reason = signal SIGABRT
+    frame #0: 0x000000018d0e6388 libsystem_kernel.dylib`__pthread_kill + 8
+libsystem_kernel.dylib`__pthread_kill:
+->  0x18d0e6388 <+8>:  b.lo   0x18d0e63a8               ; <+40>
+    0x18d0e638c <+12>: pacibsp 
+    0x18d0e6390 <+16>: stp    x29, x30, [sp, #-0x10]!
+    0x18d0e6394 <+20>: mov    x29, sp
+Target 0: (hierachain) stopped.
+(lldb) bt
+* thread #5, stop reason = signal SIGABRT
+  * frame #0: 0x000000018d0e6388 libsystem_kernel.dylib`__pthread_kill + 8
+    frame #1: 0x000000018d11f88c libsystem_pthread.dylib`pthread_kill + 296
+    frame #2: 0x000000018d028a3c libsystem_c.dylib`abort + 124
+    frame #3: 0x000000018d0d5384 libc++abi.dylib`abort_message + 132
+    frame #4: 0x000000018d0c3cd8 libc++abi.dylib`demangling_terminate_handler() + 316
+    frame #5: 0x000000018cd48de4 libobjc.A.dylib`_objc_terminate() + 172
+    frame #6: 0x000000018d0d4698 libc++abi.dylib`std::__terminate(void (*)()) + 16
+    frame #7: 0x000000018d0d7c30 libc++abi.dylib`__cxxabiv1::failed_throw(__cxxabiv1::__cxa_exception*) + 88
+    frame #8: 0x000000018d0d7bd8 libc++abi.dylib`__cxa_throw + 92
+    frame #9: 0x000000018d0d9428 libc++abi.dylib`operator new(unsigned long) + 124
+    frame #10: 0x00000001000078f4 hierachain`void* std::__1::__libcpp_operator_new[abi:ne190102]<unsigned long>(__args=4745239144377739560) at new:297:10
+    frame #11: 0x0000000100007898 hierachain`std::__1::__libcpp_allocate[abi:ne190102](__size=4745239144377739560, __align=8) at new:321:10
+    frame #12: 0x0000000100009910 hierachain`std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>::allocate[abi:ne190102](this=0x000000015b616f20, __n=197718297682405815) at allocator.h:118:32
+    frame #13: 0x00000001000097ec hierachain`std::__1::__allocation_result<std::__1::allocator_traits<std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>>::pointer> std::__1::__allocate_at_least[abi:ne190102]<std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>>(__alloc=0x000000015b616f20, __n=197718297682405815) at allocate_at_least.h:41:19
+    frame #14: 0x000000010004ad18 hierachain`std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>>::__vallocate[abi:ne190102](this=0x000000015b616f10 size=0, __n=197718297682405815) at vector:781:25
+    frame #15: 0x000000010004ac28 hierachain`void std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>>::__init_with_size[abi:ne190102]<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>*>(this=0x000000015b616f10 size=0, __first=Summary Unavailable, __last="", __n=197718297682405815) at vector:799:7
+    frame #16: 0x000000010004abb4 hierachain`std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>>::vector(this=0x000000015b616f10 size=0, __x=size=0) at vector:1238:3
+    frame #17: 0x0000000100047cc0 hierachain`std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>>::vector(this=0x000000015b616f10 size=0, __x=size=0) at vector:1237:97
+    frame #18: 0x0000000100049d9c hierachain`transaction::transaction(this=0x000000015b616ef0, (null)=0x0000000150050058) at common.h:30:8
+    frame #19: 0x0000000100047f28 hierachain`transaction::transaction(this=0x000000015b616ef0, (null)=0x0000000150050058) at common.h:30:8
+    frame #20: 0x000000010004db54 hierachain`void std::__1::allocator<transaction>::construct[abi:ne190102]<transaction, transaction const&>(this=0x000000017002ad88, __p=0x000000015b616ef0, __args=0x0000000150050058) at allocator.h:165:24
+    frame #21: 0x000000010004db24 hierachain`void std::__1::allocator_traits<std::__1::allocator<transaction>>::construct[abi:ne190102]<transaction, transaction const&, 0>(__a=0x000000017002ad88, __p=0x000000015b616ef0, __args=0x0000000150050058) at allocator_traits.h:319:9
+    frame #22: 0x000000010004da98 hierachain`transaction* std::__1::vector<transaction, std::__1::allocator<transaction>>::__push_back_slow_path<transaction const&>(this=0x000000017002ad78 size=0, __x=0x0000000150050058) at vector:1500:3
+    frame #23: 0x0000000100047d90 hierachain`std::__1::vector<transaction, std::__1::allocator<transaction>>::push_back[abi:ne190102](this=0x000000017002ad78 size=0, __x=0x0000000150050058) at vector:1514:13
+    frame #24: 0x0000000100048740 hierachain`Shard::runExecution(this=0x000000015c104710) at shard.cpp:271:29
+    frame #25: 0x00000001000553ec hierachain`Shard::start()::$_2::operator()(this=0x000000015c504168) const at shard.cpp:346:9
+    frame #27: 0x0000000100055378 hierachain`void std::__1::__thread_execute[abi:ne190102]<std::__1::unique_ptr<std::__1::__thread_struct, std::__1::default_delete<std::__1::__thread_struct>>, Shard::start()::$_2>(__t=size=2, (null)=__tuple_indices<> @ 0x000000017002af7f) at thread.h:198:3
+    frame #28: 0x0000000100055088 hierachain`void* std::__1::__thread_proxy[abi:ne190102]<std::__1::tuple<std::__1::unique_ptr<std::__1::__thread_struct, std::__1::default_delete<std::__1::__thread_struct>>, Shard::start()::$_2>>(__vp=0x000000015c504160) at thread.h:207:3
+    frame #29: 0x000000018d11fc0c libsystem_pthread.dylib`_pthread_start + 136
+(lldb) quit
