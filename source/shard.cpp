@@ -3,8 +3,8 @@
 #include <chrono>
 #include <iomanip>
 #include <ctime>
+#include "network.h"
 #include "shard.h"
-#include "shard_helper.h"
 #include <stdlib.h>
 #include <time.h>
 #include <sstream>
@@ -16,6 +16,7 @@
 #include <random>
 #include <numeric>
 #include "message.h"
+#include "shard_helper.h"
 
 using namespace std;
 
@@ -91,7 +92,7 @@ void Shard::generateTransactions(vector<transaction*>& txs){
     for(int i = 0; i < Config::transactionSendRate; i++){
 
         string prefixTxId = to_string(shardId) + to_string(txId);
-        int type = this->role == ShardRole::LEAF ? 1 : 2;
+        double type = this->role == ShardRole::LEAF ? 1 : 2;
 
         // 从  ownedStateIds 中随机选择两个元素作为本次读写集
         // 1. 初始化下标向量 [0, 1, 2, ..., n-1]
@@ -149,6 +150,16 @@ void Shard::generateTransactions(vector<transaction*>& txs){
     // cout << "本轮交易生成完毕...." << endl;
 }
 
+void Shard::enqueueTransactions(vector<transaction>& txs){ // 将一批交易 txs 压入
+
+    mempoolMutex.lock(); // 加锁
+    for(auto tx: txs){
+        transactionMempool.push(&tx); // 交易进入交易池
+    }
+    mempoolMutex.unlock(); // 解锁
+}
+
+
 void Shard::enqueueTransactions(){
 
     while (true){
@@ -191,16 +202,22 @@ void Shard::runExecution(){
         // 4. 提取完毕，立即解锁
         executionMempoolMutex.unlock();
 
+        if(txsToExecute.size() == 0){
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
         // 5. 后续处理拿到的交易
         int executedIntraTxCount = 0;
         double totalLatency = 0;
         double currentTime = helper->getCurrentTimestamp();
 
         bool existIntraTransactions = false;
+
+        cout << "txsToExecute.size = " << txsToExecute.size() << endl;
+
         for (auto tx : txsToExecute) {
-            // 因为 tx 是指针，使用 -> 访问成员
-            // std::cout << "处理交易: " << tx->txId << std::endl;
-            
+            // 因为 tx 是指针，使用 -> 访问成员            
             // 执行具体逻辑
             if (tx->type == 1) { // 片内交易
                 existIntraTransactions = true;
@@ -208,11 +225,16 @@ void Shard::runExecution(){
                 executedIntraTxCount++;
                 double latency = currentTime - tx->sendedTime;
                 totalLatency += latency;
-            }else{ // 跨片交易
+            }else if (tx->type == 1.5){
+                existIntraTransactions = true; // 将
+                simulateExecution();
+                executedIntraTxCount += 0.5;
+                double latency = currentTime - tx->sendedTime;
+                totalLatency += latency;
+            }else if (tx->type == 2){ // 跨片交易
                 
                 // 核心逻辑：解析 RWSet 判定目标分片
                 std::set<int> targetShards; // 使用 set 自动去重
-
                 for (const std::string& stateKey : tx->RWSet) {
                     // 这里假设你有一个全局或本地的路由表 stateToShardMap
                     // 或者通过 stateKey 里的数字解析出它所属的分片
@@ -254,7 +276,6 @@ void Shard::runExecution(){
                     }
                 }
             }
-
         }
 
         if(existIntraTransactions){ // 这里执行的时候只能统计到片内交易的信息，跨片需要协调者分片收齐commit消息后统一处理
@@ -358,7 +379,7 @@ void Shard::startMetrics(){ // 统计分片当前的交易吞吐和延迟
 // 初始化分片的网络模块
 void Shard::initNetwork(){
     
-    networkManager = std::unique_ptr<NetworkManager>(new NetworkManager(this->shardId));
+    networkManager = std::unique_ptr<NetworkManager>(new NetworkManager(this->shardId, *this));
     if (!networkManager->loadConfig(Config::networkConfigDir)) {
         std::cout << "加载网络配置失败: " << Config::networkConfigDir << std::endl;
         exit(1);
@@ -367,7 +388,7 @@ void Shard::initNetwork(){
     }
 
     // 注册消息包处理函数
-    MessageDispatcher();
+    // MessageDispatcher();
 }
 
 

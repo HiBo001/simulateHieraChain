@@ -10,8 +10,8 @@
 #include <iostream>
 #include <sstream>
 
-NetworkManager::NetworkManager(int localShardId)
-    : localShardId(localShardId), serverFd(-1), running(false), networkDelayMs(0) {}
+NetworkManager::NetworkManager(int localShardId, Shard& owner)
+    : localShardId(localShardId), serverFd(-1), running(false), networkDelayMs(0), dispatcher(owner) {} // 传递 Shard 引用给 MessageDispatcher
 
 NetworkManager::~NetworkManager() {
     stop();
@@ -154,8 +154,23 @@ void NetworkManager::acceptLoop() {
             continue;
         }
 
-        // 线程数量给个上限或者线程池
-        std::thread(&NetworkManager::handleConnection, this, clientFd).detach(); // 为每一个连接创建一个线程处理
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [this]() { return runningThreads < maxSendingThreads; });
+        runningThreads++;
+        lock.unlock();
+
+        std::thread([this, clientFd]() {
+            handleConnection(clientFd);
+
+            std::unique_lock<std::mutex> lock(mtx);
+            runningThreads--;
+            cv.notify_one(); // 通知有线程槽位空出来
+        }).detach();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // // 线程数量给个上限或者线程池
+        // std::thread(&NetworkManager::handleConnection, this, clientFd).detach(); // 为每一个连接创建一个线程处理
     }
 }
 

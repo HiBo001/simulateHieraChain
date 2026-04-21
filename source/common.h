@@ -1,12 +1,12 @@
+#ifndef COMMON_H      // ← 移到最顶部
+#define COMMON_H
+
 #include <string>
 #include <queue>
 #include <map>
 #include <sstream>
 
 using namespace std;
-
-#ifndef COMMON_H
-#define COMMON_H
 
 // 声明一些全局变量
 namespace Config {

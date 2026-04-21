@@ -1,3 +1,6 @@
+#ifndef SHARD_H
+#define SHARD_H        // ← 守卫必须在最顶部
+
 #include <queue>
 #include <string>
 #include <mutex>
@@ -6,11 +9,6 @@
 #include <memory>
 #include "network.h"
 #include "common.h"
-
-using namespace std;
-
-#ifndef SHARD_H
-#define SHARD_H
 
 extern std::mutex global_performance_mtx;
 
@@ -64,7 +62,8 @@ public:
     ~Shard();
     void generateTransactions(vector<transaction*>& txs); // 生成交易
     void printTransaction(transaction& tx);
-    void enqueueTransactions(); // 向交易池添加一批新来的交易
+    void enqueueTransactions(vector<transaction>& txs); // 向交易池添加一批新来的交易
+    void enqueueTransactions();
     void runExecution();
     void runConsensus(); // 从交易池取走一部分交易、最多processBatch个
     void printPerformanceStats();

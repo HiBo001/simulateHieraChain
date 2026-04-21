@@ -1,4 +1,5 @@
 #include "message.h"
+#include "shard.h"  // 添加这一行
 
 #include <iostream>
 #include <sstream>
@@ -60,7 +61,7 @@ std::string messageTypeToString(int type) {
     }
 }
 
-MessageDispatcher::MessageDispatcher() {
+MessageDispatcher::MessageDispatcher(Shard& owner):m_owner(owner) {
     registerBuiltInDefaultHandlers();
 }
 
@@ -110,20 +111,14 @@ void MessageDispatcher::crossShardTxsHandler(const Message& message) const{
     
     auto txs = message.txs;
     for (auto tx : txs) {
-        tx.type = 1.5;
+        tx.type = 1.5; // 标记为需要立即处理的跨片交易
     }
-
-
-
-
-
-
-
+    m_owner.enqueueTransactions(txs);
 }
 
 void MessageDispatcher::crossShardCommittedMsgHandler(const Message& message) const{
     cout << "收到了来自下层的跨片交易提交信息....." << endl;
-
+    
 
 
 }

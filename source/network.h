@@ -9,6 +9,8 @@
 #include <thread>
 #include "message.h"
 
+class Shard;
+
 class NetworkManager {
 public:
     struct Endpoint {
@@ -17,7 +19,7 @@ public:
     };
 
 public:
-    explicit NetworkManager(int localShardId);
+    explicit NetworkManager(int localShardId, Shard& owner);
     ~NetworkManager();
 
     bool loadConfig(const std::string& configPath);
@@ -42,8 +44,12 @@ private:
     int networkDelayMs;
     std::map<int, Endpoint> shardEndpoints;
     std::mutex sendMutex;
-
     MessageDispatcher dispatcher;
+
+    static const int maxSendingThreads = 3;
+    int runningThreads = 0;
+    std::mutex mtx;
+    std::condition_variable cv;
 };
 
 #endif // NETWORK_H

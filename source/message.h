@@ -6,7 +6,8 @@
 #include <mutex>
 #include <string>
 #include "common.h"
-#include "shard.h"
+
+class Shard;
 
 enum class MessageType : int { // 消息类型
     CROSS_SHARD_TX_REQUEST = 1,
@@ -29,7 +30,7 @@ class MessageDispatcher {
 public:
     using Handler = std::function<void(const Message&)>;
 
-    MessageDispatcher();
+    MessageDispatcher(Shard& owner);
     void registerHandler(MessageType type, Handler handler);
     void registerCustomHandler(int type, Handler handler);
     void dispatch(const Message& message) const;
@@ -45,6 +46,7 @@ private:
     mutable std::mutex handlersMutex;
     std::map<int, Handler> handlers;
     Handler fallbackHandler;
+    Shard& m_owner;
 };
 
 #endif // MESSAGE_H
