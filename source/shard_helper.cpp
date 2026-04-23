@@ -327,6 +327,7 @@ void ShardHelper::parseTopology() {
                 std::stringstream ss(idsStr);
                 std::string segment;
                 while (std::getline(ss, segment, ',')) {
+                    leafShardIds.push_back(stoi(segment));
                     if (!segment.empty() && std::stoi(segment) == shard.shardId) {
                         shard.role = ShardRole::LEAF;
                     }

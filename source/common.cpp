@@ -22,8 +22,8 @@ void globalPerformanceStats::startMetrics(){
 
 void globalPerformanceStats::printPerformanceStats(){
 
-    while (true)
-    {
+    while (true){
+        
         std::unique_lock<std::mutex> globalMetricsLock(globalMetricsMutex, std::defer_lock); // 加锁
         
         int total_throughput = 0;

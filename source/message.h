@@ -11,22 +11,25 @@ class Shard;
 
 enum class MessageType : int { // 消息类型
     CROSS_SHARD_TX_REQUEST = 1,
-    CROSS_SHARD_TX_COMMIT_MSG = 2
+    CROSS_SHARD_TX_COMMIT_MSG = 2,
+    PERFORMANCE_MSG = 3
 };
+
+// struct performanceMessage {
+//     int type;
+//     double tps;
+//     double latency;
+// };
 
 struct Message { // 消息结构体
     int type;
     int srcShardId;
     int dstShardId;
     vector<transaction> txs;
-};
 
-struct performanceMessage {
     double tps;
     double latency;
 };
-
-
 
 std::string serializeMessagePayload(Message* msg); //
 bool deserializeMessagePayload(const std::string& payload, Message& outMessage);
@@ -48,6 +51,7 @@ private:
     void defaultLogHandler(Message& message);
     void crossShardTxsHandler(Message& message);
     void crossShardCommittedMsgHandler(Message& message);
+    void performanceMsgHandler(Message& message);
 
 private:
     mutable std::mutex handlersMutex;

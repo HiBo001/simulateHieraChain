@@ -343,15 +343,21 @@ void Shard::start(){
         runExecution();
     });
 
-    // 计算当前分片的TPS
-    std::thread monitor_thread([this] {
-        startMetrics();
-    });
-
-    injectTxThread.detach();
-    consensusThread.detach();
-    executeThread.detach();
-    monitor_thread.detach();
+    auto it = std::find(helper->leafShardIds.begin(), helper->leafShardIds.end(), this->shardId); 
+    if(it != helper->leafShardIds.end()){ // 只有叶子分片需要打印测试
+        // 计算当前分片的TPS
+        std::thread monitor_thread([this] {
+            startMetrics();
+        });
+        injectTxThread.detach();
+        consensusThread.detach();
+        executeThread.detach();
+        monitor_thread.detach();
+    }else{
+        injectTxThread.detach();
+        consensusThread.detach();
+        executeThread.detach();
+    }
 
     cout << "启动分片" << this->shardId << " ..."<< endl;
 }
@@ -373,6 +379,19 @@ void Shard::printPerformanceStats(){
     committedTxCount = 0;
     committedSubTxCount = 0;
     performanceMetricsMutex.unlock();
+
+    Message requestMsg{ // 初始化Message
+        static_cast<int>(MessageType::PERFORMANCE_MSG),
+        this->shardId,
+        this->topshardId,
+        {},
+        tps,
+        latency
+    };
+
+    if (networkManager) {
+        networkManager->sendMessage(&requestMsg); // 发送消息
+    }
 }
 
 void Shard::startMetrics(){ // 统计分片当前的交易吞吐和延迟
@@ -406,7 +425,7 @@ Shard::Shard() : helper(new ShardHelper(*this)) {
     this->batchFetchSize = Config::batchFetchSize;
     this->transactionSendRate = Config::transactionSendRate;
 
-    // 获取分片id
+    // 获取分片 idx
     this->shardId = helper->parseShardId();
     this->topshardId = helper->parseTopShardId(); // 解析 topshardId
 

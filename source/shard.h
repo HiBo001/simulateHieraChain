@@ -9,6 +9,7 @@
 #include <memory>
 #include "network.h"
 #include "common.h"
+#include "shard_helper.h"
 
 extern std::mutex global_performance_mtx;
 
@@ -49,6 +50,9 @@ public:
 
     map<int, txsDistribution> intraShardTxsDistribution; // 片内交易负载
     map<int, txsDistribution> crossShardTxsDistribution; // 跨片交易负载
+
+    map<int, double> leafShardsThroughputs; // 各个叶子分片的吞吐
+    map<int, double> leafShardsLatencys; // 各个叶子分片的延时
 
 // private:
     std::unique_ptr<ShardHelper> helper;

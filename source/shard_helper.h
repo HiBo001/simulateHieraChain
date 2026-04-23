@@ -2,13 +2,15 @@
 #define SHARD_HELPER_H
 
 #include <string>
+#include <vector>
 
 class Shard;
 
 class ShardHelper {
 public:
-    explicit ShardHelper(Shard& shard);
+    std::vector<int> leafShardIds;
 
+    explicit ShardHelper(Shard& shard);
     int parseTopShardId();
     int parseShardId();
     void parseTopology();

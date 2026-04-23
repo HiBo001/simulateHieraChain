@@ -35,6 +35,12 @@ int main(){
     std::this_thread::sleep_for(std::chrono::milliseconds(10000)); // 等待10秒
     shard->start();
 
+    // auto leafShardIds = shard->helper->leafShardIds;
+    // cout << "叶子分片如下: " << endl;
+    // for(auto leafShardid : leafShardIds){
+    //     cout << "leafShardid :" << leafShardid << endl;
+    // }
+
     // cout << "topShardId = " << shard->topshardId << endl;
 
     // // 测试发送
