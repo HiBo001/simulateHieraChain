@@ -1,0 +1,22 @@
+{
+  "replicas_per_shard": 4,
+  "host": "127.0.0.1",
+  "base_port": 19000,
+  "shards": [
+    {"id": 1, "parent": 5},
+    {"id": 2, "parent": 5},
+    {"id": 5, "parent": null}
+  ],
+  "consensus": {"batch_size": 1000, "batch_wait_ms": 10, "view_timeout_ms": 2000, "checkpoint_batches": 16},
+  "execution": {"fib_iterations": 1},
+  "network": {
+    "intra_shard_delay_ms": 1,
+    "default_inter_shard_delay_ms": 20,
+    "shard_links": [
+      {"shards": [1, 2], "delay_ms": 50},
+      {"shards": [1, 5], "delay_ms": 10},
+      {"shards": [2, 5], "delay_ms": 30}
+    ],
+    "trace": false
+  }
+}

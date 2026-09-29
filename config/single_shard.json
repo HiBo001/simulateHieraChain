@@ -1,0 +1,4 @@
+{
+  "base_port": 19100,
+  "shards": [{"id": 1, "parent": null}]
+}

@@ -1,147 +1,78 @@
-#ifndef COMMON_H      // ← 移到最顶部
-#define COMMON_H
-
+#pragma once
+#include <nlohmann/json.hpp>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/sha.h>
+#include <chrono>
+#include <fstream>
+#include <memory>
+#include <stdexcept>
 #include <string>
-#include <queue>
-#include <map>
-#include <sstream>
+#include <vector>
 
-using namespace std;
-
-// 声明一些全局变量
-namespace Config {
-    extern int orderingCapacity;
-    extern int executionCapacity;
-    extern int batchFetchSize;
-    extern int transactionSendRate;
-    extern string ownedStateIdsDir;
-    extern string shardsTopologyDir;
-    extern string topShardIdDir;
-    extern string workLoadDir;
-    extern string shardIdDir;
-    extern string networkConfigDir;
+namespace arbor {
+using json = nlohmann::json;
+using Clock = std::chrono::steady_clock;
+using Key = std::shared_ptr<EVP_PKEY>;
+inline double millis(Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(t.time_since_epoch()).count();
 }
-
-extern std::mutex globalMetricsMutex; // 整体吞吐的延迟的锁
-extern map<int, int> throughputs;
-extern map<int, pair<int, double>> latencys;
-
-
-// 定义交易
-struct transaction{
-    double type; // 交易类型，1表示片内交易、2表示跨片交易、1.5表示已经由上层定过顺序的跨片交易，需要立即处理
-    string txId;
-    vector<string> RWSet; // 交易读写集
-    vector<int> invlovedShardIds;
-    double sendedTime;
-
-    transaction(){}
-
-    // 构造函数2：带参数构造函数
-    transaction(double t, const string& id, std::vector<string> rwset, vector<int> invlovedShardIds, double time):
-        type(t),
-        txId(id), 
-        RWSet(rwset), 
-        invlovedShardIds(invlovedShardIds), 
-        sendedTime(time) {}
-
-    // 将 transaction 内部序列化为一个字符串
-    std::string serialize() const {
-        std::ostringstream oss;
-        oss << type << "," << txId << ",";
-        
-        // 处理 RWSet (使用 # 分隔)
-        for (size_t i = 0; i < RWSet.size(); ++i) {
-            oss << RWSet[i] << (i == RWSet.size() - 1 ? "" : "#");
-        }
-        oss << ",";
-
-        // 处理 invlovedShardIds (使用 # 分隔)
-        for (size_t i = 0; i < invlovedShardIds.size(); ++i) {
-            oss << invlovedShardIds[i] << (i == invlovedShardIds.size() - 1 ? "" : "#");
-        }
-        oss << "," << sendedTime;
-        
-        return oss.str();
-    }
-
-    // 从字符串解析回 transaction
-    static transaction deserialize(const std::string& s) {
-        std::vector<std::string> parts;
-        std::string part;
-        std::istringstream iss(s);
-        while (std::getline(iss, part, ',')) parts.push_back(part);
-
-        transaction tx;
-        tx.type = std::stoi(parts[0]);
-        tx.txId = parts[1];
-
-        // 解析 RWSet
-        std::istringstream rss(parts[2]);
-        std::string item;
-        while (std::getline(rss, item, '#')) if(!item.empty()) tx.RWSet.push_back(item);
-
-        // 解析 invlovedShardIds
-        std::istringstream iss_ids(parts[3]);
-        while (std::getline(iss_ids, item, '#')) if(!item.empty()) tx.invlovedShardIds.push_back(std::stoi(item));
-
-        tx.sendedTime = std::stod(parts[4]);
-        return tx;
-    }
-};
-
-// 定义交易
-struct txsDistribution{
-    int type; // 交易类型，1表示片内交易，2表示跨片交易
-    int txCount;
-    vector<int> invlovedShardIds;
-};
-
-// 定义线程安全数据结构
-// Map
-template <typename K, typename V>
-class thread_safety_map{
-    
-    public:
-        void insert(K& key, V& value){
-            std::lock_guard<std::mutex> lock(map_mtx);
-            map_.insert(std::pair<K, V>(key, value));
-        }
-
-        V& find(K& key){
-            std::lock_guard<std::mutex> lock(map_mtx);
-            return map_.at(key);
-        }
-    
-    public:
-        std::mutex map_mtx;
-        std::map<K, V> map_;
-};
-
-class globalPerformanceStats{
-
-    public:
-        int leafShardCount;
-        int totalShardCount;
-        queue<int> recent_throughputs;
-        queue<double> recent_latencys;
-
-    public:
-        globalPerformanceStats(int _leafShardCount, int _totalShardCount){
-            leafShardCount = _leafShardCount;
-            totalShardCount = _totalShardCount;
-
-            for(int i = 0; i < _totalShardCount; i++){
-                int shardId = i + 1;
-                throughputs.insert(make_pair(shardId, 0));
-                pair<int, double> latency; // 交易总延迟/交易数量
-                latencys.insert(make_pair(shardId, latency));
-            }
-        }
-
-        void printPerformanceStats();
-        void startMetrics();
-        double getCurrentTimestamp();
-};
-
-#endif // COMMON_H
+inline std::string hex(const unsigned char* p, size_t n) {
+    static const char* digits = "0123456789abcdef";
+    std::string s; s.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) { s += digits[p[i] >> 4]; s += digits[p[i] & 15]; }
+    return s;
+}
+inline std::vector<unsigned char> unhex(const std::string& s) {
+    if (s.size() % 2) throw std::runtime_error("invalid hex");
+    auto digit = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        throw std::runtime_error("invalid hex");
+    };
+    std::vector<unsigned char> v;
+    for (size_t i = 0; i < s.size(); i += 2) v.push_back((digit(s[i]) << 4) | digit(s[i+1]));
+    return v;
+}
+inline std::string hash(const std::string& s) {
+    unsigned char out[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(s.data()), s.size(), out);
+    return hex(out, sizeof(out));
+}
+inline Key readKey(const std::string& path, bool secret) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("cannot open key: " + path);
+    EVP_PKEY* k = secret ? PEM_read_PrivateKey(f, nullptr, nullptr, nullptr)
+                        : PEM_read_PUBKEY(f, nullptr, nullptr, nullptr);
+    fclose(f);
+    if (!k) throw std::runtime_error("invalid Ed25519 key: " + path);
+    return Key(k, EVP_PKEY_free);
+}
+inline json sign(json body, const Key& k) {
+    auto ctx = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    auto bytes = body.dump();
+    unsigned char sig[128]; size_t n = sizeof(sig);
+    if (EVP_DigestSignInit(ctx.get(), nullptr, nullptr, nullptr, k.get()) != 1 ||
+        EVP_DigestSign(ctx.get(), sig, &n, reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size()) != 1)
+        throw std::runtime_error("Ed25519 signing failed");
+    return {{"body", body}, {"signature", hex(sig, n)}};
+}
+inline bool verify(const json& env, const Key& k) {
+    try {
+        auto bytes = env.at("body").dump();
+        auto sig = unhex(env.at("signature").get<std::string>());
+        auto ctx = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+        return EVP_DigestVerifyInit(ctx.get(), nullptr, nullptr, nullptr, k.get()) == 1 &&
+            EVP_DigestVerify(ctx.get(), sig.data(), sig.size(), reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size()) == 1;
+    } catch (...) { return false; }
+}
+inline json readJson(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("cannot read " + path);
+    json j; f >> j; return j;
+}
+inline void writeJson(const std::string& path, const json& j) {
+    { std::ofstream f(path + ".tmp"); f << j.dump(2) << '\n'; if (!f) throw std::runtime_error("write failed: " + path); }
+    if (rename((path + ".tmp").c_str(), path.c_str())) throw std::runtime_error("rename failed: " + path);
+}
+}

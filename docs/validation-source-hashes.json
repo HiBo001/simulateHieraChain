@@ -1,0 +1,9 @@
+{
+  "source/main.cpp": "8cb1c7c2c13bc77d65211a8fae338361ba77199204ded4a8664e3d348d541040",
+  "source/common.h": "e4034025e9bbeb9028292063b001e547f9a98f9e7cca3eb6a814fc3b86a932cb",
+  "source/network.h": "2f8a2cdee87f51cadd2fbdb70ff3c706913e3b97d0ff59791f4264e775f84e3f",
+  "scripts/cluster.py": "0651ab21e10fd5bcc243dbfb53bdfece5a00e21d350f8d337d6dccbc582c0c83",
+  "tests/test_stage1.py": "394038183e0cc5aba8b0e12b48991afe805d340b94031d5591d022cfce32e8a1",
+  "configs/two_layer.json": "73fbabf0c604f4fd8cb0876c5cbbd595bb783923b3f582c060eef50213d96395",
+  "third_party/nlohmann/json.hpp": "9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6"
+}

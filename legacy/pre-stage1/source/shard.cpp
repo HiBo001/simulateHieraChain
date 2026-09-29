@@ -255,29 +255,29 @@ void Shard::runExecution(){
                     pendingSendQueue[sid].push_back(tx);
                 }
             }
+        }
 
-            // 3. 模拟发送逻辑（将待发送集合转发给通信模块）
-            if (!pendingSendQueue.empty()) {
-                for (const auto& entry : pendingSendQueue) {
+        // 3. 模拟发送逻辑（将待发送集合转发给通信模块）
+        if (!pendingSendQueue.empty()) {
+            for (const auto& entry : pendingSendQueue) {
 
-                    int dstShardId = entry.first;
-                    std::vector<transaction*> txsPointers = entry.second;
-                    std::vector<transaction> txs;
+                int dstShardId = entry.first;
+                std::vector<transaction*> txsPointers = entry.second;
+                std::vector<transaction> txs;
 
-                    for (auto txsPointer: txsPointers){
-                        txs.push_back(*txsPointer);
-                    }
+                for (auto txsPointer: txsPointers){
+                    txs.push_back(*txsPointer);
+                }
 
-                    Message requestMsg{ // 初始化Message
-                        static_cast<int>(MessageType::CROSS_SHARD_TX_REQUEST),
-                        this->shardId,
-                        dstShardId,
-                        txs
-                    };
+                Message requestMsg{ // 初始化Message
+                    static_cast<int>(MessageType::CROSS_SHARD_TX_REQUEST),
+                    this->shardId,
+                    dstShardId,
+                    txs
+                };
 
-                    if (networkManager) {
-                        networkManager->sendMessage(&requestMsg); // 发送消息
-                    }
+                if (networkManager) {
+                    networkManager->sendMessage(&requestMsg); // 发送消息
                 }
             }
         }
@@ -367,12 +367,13 @@ void Shard::printPerformanceStats(){
     performanceMetricsMutex.lock();
 
     double tps = committedTxCount;
-    double latency = committedTxTotalLatency / committedTxCount;
-    
+    // ✅ 安全计算 latency
+    double latency = (committedTxCount > 0) ? (committedTxTotalLatency / committedTxCount) : 0.0;
+
     if(committedTxCount == 0){
-        cout << "当前分片"<< shardId << ", tps = 0, " << "latency = 0" << endl;
+        cout << "当前分片" << shardId << ", tps = 0, latency = 0" << endl;
     }else{
-        cout << "当前分片" << shardId << ", tps = "<< tps << " , latency = "<< latency << endl;
+        cout << "当前分片" << shardId << ", tps = " << tps << " , latency = " << latency << endl;
     }
 
     committedTxTotalLatency = 0;
@@ -380,18 +381,47 @@ void Shard::printPerformanceStats(){
     committedSubTxCount = 0;
     performanceMetricsMutex.unlock();
 
-    Message requestMsg{ // 初始化Message
-        static_cast<int>(MessageType::PERFORMANCE_MSG),
-        this->shardId,
-        this->topshardId,
-        {},
-        tps,
-        latency
-    };
+    // ✅ 只有 tps > 0 时才发送有意义的性能消息
+    if(tps > 0) {
 
-    if (networkManager) {
-        networkManager->sendMessage(&requestMsg); // 发送消息
+        Message requestMsg{ // 初始化Message
+            static_cast<int>(MessageType::PERFORMANCE_MSG),
+            this->shardId,
+            this->topshardId,
+            {},
+            tps,
+            latency
+        };
+        
+        networkManager->sendMessage(&requestMsg);
     }
+
+    // double tps = committedTxCount;
+    // double latency = committedTxTotalLatency / committedTxCount;
+    
+    // if(committedTxCount == 0){
+    //     cout << "当前分片"<< shardId << ", tps = 0, " << "latency = 0" << endl;
+    // }else{
+    //     cout << "当前分片" << shardId << ", tps = "<< tps << " , latency = "<< latency << endl;
+    // }
+
+    // committedTxTotalLatency = 0;
+    // committedTxCount = 0;
+    // committedSubTxCount = 0;
+    // performanceMetricsMutex.unlock();
+
+    // Message requestMsg{ // 初始化Message
+    //     static_cast<int>(MessageType::PERFORMANCE_MSG),
+    //     this->shardId,
+    //     this->topshardId,
+    //     {},
+    //     tps,
+    //     latency
+    // };
+
+    // if (networkManager) {
+    //     networkManager->sendMessage(&requestMsg); // 发送消息
+    // }
 }
 
 void Shard::startMetrics(){ // 统计分片当前的交易吞吐和延迟
