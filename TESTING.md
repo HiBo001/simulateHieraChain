@@ -1,4 +1,4 @@
-# 第一阶段验收说明
+# Arbor 仿真系统验收说明
 
 所有命令在项目根目录执行。每一组手动故障测试建议先停止旧集群、启动一轮新实验；停止的副本不要在原运行目录直接重启。
 
@@ -9,7 +9,7 @@ make
 make test
 ```
 
-`make test` 先运行 13 项第一阶段回归测试，再运行 1 项独立的第二阶段 A 测试。测试会选择空闲端口范围，创建独立运行目录，启动真实节点进程，结束时自动停止；不改变普通运行的 `runtime/latest` 指向。第一阶段结果保留在 `test-results/<时间-编号>/`，其中 `summary.json` 应显示：
+`make test` 依次运行 13 项第一阶段回归测试、1 项第二阶段 A 排序证书测试，以及 3 项第二阶段 B 执行测试。测试会选择空闲端口范围，创建独立运行目录，启动真实节点进程，结束时自动停止；不改变普通运行的 `runtime/latest` 指向。第一阶段结果保留在 `test-results/<时间-编号>/`，其中 `summary.json` 应显示：
 
 ```json
 {"tests": 13, "failures": 0, "errors": 0, "passed": true}
@@ -146,4 +146,26 @@ make
 python3 tests/test_stage2a.py
 ```
 
-该测试启动 12 个真实节点，向叶子 1、2 各需参与的跨片交易发送带访问集的负载，验证协调者排序证书由两个叶子独立验签后进入各自 PBFT 日志。篡改证书中的 COMMIT 签名以及缺少跨片访问集的交易必须被拒绝。手动验收命令与指标解释见 [docs/STAGE2A_DESIGN.md](docs/STAGE2A_DESIGN.md)。本阶段的 `leaf_ordered_cst` 不是执行完成计数。
+该测试启动 12 个真实节点，向叶子 1、2 各需参与的跨片交易发送带访问集的负载，验证协调者排序证书由两个叶子独立验签后进入各自 PBFT 日志。篡改证书中的 COMMIT 签名以及缺少跨片访问集的交易必须被拒绝。当前代码会继续执行并提交这些交易；`leaf_ordered_cst` 仅表示排序，最终完成看 `executed` 和客户端 `completed`。
+
+## 第二阶段 B：跨片执行与最终确认
+
+```bash
+make
+python3 tests/test_stage2b.py
+```
+
+一项测试构造两笔连续访问同一对 key 的跨片交易，验证远端读值影响本地写值、两个叶子副本状态收敛、协调分片持有三副本提交决定证书，并拒绝签名有效但决定摘要错误的 ACK。其余两项分别验证叶子少一个备份仍可形成三副本法定人数，以及整个叶子分片离线时不会把排序计为完成或暴露暂存写入。
+
+手动运行：
+
+```bash
+./stop_all.sh
+./start_all.sh --config config/two_layer.json
+python3 scripts/cluster.py load --participants 1,2 --count 40 --rate 100 --batch 8 --timeout 30
+sleep 1
+python3 scripts/cluster.py status
+./stop_all.sh
+```
+
+预期客户端报告 `completed=40 ordered_only=0 requests=5/5` 并显示完成 TPS 与秒单位延时。协调分片四副本的 `ordered_only=40`、`completed_cst=40`；两个叶子四副本各自 `leaf_ordered_cst=40`、`executed=40`、`staged_cst=0`。详见 [docs/STAGE2B_DESIGN.md](docs/STAGE2B_DESIGN.md)。

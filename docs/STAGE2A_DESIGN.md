@@ -1,6 +1,6 @@
 # 第二阶段 A：二层跨片排序下发
 
-本阶段只扩展固定二层拓扑：一个根协调分片和恰好两个叶子分片。协调分片的 PBFT 顺序被带证明地传播到参与叶子，并由每个叶子的四个副本再次通过本片 PBFT 纳入本地顺序。它**尚未执行或提交跨片交易**；片内交易的现有执行路径保持不变。
+本文件记录第二阶段 A 交付时的能力：一个根协调分片和恰好两个叶子分片，协调分片的 PBFT 顺序被带证明地传播到参与叶子，并由每个叶子的四个副本再次通过本片 PBFT 纳入本地顺序。当前代码已经进入第二阶段 B，跨片执行与最终确认见 [STAGE2B_DESIGN.md](STAGE2B_DESIGN.md)；下文的运行结果是阶段 A 的历史记录。
 
 ## 交易与证书
 
@@ -23,6 +23,6 @@ python3 scripts/cluster.py load --participants 1,2 --count 40 --rate 100 --batch
 python3 scripts/cluster.py status
 ```
 
-客户端当前报告 `completed=0 ordered_only=40 completed_tps=0`，因为它只收到协调者排序回复，不能把该结果当作跨片交易完成。稍等状态文件刷新后，协调分片四副本的 `ordered_only=40`，叶子 1、2 四副本各自的 `leaf_ordered_cst=40`，两个叶子的 `executed=0`。同一分片四副本的状态摘要应一致。每个叶子的 `commits.jsonl` 中可见嵌入协调分片证书的本地 PBFT 提交。
+阶段 A 交付时，客户端报告 `completed=0 ordered_only=40 completed_tps=0`，因为它只收到协调者排序回复，不能把该结果当作跨片交易完成。当时的状态中，协调分片四副本的 `ordered_only=40`，叶子 1、2 四副本各自的 `leaf_ordered_cst=40`，两个叶子的 `executed=0`。当前代码运行上述命令会继续执行、确认并显示 `completed=40`；当前预期见 [STAGE2B_DESIGN.md](STAGE2B_DESIGN.md)。每个叶子的 `commits.jsonl` 中仍可见嵌入协调分片证书的本地 PBFT 提交。
 
-自动测试：`python3 tests/test_stage2a.py`。它启动 12 个节点，检查两片叶子的排序收敛、真实提交证书以及篡改 COMMIT 签名、缺少跨片访问集后的拒绝行为。下一次交付将在这些已排序批次上实现叶子执行、依赖交换和最终完成确认。
+自动测试：`python3 tests/test_stage2a.py`。它启动 12 个节点，检查两片叶子的排序收敛、真实提交证书以及篡改 COMMIT 签名、缺少跨片访问集后的拒绝行为。叶子执行、依赖交换和最终完成确认现已在第二阶段 B 实现，验收方式见 [STAGE2B_DESIGN.md](STAGE2B_DESIGN.md)。

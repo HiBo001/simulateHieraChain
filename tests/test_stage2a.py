@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 2A: certified coordinator order delivered into both leaf PBFT logs."""
+"""Certified coordinator order reaches both leaf PBFT logs before finalization."""
 import copy
 import importlib.util
 import json
@@ -48,8 +48,8 @@ class CrossShardOrdering(unittest.TestCase):
             rc, result = c.load(run, count=40, rate=80, participants=[1, 2],
                                 batch=8, timeout=20)
             self.assertEqual(rc, 0)
-            self.assertEqual(result["ordered_only_transactions"], 40)
-            self.assertEqual(result["executed_transactions"], 0)
+            self.assertEqual(result["ordered_only_transactions"], 0)
+            self.assertEqual(result["executed_transactions"], 40)
             for request in result["workload"]["requests"]:
                 for tx in request["txs"]:
                     self.assertEqual([a["shard"] for a in tx["accesses"]], [1, 2])
@@ -57,7 +57,8 @@ class CrossShardOrdering(unittest.TestCase):
             while time.monotonic() < deadline:
                 rows = c.statuses(run)
                 if all(sum(r["leaf_ordered_cst_transactions"] == 40 and
-                           r["executed_transactions"] == 0 for r in rows if r["shard"] == leaf) == 4
+                           r["executed_transactions"] == 40 and r["staged_cst_batches"] == 0
+                           for r in rows if r["shard"] == leaf) == 4
                        for leaf in [1, 2]):
                     break
                 time.sleep(.1)
@@ -75,7 +76,8 @@ class CrossShardOrdering(unittest.TestCase):
             commits = [json.loads(line) for line in (Path(leaf["directory"]) / "commits.jsonl").read_text().splitlines()]
             orders = [entry["certificate"]["proposal"]["body"]["value"]["cst_orders"][0]
                       for entry in commits if "cst_orders" in entry["certificate"]["proposal"]["body"]["value"]]
-            self.assertEqual([cert["proposal"]["body"]["seq"] for cert in orders], [1, 2, 3, 4, 5])
+            self.assertEqual([cert["proposal"]["body"]["value"]["cst_order_index"] for cert in orders],
+                             [1, 2, 3, 4, 5])
             self.assertTrue(all(len(cert["commits"]) >= 3 for cert in orders))
             forged = copy.deepcopy(orders[0])
             forged["commits"][0]["signature"] = "00" * 64

@@ -478,7 +478,7 @@ def main():
             print(json.dumps(rows, ensure_ascii=False, indent=2))
         else:
             for r in rows:
-                print(f"shard={r['shard']} node={r['replica']} alive={r['alive']} view={r.get('view','?')} primary={r.get('primary','?')} batches={r.get('applied_batches',0)} executed={r.get('executed_transactions',0)} ordered_only={r.get('ordered_cst_transactions',0)} leaf_ordered_cst={r.get('leaf_ordered_cst_transactions',0)}")
+                print(f"shard={r['shard']} node={r['replica']} alive={r['alive']} view={r.get('view','?')} primary={r.get('primary','?')} batches={r.get('applied_batches',0)} executed={r.get('executed_transactions',0)} ordered_only={r.get('ordered_cst_transactions',0)} leaf_ordered_cst={r.get('leaf_ordered_cst_transactions',0)} staged_cst={r.get('staged_cst_batches',0)} finalized_cst={r.get('finalized_cst_batches',0)} completed_cst={r.get('completed_cst_transactions',0)}")
     elif a.command == "load":
         if a.participants and a.shard is not None:
             raise ValueError("--shard 和 --participants 不能同时指定")

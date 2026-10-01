@@ -15,6 +15,7 @@ $(BIN): source/main.cpp source/common.h source/network.h third_party/nlohmann/js
 test: $(BIN)
 	python3 tests/test_stage1.py
 	python3 tests/test_stage2a.py
+	python3 tests/test_stage2b.py
 check:
 	python3 scripts/cluster.py validate --config config/two_layer.json
 clean:

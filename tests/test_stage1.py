@@ -228,7 +228,7 @@ class Integration(unittest.TestCase):
             d = digest(value)
             pp = replica_msg("PREPREPARE", 0, 0, seq=1, digest=d, value=value)
             prepared = {"proposal": pp, "prepares": [replica_msg("PREPARE", r, 0, seq=1, digest=d) for r in [1, 2]]}
-            initial = {"seq": 0, "chain": __import__("hashlib").sha256(b"arbor-genesis").hexdigest(), "kv": {}, "seen": {}, "requests": {}, "executed": 0, "ordered_cst": 0, "cst_batches": {}, "cst_seen": {}, "leaf_ordered_cst": 0, "last_cst_seq": 0}
+            initial = {"seq": 0, "chain": __import__("hashlib").sha256(b"arbor-genesis").hexdigest(), "kv": {}, "seen": {}, "requests": {}, "executed": 0, "ordered_cst": 0, "cst_batches": {}, "cst_seen": {}, "leaf_ordered_cst": 0, "last_cst_seq": 0, "cst_staged": {}, "cst_finalized": {}, "cst_decisions": {}, "cst_order_index": 0}
             checkpoint = {"seq": 0, "state": initial, "proof": []}
             vcs = [replica_msg("VIEW_CHANGE", r, 1, stable=checkpoint, prepared=[prepared] if r == 2 else []) for r in [1, 2, 3]]
             bad = replica_msg("NEW_VIEW", 1, 1, changes=vcs, proposals=[])

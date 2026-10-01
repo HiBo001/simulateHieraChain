@@ -101,17 +101,30 @@ class Replica {
     json stableProof=json::array(), stableState;
     json state={{"seq",0},{"chain",hash("arbor-genesis")},{"kv",json::object()},
                 {"seen",json::object()},{"requests",json::object()},{"executed",0},{"ordered_cst",0},
-                {"cst_batches",json::object()},{"cst_seen",json::object()},{"leaf_ordered_cst",0},{"last_cst_seq",0}};
+                {"cst_batches",json::object()},{"cst_seen",json::object()},{"leaf_ordered_cst",0},{"last_cst_seq",0},
+                {"cst_staged",json::object()},{"cst_finalized",json::object()},{"cst_decisions",json::object()},
+                {"cst_order_index",0}};
     std::map<std::string,json> pending;
     std::map<std::string,json> pendingCst;
+    std::map<std::string,json> pendingDecisions;
+    std::map<std::string,std::map<int,json>> preparedVotes, ackVotes;
+    std::map<std::string,std::map<int,json>> readyVotes;
+    std::map<std::string,json> readySent, completedCstResults;
+    std::map<std::string,json> decisionCerts;
+    std::set<std::string> completedCstBatches, ackConfirmed;
+    std::map<std::string,std::set<int>> doneVotes;
+    mutable std::set<std::string> checkedOrders, checkedRecords, checkedProofs,
+                                  checkedReadies, checkedDecisions, checkedDecisionCerts;
     std::map<std::string,Clock::time_point> pingStarts;
     std::map<std::string,std::string> pingPeers;
     json probes=json::object();
     std::ofstream journal, events;
-    Clock::time_point lastProgress=Clock::now(),lastRetry=Clock::now(),lastStatus=Clock::now(),batchStart=Clock::now();
+    Clock::time_point lastProgress=Clock::now(),lastRetry=Clock::now(),lastCstRetry=Clock::now(),
+                      lastStatus=Clock::now(),batchStart=Clock::now();
     uint64_t rejected=0, duplicates=0, viewCount=0, executionNs=0;
     std::atomic<uint64_t> inboxDropped{0};
     int timeoutMs, batchSize, checkpointEvery;
+    uint64_t expectedFib=0;
     json myViewChange, lastNewView;
     int window=64;
     json make(std::string type,json fields=json::object(),int v=-1) {
@@ -128,6 +141,21 @@ class Replica {
         else net.send(members.endpoints.at(identity(s,r)),env,members.delay(shard,s));
     }
     void broadcast(const json& env) { for(int r=0;r<4;++r) sendTo(shard,r,env); }
+    int coordinator() const {
+        for(const auto& [id,parent]:members.parent) if(parent==-1) return id;
+        throw std::runtime_error("missing coordinator");
+    }
+    int otherLeaf(int leaf) const {
+        for(int id:members.leaves) if(id!=leaf) return id;
+        throw std::runtime_error("missing peer leaf");
+    }
+    json initialAccount() const { return {{"version",uint64_t(0)},{"digest",hash("initial")},{"value",uint64_t(0)}}; }
+    uint64_t fibonacci() const {
+        uint64_t a=0,b=1;
+        int loops=members.config.at("execution").at("fib_iterations");
+        for(int k=0;k<loops;++k) { uint64_t next=a+b; a=b; b=next; }
+        return a;
+    }
     bool validVote(const json& e,const std::string& type,int v,int seq,const std::string& digest) const {
         try {
             const auto& b=e.at("body");
@@ -167,59 +195,238 @@ class Replica {
         } catch (...) { return false; }
     }
     bool validRequest(const json& e) const { return validRequestForShard(e,shard); }
-    bool validCoordinatorCertificate(const json& c) const {
+    bool validForeignCertificate(const json& c,int origin) const {
         try {
             const auto& pp=c.at("proposal"); const auto& b=pp.at("body");
-            int coordinator=b.at("shard"),v=b.at("view"),seq=b.at("seq");
-            if(!members.twoLayer() || !members.leaves.count(shard) || members.parent.at(shard)!=coordinator ||
-               members.leaves.count(coordinator) || v<0 || seq<=0 || b.at("type")!="PREPREPARE" ||
-               b.at("from")!=v%4 || !members.replicaMessage(pp)) return false;
-            const auto& value=b.at("value");
-            if(!value.at("requests").is_array() || value.at("requests").empty() || value.contains("cst_orders") ||
-               b.at("digest")!=hash(value.dump())) return false;
-            int total=0,local=0;
-            for(const auto& req:value.at("requests")) {
-                if(!validRequestForShard(req,coordinator)) return false;
-                for(const auto& tx:req.at("body").at("txs")) {
-                    ++total;
-                    for(auto participant:tx.at("participants")) if(participant==shard) ++local;
-                }
-            }
-            if(!local || total>batchSize) return false;
+            int v=b.at("view"),seq=b.at("seq");
+            if(b.at("shard")!=origin || v<0 || seq<=0 || b.at("type")!="PREPREPARE" ||
+               b.at("from")!=v%4 || !members.replicaMessage(pp) ||
+               b.at("digest")!=hash(b.at("value").dump())) return false;
             std::set<int> prepares,commits;
             for(const auto& vote:c.at("prepares")) {
                 const auto& vb=vote.at("body"); int signer=vb.at("from");
                 if(signer==v%4 || !prepares.insert(signer).second || !members.replicaMessage(vote) ||
-                   vb.at("shard")!=coordinator || vb.at("type")!="PREPARE" || vb.at("view")!=v ||
+                   vb.at("shard")!=origin || vb.at("type")!="PREPARE" || vb.at("view")!=v ||
                    vb.at("seq")!=seq || vb.at("digest")!=b.at("digest")) return false;
             }
             for(const auto& vote:c.at("commits")) {
                 const auto& vb=vote.at("body"); int signer=vb.at("from");
                 if(!commits.insert(signer).second || !members.replicaMessage(vote) ||
-                   vb.at("shard")!=coordinator || vb.at("type")!="COMMIT" || vb.at("view")!=v ||
+                   vb.at("shard")!=origin || vb.at("type")!="COMMIT" || vb.at("view")!=v ||
                    vb.at("seq")!=seq || vb.at("digest")!=b.at("digest")) return false;
             }
             return prepares.size()>=2 && commits.size()>=3;
+        } catch (...) { return false; }
+    }
+    bool validCoordinatorCertificate(const json& c) const {
+        try {
+            auto fingerprint=hash(c.dump());
+            if(checkedOrders.count(fingerprint)) return true;
+            if(!members.twoLayer() || !validForeignCertificate(c,coordinator())) return false;
+            const auto& b=c.at("proposal").at("body");
+            const auto& value=b.at("value");
+            if(!value.at("requests").is_array() || value.at("requests").empty() ||
+               value.contains("cst_orders") || value.contains("cst_decisions")) return false;
+            if(!value.at("cst_order_index").is_number_integer() || value.at("cst_order_index").get<int>()<=0) return false;
+            int total=0,local=0;
+            for(const auto& req:value.at("requests")) {
+                if(!validRequestForShard(req,coordinator())) return false;
+                for(const auto& tx:req.at("body").at("txs")) {
+                    ++total;
+                    for(auto participant:tx.at("participants")) if(participant==shard) ++local;
+                }
+            }
+            bool valid=total<=batchSize && (!members.leaves.count(shard) || local>0);
+            if(valid && checkedOrders.size()<10000) checkedOrders.insert(fingerprint);
+            return valid;
         } catch (...) { return false; }
     }
     static std::string cstKey(const json& cert) {
         const auto& b=cert.at("proposal").at("body");
         return std::to_string(b.at("shard").get<int>())+":"+std::to_string(b.at("seq").get<int>());
     }
+    json accessFor(const json& tx,int owner) const {
+        for(const auto& access:tx.at("accesses")) if(access.at("shard")==owner) return access;
+        throw std::runtime_error("missing participant access");
+    }
+    bool validPreparedRecord(const json& record,int origin) const {
+        try {
+            auto fingerprint=std::to_string(origin)+":"+hash(record.dump());
+            if(checkedRecords.count(fingerprint)) return true;
+            if(!members.leaves.count(origin) || !validCoordinatorCertificate(record.at("order_certificate")) ||
+               record.at("shard")!=origin || record.at("batch_key")!=cstKey(record.at("order_certificate")) ||
+               record.at("order_digest")!=record.at("order_certificate").at("proposal").at("body").at("digest") ||
+               !record.at("reads").is_object() || !record.at("writes").is_array()) return false;
+            std::set<std::string> keys;
+            size_t index=0;
+            const auto& requests=record.at("order_certificate").at("proposal").at("body").at("value").at("requests");
+            for(const auto& request:requests) for(const auto& tx:request.at("body").at("txs")) {
+                auto access=accessFor(tx,origin);
+                if(index>=record.at("writes").size()) return false;
+                const auto& write=record.at("writes")[index++];
+                if(write.at("id")!=tx.at("id") || write.at("tx_digest")!=hash(tx.dump()) ||
+                   write.at("key")!=access.at("key") || write.at("value")!=access.at("value") ||
+                   write.at("fib")!=expectedFib || !write.at("duplicate").is_boolean()) return false;
+                if(!write.at("duplicate").get<bool>()) keys.insert(access.at("key"));
+            }
+            if(index!=record.at("writes").size() || record.at("reads").size()!=keys.size()) return false;
+            for(const auto& key:keys) {
+                const auto& read=record.at("reads").at(key);
+                if(!read.at("version").is_number_integer() || !read.at("value").is_number_integer() ||
+                   (read.at("version").is_number_integer() && !read.at("version").is_number_unsigned() && read.at("version").get<int64_t>()<0) ||
+                   (read.at("value").is_number_integer() && !read.at("value").is_number_unsigned() && read.at("value").get<int64_t>()<0) ||
+                   !read.at("digest").is_string()) return false;
+            }
+            if(checkedRecords.size()<10000) checkedRecords.insert(fingerprint);
+            return true;
+        } catch (...) { return false; }
+    }
+    bool validPreparedVote(const json& vote) const {
+        try {
+            const auto& body=vote.at("body"); int origin=body.at("shard");
+            return members.replicaMessage(vote) && body.at("type")=="CST_PREPARED" &&
+                body.at("batch_key")==vote.at("record").at("batch_key") &&
+                body.at("record_digest")==hash(vote.at("record").dump()) &&
+                validPreparedRecord(vote.at("record"),origin);
+        } catch (...) { return false; }
+    }
+    bool validPreparedProof(const json& proof,int origin) const {
+        try {
+            auto fingerprint=std::to_string(origin)+":"+hash(proof.dump());
+            if(checkedProofs.count(fingerprint)) return true;
+            const auto& votes=proof.at("votes");
+            const auto& record=proof.at("record");
+            if(!votes.is_array() || votes.size()!=3 || !validPreparedRecord(record,origin)) return false;
+            auto recordDigest=hash(record.dump());
+            std::set<int> signers;
+            for(const auto& vote:votes) {
+                const auto& b=vote.at("body");
+                if(b.at("shard")!=origin || b.at("type")!="CST_PREPARED" ||
+                   b.at("batch_key")!=record.at("batch_key") || b.at("record_digest")!=recordDigest ||
+                   !members.replicaMessage(vote) || vote.contains("record") ||
+                   !signers.insert(b.at("from").get<int>()).second) return false;
+            }
+            if(checkedProofs.size()<10000) checkedProofs.insert(fingerprint);
+            return true;
+        } catch (...) { return false; }
+    }
+    json proofRecord(const json& proof) const { return proof.at("record"); }
+    json decisionRecord(const json& decision,int owner) const {
+        for(const auto& proof:decision.at("ready")[0].at("body").at("proofs")) {
+            auto record=proofRecord(proof);
+            if(record.at("shard")==owner) return record;
+        }
+        throw std::runtime_error("decision missing participant");
+    }
+    bool validReady(const json& ready) const {
+        try {
+            auto fingerprint=hash(ready.dump());
+            if(checkedReadies.count(fingerprint)) return true;
+            const auto& b=ready.at("body"); int sender=b.at("shard");
+            if(!members.twoLayer() || !members.leaves.count(sender) || !members.replicaMessage(ready) ||
+               b.at("type")!="CST_READY" || b.at("target")!=coordinator() ||
+               !b.at("proofs").is_array() || b.at("proofs").size()!=2) return false;
+            std::set<int> owners; int previousOwner=-1;
+            std::string digest;
+            for(const auto& proof:b.at("proofs")) {
+                int owner=proofRecord(proof).at("shard");
+                if(owner<=previousOwner || !owners.insert(owner).second || !validPreparedProof(proof,owner)) return false;
+                previousOwner=owner;
+                const auto& rec=proofRecord(proof);
+                if(rec.at("batch_key")!=b.at("batch_key")) return false;
+                if(digest.empty()) digest=rec.at("order_digest");
+                else if(rec.at("order_digest")!=digest) return false;
+            }
+            bool valid=owners==members.leaves;
+            if(valid && checkedReadies.size()<10000) checkedReadies.insert(fingerprint);
+            return valid;
+        } catch (...) { return false; }
+    }
+    bool validDecision(const json& decision) const {
+        try {
+            auto fingerprint=hash(decision.dump());
+            if(checkedDecisions.count(fingerprint)) return true;
+            const auto& ready=decision.at("ready");
+            if(!ready.is_array() || ready.size()!=2 || !validReady(ready[0]) || !validReady(ready[1]) ||
+               ready[0].at("body").at("shard")==ready[1].at("body").at("shard") ||
+               ready[0].at("body").at("batch_key")!=ready[1].at("body").at("batch_key") ||
+               decision.at("batch_key")!=ready[0].at("body").at("batch_key")) return false;
+            for(size_t i=0;i<2;++i)
+                if(proofRecord(ready[0].at("body").at("proofs")[i])!=
+                   proofRecord(ready[1].at("body").at("proofs")[i])) return false;
+            auto left=decisionRecord(decision,*members.leaves.begin()),
+                 right=decisionRecord(decision,*members.leaves.rbegin());
+            for(size_t i=0;i<left.at("writes").size();++i)
+                if(left.at("writes")[i].at("duplicate")!=right.at("writes")[i].at("duplicate")) return false;
+            if(checkedDecisions.size()<10000) checkedDecisions.insert(fingerprint);
+            return true;
+        } catch (...) { return false; }
+    }
+    bool validDecisionCertificate(const json& cert) const {
+        try {
+            auto fingerprint=hash(cert.dump());
+            if(checkedDecisionCerts.count(fingerprint)) return true;
+            if(!validForeignCertificate(cert,coordinator())) return false;
+            const auto& value=cert.at("proposal").at("body").at("value");
+            bool valid=value.at("requests").is_array() && value.at("requests").empty() &&
+                !value.contains("cst_orders") && value.at("cst_decisions").is_array() &&
+                value.at("cst_decisions").size()==1 && validDecision(value.at("cst_decisions")[0]);
+            if(valid && checkedDecisionCerts.size()<10000) checkedDecisionCerts.insert(fingerprint);
+            return valid;
+        } catch (...) { return false; }
+    }
     bool validValue(const json& value) const {
         try {
             int n=0;
             if (!value.at("requests").is_array()) return false;
+            if(!state.at("cst_staged").empty() && members.leaves.count(shard) &&
+               (!value.at("requests").empty() || value.contains("cst_orders"))) return false;
             for(const auto& e:value.at("requests")) {
                 if (!validRequest(e)) return false;
                 n+=e.at("body").at("txs").size();
             }
+            if(shard==coordinator() && members.twoLayer()) {
+                std::map<std::string,std::string> ids;
+                for(const auto& request:value.at("requests"))
+                    for(const auto& tx:request.at("body").at("txs")) {
+                        auto id=tx.at("id").get<std::string>(),digest=hash(tx.dump());
+                        if((state.at("seen").contains(id) && state.at("seen").at(id).at("tx_digest")!=digest) ||
+                           (ids.count(id) && ids.at(id)!=digest)) return false;
+                        ids[id]=digest;
+                    }
+            }
+            if(value.contains("cst_decisions")) {
+                if(shard!=coordinator() || !members.twoLayer() || !value.at("requests").empty() ||
+                   value.contains("cst_orders") || value.contains("cst_finalizations") ||
+                   !value.at("cst_decisions").is_array() || value.at("cst_decisions").size()!=1 ||
+                   !validDecision(value.at("cst_decisions")[0]) ||
+                   state.at("cst_decisions").contains(value.at("cst_decisions")[0].at("batch_key").get<std::string>())) return false;
+            }
+            if(value.contains("cst_order_index")) {
+                if(shard!=coordinator() || !members.twoLayer() || value.at("requests").empty() ||
+                   value.contains("cst_orders") || value.contains("cst_decisions") ||
+                   value.contains("cst_finalizations") ||
+                   value.at("cst_order_index")!=state.at("cst_order_index").get<int>()+1) return false;
+            } else if(shard==coordinator() && members.twoLayer() && !value.at("requests").empty()) return false;
+            if(value.contains("cst_finalizations")) {
+                if(!members.leaves.count(shard) || !members.twoLayer() || !value.at("requests").empty() ||
+                   value.contains("cst_orders") || value.contains("cst_decisions") ||
+                   !value.at("cst_finalizations").is_array() || value.at("cst_finalizations").size()!=1) return false;
+                const auto& cert=value.at("cst_finalizations")[0];
+                if(!validDecisionCertificate(cert)) return false;
+                const auto& decision=cert.at("proposal").at("body").at("value").at("cst_decisions")[0];
+                auto key=decision.at("batch_key").get<std::string>();
+                if(!state.at("cst_staged").contains(key) ||
+                   state.at("cst_staged").at(key)!=decisionRecord(decision,shard)) return false;
+            }
             if(value.contains("cst_orders")) {
                 if(!members.leaves.count(shard) || !members.twoLayer() || !value.at("cst_orders").is_array() ||
-                   value.at("cst_orders").size()>1) return false;
+                   value.at("cst_orders").size()>1 || value.contains("cst_decisions") ||
+                   value.contains("cst_finalizations")) return false;
                 for(const auto& cert:value.at("cst_orders")) {
                     if(!validCoordinatorCertificate(cert) ||
-                       cert.at("proposal").at("body").at("seq").get<int>()!=state.at("last_cst_seq").get<int>()+1) return false;
+                       cert.at("proposal").at("body").at("value").at("cst_order_index").get<int>()!=
+                           state.at("last_cst_seq").get<int>()+1) return false;
                     for(const auto& req:cert.at("proposal").at("body").at("value").at("requests"))
                         for(const auto& tx:req.at("body").at("txs"))
                             for(auto participant:tx.at("participants")) if(participant==shard) ++n;
@@ -279,7 +486,9 @@ class Replica {
     }
     static json genesis() { return {{"seq",0},{"chain",hash("arbor-genesis")},{"kv",json::object()},
                 {"seen",json::object()},{"requests",json::object()},{"executed",0},{"ordered_cst",0},
-                {"cst_batches",json::object()},{"cst_seen",json::object()},{"leaf_ordered_cst",0},{"last_cst_seq",0}}; }
+                {"cst_batches",json::object()},{"cst_seen",json::object()},{"leaf_ordered_cst",0},{"last_cst_seq",0},
+                {"cst_staged",json::object()},{"cst_finalized",json::object()},{"cst_decisions",json::object()},
+                {"cst_order_index",0}}; }
     bool validVC(const json& e,int v) const {
         try {
             const auto& b=e.at("body");
@@ -349,7 +558,8 @@ class Replica {
         for(auto it=checkpointVotes.begin();it!=checkpointVotes.end();) it=it->first<h?checkpointVotes.erase(it):std::next(it);
         for(auto it=pending.begin();it!=pending.end();) {
             if(state["requests"].contains(it->first)) {
-                reply(it->second,state["requests"][it->first]["results"]);
+                if(completedCstResults.count(it->first)) reply(it->second,completedCstResults.at(it->first));
+                else if(members.leaves.count(shard) || !members.twoLayer()) reply(it->second,state["requests"][it->first]["results"]);
                 it=pending.erase(it);
             } else ++it;
         }
@@ -382,6 +592,7 @@ class Replica {
         // A committed sequence may be replayed in a new view, never replaced.
         if(certificates.count(n) && certificates[n].at("proposal").at("body").at("digest")!=b.at("digest")) throw std::runtime_error("conflicting committed sequence");
         s.proposal=e;
+        lastProgress=Clock::now();
         log("preprepare",{{"seq",n},{"digest",b.at("digest")}});
         if(me!=view%4) broadcast(make("PREPARE",{{"seq",n},{"digest",b.at("digest")}}));
         advance(n);
@@ -407,6 +618,12 @@ class Replica {
         auto e=make("REPLY",{{"request",b.at("id")},{"results",results}});
         net.send({ep.at("host"),ep.at("port")},e,0);
     }
+    void replyConflict(const json& req) {
+        json results=json::array();
+        for(const auto& tx:req.at("body").at("txs"))
+            results.push_back({{"id",tx.at("id")},{"error","id_conflict"}});
+        reply(req,results);
+    }
     void forwardCstOrder(const json& cert,const json& value) {
         if(members.leaves.count(shard) || !members.twoLayer()) return;
         std::set<int> destinations;
@@ -420,9 +637,161 @@ class Replica {
         if(!destinations.empty()) log("cst_order_forwarded",{{"coordinator_seq",cert.at("proposal").at("body").at("seq")},
             {"destinations",destinations}});
     }
+    void sendPrepared(const std::string& key) {
+        if(!members.leaves.count(shard) || !state["cst_staged"].contains(key)) return;
+        const auto& record=state["cst_staged"].at(key);
+        auto vote=make("CST_PREPARED",{{"batch_key",key},{"record_digest",hash(record.dump())}});
+        vote["record"]=record;
+        for(int leaf:members.leaves) for(int replica=0;replica<4;++replica) sendTo(leaf,replica,vote);
+    }
+    void stageCst(const json& cert) {
+        auto key=cstKey(cert);
+        json record={{"shard",shard},{"batch_key",key},
+                     {"order_digest",cert.at("proposal").at("body").at("digest")},
+                     {"order_certificate",cert},{"reads",json::object()},{"writes",json::array()}};
+        for(const auto& request:cert.at("proposal").at("body").at("value").at("requests"))
+            for(const auto& tx:request.at("body").at("txs")) {
+                auto access=accessFor(tx,shard);
+                auto localKey=access.at("key").get<std::string>();
+                std::string id=tx.at("id");
+                bool duplicate=state["cst_seen"].contains(id);
+                if(duplicate && state["cst_seen"].at(id).at("tx_digest")!=hash(tx.dump()))
+                    throw std::runtime_error("cross-shard transaction ID reused with different content");
+                if(!duplicate && !record["reads"].contains(localKey))
+                    record["reads"][localKey]=state["kv"].contains(localKey)?state["kv"].at(localKey):initialAccount();
+                record["writes"].push_back({{"id",tx.at("id")},{"tx_digest",hash(tx.dump())},
+                                             {"key",localKey},{"value",access.at("value")},
+                                             {"fib",duplicate?expectedFib:fibonacci()},{"duplicate",duplicate}});
+                if(!duplicate) {
+                    state["cst_seen"][id]={{"tx_digest",hash(tx.dump())},{"coordinator_batch",key}};
+                    state["leaf_ordered_cst"]=state["leaf_ordered_cst"].get<uint64_t>()+1;
+                }
+            }
+        state["cst_staged"][key]=record;
+        log("cst_staged",{{"batch_key",key},{"transactions",record["writes"].size()}});
+    }
+    void maybeReady(const std::string& key) {
+        if(!state["cst_staged"].contains(key) || readySent.count(key)) return;
+        json proofs=json::array();
+        for(int leaf:members.leaves) {
+            json proof;
+            std::string prefix=key+"|"+std::to_string(leaf)+"|";
+            for(const auto& [group,votes]:preparedVotes) if(group.rfind(prefix,0)==0 && votes.size()>=3) {
+                json selected=json::array();
+                for(const auto& [replica,vote]:votes) {
+                    (void)replica;
+                    if(selected.size()<3) selected.push_back({{"body",vote.at("body")},{"signature",vote.at("signature")}});
+                }
+                json candidate={{"record",votes.begin()->second.at("record")},{"votes",selected}};
+                if(validPreparedProof(candidate,leaf)) {proof=candidate;break;}
+            }
+            if(proof.is_null()) return;
+            proofs.push_back(proof);
+        }
+        if(proofRecord(proofs[0]).at("order_digest")!=proofRecord(proofs[1]).at("order_digest")) return;
+        auto ready=make("CST_READY",{{"batch_key",key},{"target",coordinator()},{"proofs",proofs}});
+        if(!validReady(ready)) throw std::runtime_error("locally constructed CST_READY is invalid");
+        readySent[key]=ready;
+        sendTo(coordinator(),me,ready);
+        log("cst_dependencies_ready",{{"batch_key",key}});
+    }
+    void forwardDecision(const json& cert) {
+        const auto& decision=cert.at("proposal").at("body").at("value").at("cst_decisions")[0];
+        for(int leaf:members.leaves) {
+            auto env=make("CST_DECISION",{{"target",leaf},{"certificate",cert}});
+            sendTo(leaf,me,env);
+        }
+        (void)decision;
+    }
+    void sendAck(const std::string& key) {
+        if(!state["cst_finalized"].contains(key) || ackConfirmed.count(key)) return;
+        const auto& done=state["cst_finalized"].at(key);
+        auto ack=make("CST_ACK",{{"batch_key",key},{"target",coordinator()},
+                                  {"decision_digest",done.at("decision_digest")},
+                                  {"result_digest",done.at("result_digest")}});
+        for(int replica=0;replica<4;++replica) sendTo(coordinator(),replica,ack);
+    }
+    void sendDone(const std::string& key) {
+        if(!state["cst_decisions"].contains(key)) return;
+        for(int leaf:members.leaves) {
+            auto done=make("CST_DONE",{{"target",leaf},{"batch_key",key},
+                                       {"decision_digest",hash(state["cst_decisions"].at(key).dump())}});
+            for(int replica=0;replica<4;++replica) sendTo(leaf,replica,done);
+        }
+    }
+    void finalizeCst(const json& decision) {
+        auto key=decision.at("batch_key").get<std::string>();
+        auto mine=decisionRecord(decision,shard), peer=decisionRecord(decision,otherLeaf(shard));
+        if(mine!=state["cst_staged"].at(key)) throw std::runtime_error("local prepared result differs from decision");
+        std::map<int,json> working={{shard,mine.at("reads")},{otherLeaf(shard),peer.at("reads")}};
+        json localWrites=json::array();
+        const auto& requests=mine.at("order_certificate").at("proposal").at("body").at("value").at("requests");
+        size_t index=0;
+        for(const auto& request:requests) for(const auto& tx:request.at("body").at("txs")) {
+            bool duplicate=mine.at("writes")[index++].at("duplicate");
+            if(duplicate) continue;
+            auto a=accessFor(tx,shard), b=accessFor(tx,otherLeaf(shard));
+            std::string ak=a.at("key"),bk=b.at("key");
+            json oldA=working.at(shard).at(ak),oldB=working.at(otherLeaf(shard)).at(bk);
+            uint64_t fib=expectedFib;
+            uint64_t newA=a.at("value").get<uint64_t>()+oldB.at("value").get<uint64_t>()+fib;
+            uint64_t newB=b.at("value").get<uint64_t>()+oldA.at("value").get<uint64_t>()+fib;
+            json nextA={{"version",oldA.at("version").get<uint64_t>()+1},{"value",newA},{"fib",fib},
+                        {"digest",hash(oldA.dump()+oldB.dump()+tx.dump()+std::to_string(shard))}};
+            json nextB={{"version",oldB.at("version").get<uint64_t>()+1},{"value",newB},{"fib",fib},
+                        {"digest",hash(oldB.dump()+oldA.dump()+tx.dump()+std::to_string(otherLeaf(shard)))}};
+            working[shard][ak]=nextA;
+            working[otherLeaf(shard)][bk]=nextB;
+            localWrites.push_back({{"id",tx.at("id")},{"key",ak},{"state",nextA}});
+            state["cst_seen"][tx.at("id").get<std::string>()]["committed"]=true;
+            state["executed"]=state["executed"].get<uint64_t>()+1;
+        }
+        for(auto it=working.at(shard).begin();it!=working.at(shard).end();++it) state["kv"][it.key()]=it.value();
+        auto digest=hash(localWrites.dump());
+        state["cst_finalized"][key]={{"decision_digest",hash(decision.dump())},{"result_digest",digest}};
+        state["cst_staged"].erase(key);
+        log("cst_finalized",{{"batch_key",key},{"transactions",localWrites.size()}});
+    }
+    void maybeCompleteBatch(const std::string& key) {
+        if(!state["cst_decisions"].contains(key)) return;
+        if(completedCstBatches.count(key)) {sendDone(key);return;}
+        const auto& decision=state["cst_decisions"].at(key);
+        std::map<int,std::string> digests;
+        for(int leaf:members.leaves) {
+            std::string prefix=key+"|"+std::to_string(leaf)+"|";
+            for(const auto& [group,votes]:ackVotes) if(group.rfind(prefix,0)==0 && votes.size()>=3) {
+                const auto& body=votes.begin()->second.at("body");
+                if(body.at("decision_digest")==hash(decision.dump())) {digests[leaf]=body.at("result_digest");break;}
+            }
+            if(!digests.count(leaf)) return;
+        }
+        auto record=decisionRecord(decision,*members.leaves.begin());
+        const auto& cert=record.at("order_certificate");
+        size_t index=0;
+        for(const auto& request:cert.at("proposal").at("body").at("value").at("requests")) {
+            std::string rid=request.at("body").at("id");
+            if(completedCstResults.count(rid)) {index+=request.at("body").at("txs").size();continue;}
+            json results=json::array();
+            for(const auto& tx:request.at("body").at("txs")) {
+                bool duplicate=record.at("writes")[index++].at("duplicate");
+                results.push_back({{"id",tx.at("id")},{"kind",duplicate?"duplicate":"executed"},
+                                   {"digest",hash(tx.at("id").get<std::string>()+hash(decision.dump())+
+                                                  digests.begin()->second+digests.rbegin()->second)}});
+            }
+            completedCstResults[rid]=results;
+            reply(request,results);
+        }
+        completedCstBatches.insert(key);
+        decisionCerts.erase(key);
+        for(auto it=ackVotes.begin();it!=ackVotes.end();) it=it->first.rfind(key+"|",0)==0?ackVotes.erase(it):std::next(it);
+        sendDone(key);
+        log("cst_complete",{{"batch_key",key}});
+    }
     void applyReady() {
         while(certificates.count(applied+1)) {
             int n=applied+1; const auto cert=certificates.at(n); const auto& value=cert.at("proposal").at("body").at("value");
+            if(members.leaves.count(shard) && !state["cst_staged"].empty() &&
+               (!value.at("requests").empty() || value.contains("cst_orders"))) break;
             auto before=Clock::now();
             for(const auto& req:value.at("requests")) {
                 const auto& rb=req.at("body"); std::string rid=rb.at("id");
@@ -430,7 +799,8 @@ class Replica {
                 json results=json::array();
                 if(state["requests"].contains(rid) && state["requests"][rid]["txs_hash"]!=requestHash) {
                     for(const auto& tx:rb.at("txs")) results.push_back({{"id",tx.at("id")},{"error","request_id_conflict"}});
-                    reply(req,results); pending.erase(rid); continue;
+                    if(members.leaves.count(shard) || !members.twoLayer()) reply(req,results);
+                    pending.erase(rid); continue;
                 }
                 for(const auto& tx:rb.at("txs")) {
                     std::string id=tx.at("id"); auto d=hash(tx.dump());
@@ -454,8 +824,10 @@ class Replica {
                     state["seen"][id]={{"tx_digest",d},{"result",result}}; results.push_back(result);
                 }
                 state["requests"][rid]={{"txs_hash",requestHash},{"results",results}};
-                pending.erase(rid); reply(req,results);
+                pending.erase(rid);
+                if(members.leaves.count(shard) || !members.twoLayer()) reply(req,results);
             }
+            if(value.contains("cst_order_index")) state["cst_order_index"]=value.at("cst_order_index");
             if(value.contains("cst_orders")) for(const auto& cst:value.at("cst_orders")) {
                 std::string key=cstKey(cst);
                 std::string digest=cst.at("proposal").at("body").at("digest");
@@ -463,27 +835,41 @@ class Replica {
                     throw std::runtime_error("conflicting certified CST batch");
                 if(!state["cst_batches"].contains(key)) {
                     state["cst_batches"][key]=digest;
-                    state["last_cst_seq"]=cst.at("proposal").at("body").at("seq");
-                    for(const auto& request:cst.at("proposal").at("body").at("value").at("requests"))
-                        for(const auto& tx:request.at("body").at("txs")) {
-                            bool involved=false;
-                            for(auto participant:tx.at("participants")) if(participant==shard) involved=true;
-                            if(!involved) continue;
-                            std::string id=tx.at("id");
-                            if(!state["cst_seen"].contains(id)) {
-                                state["cst_seen"][id]={{"tx_digest",hash(tx.dump())},{"coordinator_batch",key}};
-                                state["leaf_ordered_cst"]=state["leaf_ordered_cst"].get<uint64_t>()+1;
-                            }
-                        }
+                    state["last_cst_seq"]=cst.at("proposal").at("body").at("value").at("cst_order_index");
+                    stageCst(cst);
                     log("cst_ordered_at_leaf",{{"coordinator_batch",key},{"digest",digest}});
                 }
                 pendingCst.erase(key);
+            }
+            if(value.contains("cst_decisions")) for(const auto& decision:value.at("cst_decisions")) {
+                auto key=decision.at("batch_key").get<std::string>();
+                state["cst_decisions"][key]=decision;
+                readyVotes.erase(key);
+                log("cst_decided",{{"batch_key",key}});
+            }
+            if(value.contains("cst_finalizations")) for(const auto& decisionCert:value.at("cst_finalizations")) {
+                const auto& decision=decisionCert.at("proposal").at("body").at("value").at("cst_decisions")[0];
+                auto key=decision.at("batch_key").get<std::string>();
+                finalizeCst(decision);
+                pendingDecisions.erase(key);
+                readySent.erase(key);
             }
             state["chain"]=hash(state["chain"].get<std::string>()+std::to_string(n)+value.dump());
             applied=n; state["seq"]=n;
             executionNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-before).count();
             journal<<json{{"seq",n},{"value_digest",hash(value.dump())},{"state_digest",hash(state.dump())},{"certificate",cert}}.dump()<<'\n'; journal.flush();
             if(!members.leaves.count(shard)) forwardCstOrder(cert,value);
+            if(members.leaves.count(shard)) {
+                if(value.contains("cst_orders")) for(const auto& cst:value.at("cst_orders")) sendPrepared(cstKey(cst));
+                if(value.contains("cst_finalizations")) for(const auto& decisionCert:value.at("cst_finalizations")) {
+                    const auto& d=decisionCert.at("proposal").at("body").at("value").at("cst_decisions")[0];
+                    sendAck(d.at("batch_key"));
+                }
+            } else if(value.contains("cst_decisions")) {
+                for(const auto& decision:value.at("cst_decisions")) decisionCerts[decision.at("batch_key")]=cert;
+                forwardDecision(cert);
+                for(const auto& decision:value.at("cst_decisions")) maybeCompleteBatch(decision.at("batch_key"));
+            }
             lastProgress=Clock::now();
             if(n%checkpointEvery==0) {
                 snapshots[n]=state;
@@ -499,23 +885,64 @@ class Replica {
         if(proof.size()>=3) installStable({{"seq",n},{"state",snapshots[n]},{"proof",proof}});
     }
     void propose() {
-        if(changing || me!=view%4 || (pending.empty() && pendingCst.empty()) || applied+1>stableSeq+window) return;
+        if(changing || me!=view%4 || applied+1>stableSeq+window) return;
         // One fresh batch in flight. Recovery slots may coexist after a view change.
         if(slots.count(applied+1) && !slots.at(applied+1).proposal.is_null()) return;
         if(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-batchStart).count()<members.config.at("consensus").at("batch_wait_ms").get<int>()) return;
+        if(members.leaves.count(shard) && !state["cst_staged"].empty()) {
+            auto key=state["cst_staged"].begin().key();
+            auto found=pendingDecisions.find(key);
+            if(found==pendingDecisions.end()) return;
+            json value={{"requests",json::array()},
+                        {"cst_finalizations",json::array({found->second.at("body").at("certificate")})}};
+            broadcast(make("PREPREPARE",{{"seq",applied+1},{"digest",hash(value.dump())},{"value",value}}));
+            batchStart=Clock::now(); return;
+        }
+        if(shard==coordinator() && members.twoLayer()) for(const auto& [key,fromLeaves]:readyVotes) {
+            if(state["cst_decisions"].contains(key) || fromLeaves.size()!=2) continue;
+            json decision={{"batch_key",key},{"ready",json::array({fromLeaves.at(*members.leaves.begin()),
+                                                fromLeaves.at(*members.leaves.rbegin())})}};
+            if(!validDecision(decision)) continue;
+            json value={{"requests",json::array()},{"cst_decisions",json::array({decision})}};
+            broadcast(make("PREPREPARE",{{"seq",applied+1},{"digest",hash(value.dump())},{"value",value}}));
+            batchStart=Clock::now(); return;
+        }
+        if(pending.empty() && pendingCst.empty()) return;
         json reqs=json::array(); int count=0;
+        std::map<std::string,std::string> selectedIds;
         for(auto it=pending.begin();it!=pending.end();) {
-            if(state["requests"].contains(it->first)) { reply(it->second,state["requests"][it->first]["results"]); it=pending.erase(it); continue; }
+            if(state["requests"].contains(it->first)) {
+                if(completedCstResults.count(it->first)) reply(it->second,completedCstResults.at(it->first));
+                else if(members.leaves.count(shard) || !members.twoLayer()) reply(it->second,state["requests"][it->first]["results"]);
+                it=pending.erase(it); continue;
+            }
             int size=it->second.at("body").at("txs").size();
             if(count+size>batchSize) break;
+            if(shard==coordinator() && members.twoLayer()) {
+                bool conflict=false;
+                for(const auto& tx:it->second.at("body").at("txs")) {
+                    auto id=tx.at("id").get<std::string>(),digest=hash(tx.dump());
+                    if((state["seen"].contains(id) && state["seen"].at(id).at("tx_digest")!=digest) ||
+                       (selectedIds.count(id) && selectedIds.at(id)!=digest)) conflict=true;
+                }
+                if(conflict) {replyConflict(it->second);it=pending.erase(it);continue;}
+                for(const auto& tx:it->second.at("body").at("txs"))
+                    selectedIds[tx.at("id").get<std::string>()]=hash(tx.dump());
+            }
             reqs.push_back(it->second); count+=size; ++it;
         }
         json value={{"requests",reqs}};
+        if(!reqs.empty() && shard==coordinator() && members.twoLayer())
+            value["cst_order_index"]=state.at("cst_order_index").get<int>()+1;
         if(reqs.empty() && !pendingCst.empty()) {
-            std::string expected=std::to_string(members.parent.at(shard))+":"+
-                std::to_string(state.at("last_cst_seq").get<int>()+1);
-            auto next=pendingCst.find(expected);
-            if(next!=pendingCst.end()) value["cst_orders"]=json::array({next->second.at("body").at("certificate")});
+            int expected=state.at("last_cst_seq").get<int>()+1;
+            for(const auto& [key,message]:pendingCst) {
+                (void)key;
+                const auto& cert=message.at("body").at("certificate");
+                if(cert.at("proposal").at("body").at("value").at("cst_order_index")==expected) {
+                    value["cst_orders"]=json::array({cert});break;
+                }
+            }
         }
         if(reqs.empty() && !value.contains("cst_orders")) return;
         broadcast(make("PREPREPARE",{{"seq",applied+1},{"digest",hash(value.dump())},{"value",value}}));
@@ -526,8 +953,19 @@ class Replica {
         if(type=="CLIENT") {
             if(!validRequest(e)) {rejected++;return;}
             std::string id=b.at("id");
+            if(shard==coordinator() && members.twoLayer()) {
+                for(const auto& tx:b.at("txs")) {
+                    auto tid=tx.at("id").get<std::string>();
+                    if(state["seen"].contains(tid) && state["seen"].at(tid).at("tx_digest")!=hash(tx.dump())) {
+                        replyConflict(e);rejected++;return;
+                    }
+                }
+            }
             if(state["requests"].contains(id)) {
-                if(state["requests"][id]["txs_hash"]==hash(b.at("txs").dump())) reply(e,state["requests"][id]["results"]);
+                if(state["requests"][id]["txs_hash"]==hash(b.at("txs").dump())) {
+                    if(completedCstResults.count(id)) reply(e,completedCstResults.at(id));
+                    else if(members.leaves.count(shard) || !members.twoLayer()) reply(e,state["requests"][id]["results"]);
+                }
                 else rejected++;
                 duplicates++; return;
             }
@@ -577,6 +1015,63 @@ class Replica {
                 rejected++;
             else if(!inserted) duplicates++;
             else if(me!=view%4) sendTo(shard,view%4,e);
+            return;
+        }
+        if(type=="CST_PREPARED") {
+            if(!members.twoLayer() || !members.leaves.count(shard) || !members.leaves.count(source) ||
+               !validPreparedVote(e)) {rejected++;return;}
+            const auto& record=e.at("record"); auto key=record.at("batch_key").get<std::string>();
+            if(state["cst_finalized"].contains(key)) return;
+            auto group=key+"|"+std::to_string(source)+"|"+b.at("record_digest").get<std::string>();
+            if(preparedVotes.size()>=10000 && !preparedVotes.count(group)) {rejected++;return;}
+            if(!preparedVotes[group].emplace(sender,e).second) duplicates++;
+            maybeReady(key); return;
+        }
+        if(type=="CST_READY") {
+            if(shard!=coordinator() || !validReady(e)) {rejected++;return;}
+            auto key=b.at("batch_key").get<std::string>();
+            if(state["cst_decisions"].contains(key)) return;
+            if(readyVotes.size()>=10000 && !readyVotes.count(key)) {rejected++;return;}
+            readyVotes[key].emplace(source,e);
+            if(me!=view%4) sendTo(shard,view%4,e);
+            return;
+        }
+        if(type=="CST_DECISION") {
+            if(!members.twoLayer() || !members.leaves.count(shard) || source!=coordinator() ||
+               b.at("target")!=shard || !validDecisionCertificate(b.at("certificate"))) {rejected++;return;}
+            const auto& decision=b.at("certificate").at("proposal").at("body").at("value").at("cst_decisions")[0];
+            auto key=decision.at("batch_key").get<std::string>();
+            if(state["cst_finalized"].contains(key)) return;
+            auto [it,inserted]=pendingDecisions.emplace(key,e);
+            if(!inserted && it->second.at("body").at("certificate").at("proposal").at("body").at("digest")!=
+                            b.at("certificate").at("proposal").at("body").at("digest")) rejected++;
+            else if(!inserted) duplicates++;
+            else {batchStart=Clock::now();lastProgress=Clock::now();}
+            if(inserted && me!=view%4) sendTo(shard,view%4,e);
+            return;
+        }
+        if(type=="CST_ACK") {
+            if(shard!=coordinator() || !members.twoLayer() || !members.leaves.count(source) ||
+               b.at("target")!=shard || !b.at("batch_key").is_string() ||
+               !b.at("decision_digest").is_string() || !b.at("result_digest").is_string()) {rejected++;return;}
+            auto key=b.at("batch_key").get<std::string>();
+            if(state["cst_decisions"].contains(key) &&
+               b.at("decision_digest")!=hash(state["cst_decisions"].at(key).dump())) {rejected++;return;}
+            if(completedCstBatches.count(key)) {sendDone(key);return;}
+            auto group=key+"|"+std::to_string(source)+"|"+b.at("result_digest").get<std::string>();
+            if(ackVotes.size()>=10000 && !ackVotes.count(group)) {rejected++;return;}
+            if(!ackVotes[group].emplace(sender,e).second) duplicates++;
+            maybeCompleteBatch(key); return;
+        }
+        if(type=="CST_DONE") {
+            if(!members.leaves.count(shard) || !members.twoLayer() || source!=coordinator() ||
+               b.at("target")!=shard || !b.at("batch_key").is_string()) {rejected++;return;}
+            auto key=b.at("batch_key").get<std::string>();
+            if(state["cst_finalized"].contains(key) &&
+               b.at("decision_digest")==state["cst_finalized"].at(key).at("decision_digest")) {
+                doneVotes[key].insert(sender);
+                if(doneVotes[key].size()>=2) ackConfirmed.insert(key);
+            }
             return;
         }
         if(source!=shard) {rejected++;return;}
@@ -630,12 +1125,18 @@ class Replica {
         }
     }
     void status(bool ready=true) {
+        size_t completed=0;
+        for(const auto& [request,results]:completedCstResults) {(void)request;completed+=results.size();}
         json s={{"ready",ready},{"run_id",members.run},{"pid",getpid()},{"shard",shard},{"replica",me},
             {"role",members.leaves.count(shard)?"leaf":"coordinator"},{"view",view},{"primary",view%4},
             {"changing_view",changing},{"target_view",targetView},{"applied_batches",applied},{"stable_seq",stableSeq},
             {"executed_transactions",state["executed"]},{"ordered_cst_transactions",state["ordered_cst"]},
             {"leaf_ordered_cst_transactions",state["leaf_ordered_cst"]},{"last_cst_seq",state["last_cst_seq"]},
-            {"pending_cst_batches",pendingCst.size()},
+            {"cst_order_index",state["cst_order_index"]},
+            {"pending_cst_batches",pendingCst.size()},{"staged_cst_batches",state["cst_staged"].size()},
+            {"finalized_cst_batches",state["cst_finalized"].size()},
+            {"decided_cst_batches",state["cst_decisions"].size()},{"completed_cst_transactions",completed},
+            {"kv_entries",state["kv"].size()},{"kv_digest",hash(state["kv"].dump())},
             {"state_digest",hash(state.dump())},{"chain_digest",state["chain"]},{"pending_requests",pending.size()},
             {"rejected_messages",rejected},{"duplicate_messages",duplicates},{"view_changes",viewCount},
             {"execution_ns",executionNs},{"messages_sent",net.sent.load()},{"messages_received",net.received.load()},
@@ -650,6 +1151,7 @@ public:
         for(const auto& n:cfg.at("nodes")) if(n.at("shard")==sid && n.at("replica")==rid) privateKey=readKey(n.at("private_key"),true);
         timeoutMs=cfg.at("consensus").at("view_timeout_ms"); batchSize=cfg.at("consensus").at("batch_size");
         checkpointEvery=cfg.at("consensus").at("checkpoint_batches"); stableState=state;
+        expectedFib=fibonacci();
         if(std::filesystem::exists(dir+"/commits.jsonl")) throw std::runtime_error("replica restart within a run is not supported; start a fresh run to prevent double voting");
         journal.open(dir+"/commits.jsonl"); events.open(dir+"/events.jsonl");
         if(!journal || !events) throw std::runtime_error("cannot open node logs");
@@ -671,7 +1173,8 @@ public:
                 } else ++it;
             }
             int backoff=std::min(16,1<<std::min(4,std::max(0,targetView-view)));
-            bool waiting=!pending.empty() || !pendingCst.empty();
+            bool staged=members.leaves.count(shard) && !state["cst_staged"].empty();
+            bool waiting=staged?!pendingDecisions.empty():(!pending.empty() || !pendingCst.empty());
             for(const auto& [n,s]:slots) if(n>applied && !s.proposal.is_null()) waiting=true;
             if((waiting || changing) && std::chrono::duration_cast<std::chrono::milliseconds>(now-lastProgress).count()>timeoutMs*(changing?backoff:1)) {
                 if(!changing || viewChanges[targetView].size()>=3) startViewChange(std::max(view,targetView)+1);
@@ -688,6 +1191,22 @@ public:
                 }
                 if(!changing && !pending.empty() && me!=view%4) sendTo(shard,view%4,pending.begin()->second);
                 if(!changing && !pendingCst.empty() && me!=view%4) sendTo(shard,view%4,pendingCst.begin()->second);
+                if(!changing && !pendingDecisions.empty() && me!=view%4) sendTo(shard,view%4,pendingDecisions.begin()->second);
+                if(std::chrono::duration_cast<std::chrono::milliseconds>(now-lastCstRetry).count()>2000) {
+                    if(members.leaves.count(shard)) {
+                        for(auto it=state["cst_staged"].begin();it!=state["cst_staged"].end();++it)
+                            if(!readySent.count(it.key())) sendPrepared(it.key());
+                        for(const auto& [key,ready]:readySent) {
+                            (void)key;
+                            sendTo(coordinator(),me,ready);
+                        }
+                        for(auto it=state["cst_finalized"].begin();it!=state["cst_finalized"].end();++it)
+                            if(!ackConfirmed.count(it.key())) sendAck(it.key());
+                    } else {
+                        for(const auto& [key,cert]:decisionCerts) if(!completedCstBatches.count(key)) forwardDecision(cert);
+                    }
+                    lastCstRetry=now;
+                }
                 if(applied>stableSeq && snapshots.count(applied)) broadcast(make("CHECKPOINT",{{"seq",applied},{"digest",hash(snapshots[applied].dump())}}));
                 broadcast(make("SYNC_REQUEST",{{"after",applied},{"stable_seq",stableSeq}}));
                 lastRetry=now;
@@ -708,7 +1227,7 @@ static int client(const json& cfg,const json& workload,const std::string& output
     std::map<std::string,Request> requests;
     json timings=json::array();std::set<std::string> confirmedIds;
     size_t next=0;auto begin=Clock::now();auto lastSend=begin;
-    double rate=workload.at("rate");double nextDue=0;uint64_t executed=0,ordered=0,errors=0;
+    double rate=workload.at("rate");double nextDue=0;uint64_t executed=0,ordered=0,duplicates=0,errors=0;
     const auto& jobs=workload.at("requests");
     double timeout=workload.value("timeout_s",30.0);
     while(!stopping && std::chrono::duration<double>(Clock::now()-begin).count()<timeout) {
@@ -739,6 +1258,7 @@ static int client(const json& cfg,const json& workload,const std::string& output
                 if(!confirmedIds.insert(tx.at("id").get<std::string>()).second) continue;
                 if(tx.contains("error")) errors++;
                 else if(tx.at("kind")=="executed") executed++;
+                else if(tx.at("kind")=="duplicate") duplicates++;
                 else ordered++;
                 auto confirmedAt=Clock::now();
                 timings.push_back({{"id",tx.at("id")},
@@ -769,13 +1289,15 @@ static int client(const json& cfg,const json& workload,const std::string& output
     auto percentile=[&](double p){return lat.empty()?0:lat[std::min(lat.size()-1,size_t(std::ceil(p*lat.size())-1))];};
     size_t complete=0;for(const auto& [id,r]:requests){(void)id;if(r.done)complete++;}
     json summary={{"requests",jobs.size()},{"completed_requests",complete},{"executed_transactions",executed},
-        {"ordered_only_transactions",ordered},{"errors",errors},{"elapsed_s",elapsed},
+        {"ordered_only_transactions",ordered},{"duplicate_transactions",duplicates},{"errors",errors},{"elapsed_s",elapsed},
         {"completed_tps",executed/elapsed},{"avg_latency_s",avgLatency},
         {"p50_s",percentile(.5)},{"p95_s",percentile(.95)},
         {"p99_s",percentile(.99)},{"timings",timings},{"workload",workload}};
     writeJson(output,summary);
     bool finished=complete==jobs.size() && errors==0;
-    std::cout<<"completed="<<executed<<" ordered_only="<<ordered<<" requests="<<complete<<"/"<<jobs.size();
+    std::cout<<"completed="<<executed<<" ordered_only="<<ordered;
+    if(duplicates) std::cout<<" duplicates="<<duplicates;
+    std::cout<<" requests="<<complete<<"/"<<jobs.size();
     if(finished) std::cout<<" completed_tps="<<executed/elapsed;
     else std::cout<<" incomplete=true";
     std::cout<<" avg_latency_s="<<avgLatency<<" p50_s="<<percentile(.5)
