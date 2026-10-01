@@ -14,6 +14,7 @@ $(BIN): source/main.cpp source/common.h source/network.h third_party/nlohmann/js
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) source/main.cpp $(LDFLAGS) $(LDLIBS) -o $@
 test: $(BIN)
 	python3 tests/test_stage1.py
+	python3 tests/test_stage2a.py
 check:
 	python3 scripts/cluster.py validate --config config/two_layer.json
 clean:

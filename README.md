@@ -1,6 +1,6 @@
-# Arbor 仿真系统：第一阶段
+# Arbor 仿真系统：第一阶段与第二阶段 A
 
-第一阶段提供可手动配置拓扑的多分片 PBFT 底座。每个分片固定 4 个独立 C++ 进程，通过 TCP 交换真实签名消息。叶子副本在共识提交后实际执行斐波那契计算并更新内存状态；协调者副本只排序。
+第一阶段提供可手动配置拓扑的多分片 PBFT 底座。第二阶段 A 已把两个叶子的二层跨片交易的协调者排序证书下发给参与叶子，由叶子各自运行 PBFT 排序；跨片执行和最终提交仍在下一次交付中完成。每个分片固定 4 个独立 C++ 进程，通过 TCP 交换真实签名消息。叶子副本在片内交易共识提交后实际执行斐波那契计算并更新内存状态；协调者副本只排序。
 
 支持 macOS / Linux 本机多进程运行。构建依赖 C++17 编译器、Python 3.9+ 和 OpenSSL 3 开发库；不依赖 FISCO、Python 第三方包或额外 JSON 包安装。nlohmann/json 3.11.3 单头文件及 MIT 许可证已放入 `third_party/nlohmann/`。
 
@@ -48,7 +48,7 @@ OPENSSL_BIN=/your/openssl/prefix/bin/openssl ./start_all.sh
 make test
 ```
 
-详细手动测试见 [TESTING.md](TESTING.md)，协议与实现说明见 [docs/STAGE1_DESIGN.md](docs/STAGE1_DESIGN.md)。
+详细手动测试见 [TESTING.md](TESTING.md)，协议与实现说明见 [docs/STAGE1_DESIGN.md](docs/STAGE1_DESIGN.md) 和 [docs/STAGE2A_DESIGN.md](docs/STAGE2A_DESIGN.md)。
 
 ## 配置分片与拓扑
 
@@ -144,7 +144,7 @@ python3 scripts/cluster.py load --count 20000 --rate 10000 --timeout 120
 python3 scripts/cluster.py load --shard 1 --count 40 --rate 100 --id-prefix duplicate-test --seed 42
 python3 scripts/cluster.py load --shard 1 --count 40 --rate 100 --id-prefix duplicate-test --seed 42
 
-# 测试 NCA=5 的协调者真实共识，只排序，不是已完成跨片交易
+# 测试 NCA=5 的协调者共识及二层叶子 PBFT 排序；仍不是已完成跨片交易
 python3 scripts/cluster.py load --participants 1,2 --count 40 --rate 100
 ```
 
@@ -183,11 +183,11 @@ python3 scripts/cluster.py status --json
 
 每次 `start` 是一轮新实验，初始状态清空、生成新的 run ID 和密钥。旧日志不删除。已存在的运行目录禁止覆盖；重复启动当前运行或端口冲突会直接报错并避免留下半启动集群。
 
-## 第一阶段边界
+## 当前实现边界
 
 - 包括真实 PBFT 三阶段、批处理、Ed25519 签名、检查点、带 prepared 证明的视图切换，以及滞后但未重启副本的状态追赶。
 - 包括独立分片的排序和叶子的本地执行，以及所有分片对之间的延迟探测。
-- 协调者收到跨片样例后只产生 `ordered_only` 数量，不向叶子执行跨片事务，也不计入 `completed_tps`。Arbor 的读写集交换、跨片 ACK 闭环、多层冲突调度、SharPer、重分片和扩缩容尚未实现。
+- 恰好两个叶子的二层拓扑中，协调者收到跨片交易后产生 `ordered_only` 数量，并将带 PBFT 证书的有序批次下发给参与叶子；叶子各自通过 PBFT 排序，计入 `leaf_ordered_cst_transactions`。读写依赖交换、叶子跨片执行、跨片 ACK 闭环、多层冲突调度、SharPer、重分片和扩缩容尚未实现。跨片排序不计入 `completed_tps`。
 - 正常路径每片最多一个新批次在途，视图恢复可涉及多个历史序号；这一阶段不以极限性能为目标。
 - 进程崩溃后在同一次运行中重启该身份还未提供完整 WAL 恢复。节点检测到已有提交日志会拒绝启动，防止丢失投票状态后重新投票。请停止整个集群并新建实验；暂停后恢复进程可通过状态追赶恢复。
 - 状态、请求去重索引在内存中，适合有限负载的验收。检查点会清理旧共识消息，历史状态和去重信息仍随有效交易增长；不是生产存储引擎。

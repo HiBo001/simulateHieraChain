@@ -9,7 +9,7 @@ make
 make test
 ```
 
-测试会选择空闲端口范围，创建独立运行目录，启动真实节点进程，结束时自动停止；不改变普通运行的 `runtime/latest` 指向。结果保留在 `test-results/<时间-编号>/`，其中 `summary.json` 应显示：
+`make test` 先运行 13 项第一阶段回归测试，再运行 1 项独立的第二阶段 A 测试。测试会选择空闲端口范围，创建独立运行目录，启动真实节点进程，结束时自动停止；不改变普通运行的 `runtime/latest` 指向。第一阶段结果保留在 `test-results/<时间-编号>/`，其中 `summary.json` 应显示：
 
 ```json
 {"tests": 13, "failures": 0, "errors": 0, "passed": true}
@@ -138,3 +138,12 @@ python3 scripts/cluster.py status
 - 客户端超时但稍后节点完成：增加 `--timeout`；超时不会撤销已发送交易。
 - `network_failures` 增加：可能是故障测试中的离线目标，也可能是队列上限/帧大小/连接超时；结合节点状态和事件判断。
 - 状态暂时不同：等待排空；若持续不同，保留完整日志。
+
+## 第二阶段 A：带证书的二层跨片排序下发
+
+```bash
+make
+python3 tests/test_stage2a.py
+```
+
+该测试启动 12 个真实节点，向叶子 1、2 各需参与的跨片交易发送带访问集的负载，验证协调者排序证书由两个叶子独立验签后进入各自 PBFT 日志。篡改证书中的 COMMIT 签名以及缺少跨片访问集的交易必须被拒绝。手动验收命令与指标解释见 [docs/STAGE2A_DESIGN.md](docs/STAGE2A_DESIGN.md)。本阶段的 `leaf_ordered_cst` 不是执行完成计数。

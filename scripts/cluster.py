@@ -22,6 +22,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "build/bin/arbor_node"
+RUN_PROCESSES = {}
 
 
 def read(path):
@@ -215,6 +216,12 @@ def stop_run(run):
     for n in m["nodes"]:
         if is_our_process(n):
             os.kill(n["pid"], signal.SIGKILL)
+    for process in RUN_PROCESSES.pop(str(run), []):
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
     m["stopped_at"] = datetime.datetime.now().isoformat()
     write(manifest_path, m)
     print(f"已停止本次运行的全部节点: {run}")
@@ -273,6 +280,7 @@ def start(config, run=None):
         manifest = {"run_id": c["run_id"], "config_source": str(Path(config).resolve()), "nodes": []}
         write(run / "manifest.json", manifest)
         processes = []
+        RUN_PROCESSES[str(run)] = processes
         try:
             for n in c["nodes"]:
                 with (Path(n["directory"]) / "node.log").open("w") as log:
@@ -327,7 +335,13 @@ def prepare_workload(c, count, rate, seed, prefix, shard=None, participants=None
         dest = target if target is not None else ps[0]
         txs = []
         for _ in range(min(batch, remaining)):
-            txs.append({"id": f"{prefix}:tx:{index}", "key": f"account:{ps[0]}:{rng.randrange(1000)}", "value": rng.randrange(1, 1000000), "participants": sorted(ps)})
+            if len(ps) == 1:
+                tx = {"id": f"{prefix}:tx:{index}", "key": f"account:{ps[0]}:{rng.randrange(1000)}", "value": rng.randrange(1, 1000000), "participants": sorted(ps)}
+            else:
+                accesses = [{"shard": sid, "key": f"account:{sid}:{rng.randrange(1000)}", "value": rng.randrange(1, 1000000)} for sid in sorted(ps)]
+                tx = {"id": f"{prefix}:tx:{index}", "key": accesses[0]["key"], "value": accesses[0]["value"],
+                      "participants": sorted(ps), "accesses": accesses}
+            txs.append(tx)
             index += 1
         remaining -= len(txs)
         requests.append({"id": f"{prefix}:request:{len(requests)}", "target": dest, "txs": txs})
@@ -464,7 +478,7 @@ def main():
             print(json.dumps(rows, ensure_ascii=False, indent=2))
         else:
             for r in rows:
-                print(f"shard={r['shard']} node={r['replica']} alive={r['alive']} view={r.get('view','?')} primary={r.get('primary','?')} batches={r.get('applied_batches',0)} executed={r.get('executed_transactions',0)} ordered_only={r.get('ordered_cst_transactions',0)}")
+                print(f"shard={r['shard']} node={r['replica']} alive={r['alive']} view={r.get('view','?')} primary={r.get('primary','?')} batches={r.get('applied_batches',0)} executed={r.get('executed_transactions',0)} ordered_only={r.get('ordered_cst_transactions',0)} leaf_ordered_cst={r.get('leaf_ordered_cst_transactions',0)}")
     elif a.command == "load":
         if a.participants and a.shard is not None:
             raise ValueError("--shard 和 --participants 不能同时指定")

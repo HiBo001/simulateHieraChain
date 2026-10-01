@@ -48,6 +48,13 @@ struct Membership {
         }
         return candidate;
     }
+    bool twoLayer() const {
+        int root=-1;
+        for(const auto& [id,p]:parent) if(p==-1) root=id;
+        if(root<0 || leaves.size()!=2) return false;
+        for(int leaf:leaves) if(parent.at(leaf)!=root) return false;
+        return true;
+    }
     int delay(int from,int to) const {
         const auto& n=config.at("network");
         if (from==to) return n.at("intra_shard_delay_ms");
@@ -93,8 +100,10 @@ class Replica {
     std::map<int,std::map<int,json>> viewChanges;
     json stableProof=json::array(), stableState;
     json state={{"seq",0},{"chain",hash("arbor-genesis")},{"kv",json::object()},
-                {"seen",json::object()},{"requests",json::object()},{"executed",0},{"ordered_cst",0}};
+                {"seen",json::object()},{"requests",json::object()},{"executed",0},{"ordered_cst",0},
+                {"cst_batches",json::object()},{"cst_seen",json::object()},{"leaf_ordered_cst",0},{"last_cst_seq",0}};
     std::map<std::string,json> pending;
+    std::map<std::string,json> pendingCst;
     std::map<std::string,Clock::time_point> pingStarts;
     std::map<std::string,std::string> pingPeers;
     json probes=json::object();
@@ -126,11 +135,11 @@ class Replica {
                 b.at("view")==v && b.at("seq")==seq && b.at("digest")==digest;
         } catch (...) { return false; }
     }
-    bool validRequest(const json& e) const {
+    bool validRequestForShard(const json& e,int target) const {
         try {
             if (!members.clientMessage(e)) return false;
             const auto& b=e.at("body");
-            if(b.at("type")!="CLIENT" || b.at("target")!=shard || !b.at("id").is_string() ||
+            if(b.at("type")!="CLIENT" || b.at("target")!=target || !b.at("id").is_string() ||
                b.at("id").get<std::string>().size()>200 || !b.at("txs").is_array() || b.at("txs").empty() || int(b.at("txs").size())>batchSize) return false;
             const auto& reply=b.at("reply");
             in_addr address{};
@@ -139,13 +148,63 @@ class Replica {
             for(const auto& t:b.at("txs")) {
                 auto id=t.at("id").get<std::string>(); auto key=t.at("key").get<std::string>();
                 if(id.empty() || id.size()>200 || key.empty() || key.size()>128 || !ids.insert(id).second ||
-                   !t.at("value").is_number_unsigned() || !t.at("participants").is_array() || members.lca(t.at("participants"))!=shard) return false;
+                   !t.at("value").is_number_unsigned() || !t.at("participants").is_array() || members.lca(t.at("participants"))!=target) return false;
                 std::set<int> ps;
                 for (auto p:t.at("participants")) if(!ps.insert(p.get<int>()).second) return false;
-                if (members.leaves.count(shard) && ps.size()!=1) return false;
+                if (members.leaves.count(target) && ps.size()!=1) return false;
+                if (ps.size()>1) {
+                    if(!t.contains("accesses") || !t.at("accesses").is_array() || t.at("accesses").size()!=ps.size()) return false;
+                    std::set<int> accessed;
+                    for(const auto& a:t.at("accesses")) {
+                        int owner=a.at("shard"); auto localKey=a.at("key").get<std::string>();
+                        if(!ps.count(owner) || !accessed.insert(owner).second || localKey.empty() || localKey.size()>128 ||
+                           !a.at("value").is_number_unsigned()) return false;
+                    }
+                    if(accessed!=ps) return false;
+                } else if(t.contains("accesses")) return false;
             }
             return true;
         } catch (...) { return false; }
+    }
+    bool validRequest(const json& e) const { return validRequestForShard(e,shard); }
+    bool validCoordinatorCertificate(const json& c) const {
+        try {
+            const auto& pp=c.at("proposal"); const auto& b=pp.at("body");
+            int coordinator=b.at("shard"),v=b.at("view"),seq=b.at("seq");
+            if(!members.twoLayer() || !members.leaves.count(shard) || members.parent.at(shard)!=coordinator ||
+               members.leaves.count(coordinator) || v<0 || seq<=0 || b.at("type")!="PREPREPARE" ||
+               b.at("from")!=v%4 || !members.replicaMessage(pp)) return false;
+            const auto& value=b.at("value");
+            if(!value.at("requests").is_array() || value.at("requests").empty() || value.contains("cst_orders") ||
+               b.at("digest")!=hash(value.dump())) return false;
+            int total=0,local=0;
+            for(const auto& req:value.at("requests")) {
+                if(!validRequestForShard(req,coordinator)) return false;
+                for(const auto& tx:req.at("body").at("txs")) {
+                    ++total;
+                    for(auto participant:tx.at("participants")) if(participant==shard) ++local;
+                }
+            }
+            if(!local || total>batchSize) return false;
+            std::set<int> prepares,commits;
+            for(const auto& vote:c.at("prepares")) {
+                const auto& vb=vote.at("body"); int signer=vb.at("from");
+                if(signer==v%4 || !prepares.insert(signer).second || !members.replicaMessage(vote) ||
+                   vb.at("shard")!=coordinator || vb.at("type")!="PREPARE" || vb.at("view")!=v ||
+                   vb.at("seq")!=seq || vb.at("digest")!=b.at("digest")) return false;
+            }
+            for(const auto& vote:c.at("commits")) {
+                const auto& vb=vote.at("body"); int signer=vb.at("from");
+                if(!commits.insert(signer).second || !members.replicaMessage(vote) ||
+                   vb.at("shard")!=coordinator || vb.at("type")!="COMMIT" || vb.at("view")!=v ||
+                   vb.at("seq")!=seq || vb.at("digest")!=b.at("digest")) return false;
+            }
+            return prepares.size()>=2 && commits.size()>=3;
+        } catch (...) { return false; }
+    }
+    static std::string cstKey(const json& cert) {
+        const auto& b=cert.at("proposal").at("body");
+        return std::to_string(b.at("shard").get<int>())+":"+std::to_string(b.at("seq").get<int>());
     }
     bool validValue(const json& value) const {
         try {
@@ -154,6 +213,17 @@ class Replica {
             for(const auto& e:value.at("requests")) {
                 if (!validRequest(e)) return false;
                 n+=e.at("body").at("txs").size();
+            }
+            if(value.contains("cst_orders")) {
+                if(!members.leaves.count(shard) || !members.twoLayer() || !value.at("cst_orders").is_array() ||
+                   value.at("cst_orders").size()>1) return false;
+                for(const auto& cert:value.at("cst_orders")) {
+                    if(!validCoordinatorCertificate(cert) ||
+                       cert.at("proposal").at("body").at("seq").get<int>()!=state.at("last_cst_seq").get<int>()+1) return false;
+                    for(const auto& req:cert.at("proposal").at("body").at("value").at("requests"))
+                        for(const auto& tx:req.at("body").at("txs"))
+                            for(auto participant:tx.at("participants")) if(participant==shard) ++n;
+                }
             }
             return n<=batchSize;
         } catch (...) { return false; }
@@ -208,7 +278,8 @@ class Replica {
         } catch (...) {return false;}
     }
     static json genesis() { return {{"seq",0},{"chain",hash("arbor-genesis")},{"kv",json::object()},
-                {"seen",json::object()},{"requests",json::object()},{"executed",0},{"ordered_cst",0}}; }
+                {"seen",json::object()},{"requests",json::object()},{"executed",0},{"ordered_cst",0},
+                {"cst_batches",json::object()},{"cst_seen",json::object()},{"leaf_ordered_cst",0},{"last_cst_seq",0}}; }
     bool validVC(const json& e,int v) const {
         try {
             const auto& b=e.at("body");
@@ -282,6 +353,8 @@ class Replica {
                 it=pending.erase(it);
             } else ++it;
         }
+        for(auto it=pendingCst.begin();it!=pendingCst.end();)
+            it=state["cst_batches"].contains(it->first)?pendingCst.erase(it):std::next(it);
     }
     void acceptNewView(const json& e) {
         const auto& b=e.at("body"); int v=b.at("view");
@@ -334,6 +407,19 @@ class Replica {
         auto e=make("REPLY",{{"request",b.at("id")},{"results",results}});
         net.send({ep.at("host"),ep.at("port")},e,0);
     }
+    void forwardCstOrder(const json& cert,const json& value) {
+        if(members.leaves.count(shard) || !members.twoLayer()) return;
+        std::set<int> destinations;
+        for(const auto& req:value.at("requests"))
+            for(const auto& tx:req.at("body").at("txs"))
+                for(auto participant:tx.at("participants")) destinations.insert(participant.get<int>());
+        for(int leaf:destinations) {
+            auto message=make("CST_ORDER",{{"target",leaf},{"certificate",cert}});
+            for(int replica=0;replica<4;++replica) sendTo(leaf,replica,message);
+        }
+        if(!destinations.empty()) log("cst_order_forwarded",{{"coordinator_seq",cert.at("proposal").at("body").at("seq")},
+            {"destinations",destinations}});
+    }
     void applyReady() {
         while(certificates.count(applied+1)) {
             int n=applied+1; const auto cert=certificates.at(n); const auto& value=cert.at("proposal").at("body").at("value");
@@ -370,10 +456,34 @@ class Replica {
                 state["requests"][rid]={{"txs_hash",requestHash},{"results",results}};
                 pending.erase(rid); reply(req,results);
             }
+            if(value.contains("cst_orders")) for(const auto& cst:value.at("cst_orders")) {
+                std::string key=cstKey(cst);
+                std::string digest=cst.at("proposal").at("body").at("digest");
+                if(state["cst_batches"].contains(key) && state["cst_batches"][key]!=digest)
+                    throw std::runtime_error("conflicting certified CST batch");
+                if(!state["cst_batches"].contains(key)) {
+                    state["cst_batches"][key]=digest;
+                    state["last_cst_seq"]=cst.at("proposal").at("body").at("seq");
+                    for(const auto& request:cst.at("proposal").at("body").at("value").at("requests"))
+                        for(const auto& tx:request.at("body").at("txs")) {
+                            bool involved=false;
+                            for(auto participant:tx.at("participants")) if(participant==shard) involved=true;
+                            if(!involved) continue;
+                            std::string id=tx.at("id");
+                            if(!state["cst_seen"].contains(id)) {
+                                state["cst_seen"][id]={{"tx_digest",hash(tx.dump())},{"coordinator_batch",key}};
+                                state["leaf_ordered_cst"]=state["leaf_ordered_cst"].get<uint64_t>()+1;
+                            }
+                        }
+                    log("cst_ordered_at_leaf",{{"coordinator_batch",key},{"digest",digest}});
+                }
+                pendingCst.erase(key);
+            }
             state["chain"]=hash(state["chain"].get<std::string>()+std::to_string(n)+value.dump());
             applied=n; state["seq"]=n;
             executionNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-before).count();
             journal<<json{{"seq",n},{"value_digest",hash(value.dump())},{"state_digest",hash(state.dump())},{"certificate",cert}}.dump()<<'\n'; journal.flush();
+            if(!members.leaves.count(shard)) forwardCstOrder(cert,value);
             lastProgress=Clock::now();
             if(n%checkpointEvery==0) {
                 snapshots[n]=state;
@@ -389,7 +499,7 @@ class Replica {
         if(proof.size()>=3) installStable({{"seq",n},{"state",snapshots[n]},{"proof",proof}});
     }
     void propose() {
-        if(changing || me!=view%4 || pending.empty() || applied+1>stableSeq+window) return;
+        if(changing || me!=view%4 || (pending.empty() && pendingCst.empty()) || applied+1>stableSeq+window) return;
         // One fresh batch in flight. Recovery slots may coexist after a view change.
         if(slots.count(applied+1) && !slots.at(applied+1).proposal.is_null()) return;
         if(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-batchStart).count()<members.config.at("consensus").at("batch_wait_ms").get<int>()) return;
@@ -400,8 +510,14 @@ class Replica {
             if(count+size>batchSize) break;
             reqs.push_back(it->second); count+=size; ++it;
         }
-        if(reqs.empty()) return;
         json value={{"requests",reqs}};
+        if(reqs.empty() && !pendingCst.empty()) {
+            std::string expected=std::to_string(members.parent.at(shard))+":"+
+                std::to_string(state.at("last_cst_seq").get<int>()+1);
+            auto next=pendingCst.find(expected);
+            if(next!=pendingCst.end()) value["cst_orders"]=json::array({next->second.at("body").at("certificate")});
+        }
+        if(reqs.empty() && !value.contains("cst_orders")) return;
         broadcast(make("PREPREPARE",{{"seq",applied+1},{"digest",hash(value.dump())},{"value",value}}));
         batchStart=Clock::now();
     }
@@ -442,6 +558,25 @@ class Replica {
                 probes[id]={{"rtt_ms",millis(Clock::now())-millis(pingStarts[id])},{"peer",identity(source,sender)}};
                 pingStarts.erase(id); pingPeers.erase(id); while(probes.size()>100) probes.erase(probes.begin());
             }
+            return;
+        }
+        if(type=="CST_ORDER") {
+            if(!members.leaves.count(shard) || !members.twoLayer() || b.at("target")!=shard ||
+               source!=members.parent.at(shard) || !validCoordinatorCertificate(b.at("certificate"))) {rejected++;return;}
+            const auto& cert=b.at("certificate");std::string key=cstKey(cert);
+            std::string digest=cert.at("proposal").at("body").at("digest");
+            if(state["cst_batches"].contains(key)) {
+                if(state["cst_batches"][key]!=digest) rejected++;
+                else duplicates++;
+                return;
+            }
+            if(pendingCst.size()>=10000) {rejected++;return;}
+            if(pending.empty() && pendingCst.empty()) {lastProgress=Clock::now();batchStart=Clock::now();}
+            auto [it,inserted]=pendingCst.emplace(key,e);
+            if(!inserted && it->second.at("body").at("certificate").at("proposal").at("body").at("digest")!=digest)
+                rejected++;
+            else if(!inserted) duplicates++;
+            else if(me!=view%4) sendTo(shard,view%4,e);
             return;
         }
         if(source!=shard) {rejected++;return;}
@@ -499,6 +634,8 @@ class Replica {
             {"role",members.leaves.count(shard)?"leaf":"coordinator"},{"view",view},{"primary",view%4},
             {"changing_view",changing},{"target_view",targetView},{"applied_batches",applied},{"stable_seq",stableSeq},
             {"executed_transactions",state["executed"]},{"ordered_cst_transactions",state["ordered_cst"]},
+            {"leaf_ordered_cst_transactions",state["leaf_ordered_cst"]},{"last_cst_seq",state["last_cst_seq"]},
+            {"pending_cst_batches",pendingCst.size()},
             {"state_digest",hash(state.dump())},{"chain_digest",state["chain"]},{"pending_requests",pending.size()},
             {"rejected_messages",rejected},{"duplicate_messages",duplicates},{"view_changes",viewCount},
             {"execution_ns",executionNs},{"messages_sent",net.sent.load()},{"messages_received",net.received.load()},
@@ -534,7 +671,7 @@ public:
                 } else ++it;
             }
             int backoff=std::min(16,1<<std::min(4,std::max(0,targetView-view)));
-            bool waiting=!pending.empty();
+            bool waiting=!pending.empty() || !pendingCst.empty();
             for(const auto& [n,s]:slots) if(n>applied && !s.proposal.is_null()) waiting=true;
             if((waiting || changing) && std::chrono::duration_cast<std::chrono::milliseconds>(now-lastProgress).count()>timeoutMs*(changing?backoff:1)) {
                 if(!changing || viewChanges[targetView].size()>=3) startViewChange(std::max(view,targetView)+1);
@@ -550,6 +687,7 @@ public:
                     }
                 }
                 if(!changing && !pending.empty() && me!=view%4) sendTo(shard,view%4,pending.begin()->second);
+                if(!changing && !pendingCst.empty() && me!=view%4) sendTo(shard,view%4,pendingCst.begin()->second);
                 if(applied>stableSeq && snapshots.count(applied)) broadcast(make("CHECKPOINT",{{"seq",applied},{"digest",hash(snapshots[applied].dump())}}));
                 broadcast(make("SYNC_REQUEST",{{"after",applied},{"stable_seq",stableSeq}}));
                 lastRetry=now;
