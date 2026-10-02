@@ -100,6 +100,8 @@ class Configuration(unittest.TestCase):
         x = copy.deepcopy(good); x["replicas_per_shard"] = 3; variants.append(x)
         x = copy.deepcopy(good); x["base_port"] = 65535; variants.append(x)
         x = copy.deepcopy(good); x["consensus"]["batch_size"] = 0; variants.append(x)
+        x = copy.deepcopy(good); x["consensus"]["cross_shard_batch_size"] = 1001; variants.append(x)
+        x = copy.deepcopy(good); x["consensus"]["cross_shard_batch_wait_ms"] = -1; variants.append(x)
         for raw in variants:
             with self.subTest(config=raw), self.assertRaises(ValueError):
                 c.validate(raw)
@@ -112,6 +114,10 @@ class Configuration(unittest.TestCase):
         self.assertEqual(sum(len(r["txs"]) for r in a["requests"]), 101)
         ids = [t["id"] for r in a["requests"] for t in r["txs"]]
         self.assertEqual(len(ids), len(set(ids)))
+        cross = c.validate(c.read(ROOT / "config/two_layer.json"))
+        small_requests = c.prepare_workload(cross, 16, 100, 42, "batch-test", participants=[1, 2], batch=8)
+        self.assertEqual([len(r["txs"]) for r in small_requests["requests"]], [8, 8])
+        self.assertTrue(all("batch_limit" not in r for r in small_requests["requests"]))
 
 
 class Integration(unittest.TestCase):
@@ -228,7 +234,7 @@ class Integration(unittest.TestCase):
             d = digest(value)
             pp = replica_msg("PREPREPARE", 0, 0, seq=1, digest=d, value=value)
             prepared = {"proposal": pp, "prepares": [replica_msg("PREPARE", r, 0, seq=1, digest=d) for r in [1, 2]]}
-            initial = {"seq": 0, "chain": __import__("hashlib").sha256(b"arbor-genesis").hexdigest(), "kv": {}, "seen": {}, "requests": {}, "executed": 0, "ordered_cst": 0, "cst_batches": {}, "cst_seen": {}, "leaf_ordered_cst": 0, "last_cst_seq": 0, "cst_staged": {}, "cst_finalized": {}, "cst_decisions": {}, "cst_order_index": 0}
+            initial = {"seq": 0, "chain": __import__("hashlib").sha256(b"arbor-genesis").hexdigest(), "kv": {}, "seen": {}, "requests": {}, "executed": 0, "ordered_cst": 0, "cst_batches": {}, "cst_seen": {}, "leaf_ordered_cst": 0, "last_cst_seq": 0, "cst_finalized": {}, "cst_orders": {}, "cst_order_index": 0}
             checkpoint = {"seq": 0, "state": initial, "proof": []}
             vcs = [replica_msg("VIEW_CHANGE", r, 1, stable=checkpoint, prepared=[prepared] if r == 2 else []) for r in [1, 2, 3]]
             bad = replica_msg("NEW_VIEW", 1, 1, changes=vcs, proposals=[])
@@ -242,6 +248,54 @@ class Integration(unittest.TestCase):
                 c.send_frame(n["host"], n["port"], good)
             rows = wait_state(run, 1, 1)
             self.assertTrue(all(r["view"] == 1 for r in rows))
+
+    def test_new_view_reuses_original_committed_certificate(self):
+        # Recovery must disseminate the existing commit proof rather than
+        # require a new quorum to commit the same slot in the next view.
+        def tune(raw):
+            raw["consensus"]["view_timeout_ms"] = 5000
+        with running("committed-recovery", modify=tune) as run:
+            cfg = c.read(run / "config.json")
+            def msg(kind, who, view, **fields):
+                return c.signed(dict(type=kind, run=cfg["run_id"], shard=1,
+                                     **{"from": who}, view=view, **fields),
+                                cfg["nodes"][who]["private_key"], run)
+            request = c.prepare_workload(cfg, 1, 100, 1, "committed", shard=1)["requests"][0]
+            request.update(type="CLIENT", run=cfg["run_id"], reply={"host": "127.0.0.1", "port": 9})
+            value = {"requests": [c.signed(request, cfg["client_private_key"], run)]}
+            d = __import__("hashlib").sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                                       separators=(",", ":")).encode()).hexdigest()
+            certificate = {"proposal": msg("PREPREPARE", 0, 0, seq=1, digest=d, value=value),
+                           "prepares": [msg("PREPARE", who, 0, seq=1, digest=d) for who in (1, 2)],
+                           "commits": [msg("COMMIT", who, 0, seq=1, digest=d) for who in (0, 1, 2)]}
+            initial = {"seq": 0, "chain": __import__("hashlib").sha256(b"arbor-genesis").hexdigest(),
+                       "kv": {}, "seen": {}, "requests": {}, "executed": 0, "ordered_cst": 0,
+                       "cst_batches": {}, "cst_seen": {}, "leaf_ordered_cst": 0, "last_cst_seq": 0,
+                       "cst_finalized": {}, "cst_orders": {}, "cst_order_index": 0}
+            checkpoint = {"seq": 0, "state": initial, "proof": []}
+            changes = [msg("VIEW_CHANGE", who, 1, stable=checkpoint,
+                           prepared=[certificate] if who == 2 else []) for who in (1, 2, 3)]
+            proposal = msg("PREPREPARE", 1, 1, seq=1, digest=d, value=value)
+            # A field named commits is not evidence unless every vote verifies.
+            malformed = copy.deepcopy(changes)
+            bad = copy.deepcopy(certificate)
+            bad["commits"] = [bad["commits"][0]] * 3
+            malformed[1] = msg("VIEW_CHANGE", 2, 1, stable=checkpoint, prepared=[bad])
+            for node in cfg["nodes"]:
+                c.send_frame(node["host"], node["port"],
+                             msg("NEW_VIEW", 1, 1, changes=malformed, proposals=[proposal]))
+            time.sleep(.2)
+            self.assertTrue(all(row["view"] == 0 for row in c.statuses(run)))
+            recovered = msg("NEW_VIEW", 1, 1, changes=changes, proposals=[proposal])
+            for node in cfg["nodes"]:
+                c.send_frame(node["host"], node["port"], recovered)
+            rows = wait_state(run, 1, 1)
+            self.assertTrue(all(row["view"] == 1 and row["applied_batches"] == 1 for row in rows))
+            for node in cfg["nodes"]:
+                entries = [json.loads(line) for line in
+                           (Path(node["directory"]) / "commits.jsonl").read_text().splitlines()]
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["certificate"]["proposal"]["body"]["view"], 0)
 
     def test_lagging_replica_catches_up(self):
         with running("catch-up") as run:

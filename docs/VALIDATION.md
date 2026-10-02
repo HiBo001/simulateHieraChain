@@ -2,7 +2,7 @@
 
 日期：2026-09-13。目标项目：`/Users/tanghaibo_office/Desktop/ATLAS/sourceCode/simulateHieraChain`。
 
-目录整理说明：本页与 `validation-source-hashes.json` 记录的是当时的文件路径；示例配置现位于 `config/`，旧格式配置也集中于该目录，原始快照仍在 `legacy/pre-stage1/`。
+目录整理说明：本页与 `validation-source-hashes.json` 记录的是当时的文件路径；示例配置现位于 `config/`，旧格式配置也集中于该目录，原始快照可在历史标签 `stage1-pbft` 的 `legacy/pre-stage1/` 中查阅，当前工作区已移除该目录。
 
 ## 验收结果
 

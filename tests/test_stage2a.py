@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Certified coordinator order reaches both leaf PBFT logs before finalization."""
+"""One certified coordinator ORDER and one execution slot at each leaf per batch."""
 import copy
 import importlib.util
 import json
@@ -71,6 +71,24 @@ class CrossShardOrdering(unittest.TestCase):
             coordinator = [r for r in rows if r["shard"] == 5]
             self.assertTrue(all(r["ordered_cst_transactions"] == 40 for r in coordinator))
             self.assertTrue(all(r["executed_transactions"] == 0 for r in coordinator))
+            self.assertTrue(all(r["applied_batches"] == 5 for r in rows))
+            self.assertTrue(all(r["completed_cst_transactions"] == 40 for r in coordinator))
+            for shard in (1, 2, 5):
+                for replica in range(4):
+                    entries = [json.loads(line) for line in
+                               (run / f"shard{shard}" / f"node{replica}" / "commits.jsonl")
+                               .read_text().splitlines()]
+                    self.assertEqual([entry["seq"] for entry in entries], [1, 2, 3, 4, 5])
+                    for entry in entries:
+                        value = entry["certificate"]["proposal"]["body"]["value"]
+                        self.assertNotIn("cst_decisions", value)
+                        self.assertNotIn("cst_finalizations", value)
+                        if shard in (1, 2):
+                            witness = entry["execution_witness"]
+                            self.assertEqual([proof["record"]["shard"] for proof in witness["proofs"]], [1, 2])
+                            for proof in witness["proofs"]:
+                                self.assertEqual(len(proof["votes"]), 3)
+                                self.assertEqual(len({vote["body"]["from"] for vote in proof["votes"]}), 3)
             cfg = c.read(run / "config.json")
             leaf = next(n for n in cfg["nodes"] if n["shard"] == 1 and n["replica"] == 0)
             commits = [json.loads(line) for line in (Path(leaf["directory"]) / "commits.jsonl").read_text().splitlines()]
