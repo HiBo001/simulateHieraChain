@@ -5,3 +5,5 @@
 - `shard1/`、`shard2/`、`shard5/` 留在项目根目录，保存对应旧分片的 `shardId`、LLDB 命令和历史日志。第一阶段改造前的完整快照保留在 `legacy/pre-stage1/`。
 
 每轮实验解析后的配置写入 `runtime/<运行编号>/config.json`，属于运行结果。配置格式和参数见项目根目录的 `README.md`。
+
+二层跨片批处理参数也统一写在配置文件的 `consensus` 中：`cross_shard_batch_size` 限制一个协调 PBFT 批次的交易数，`cross_shard_batch_wait_ms` 限制等待凑批的时间。`--batch` 只控制客户端每个请求的交易数。
