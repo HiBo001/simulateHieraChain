@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end two-leaf execution, dependency exchange and atomic visibility."""
+"""Single-slot leaf execution, certified dependencies and direct ACK completion."""
 import hashlib
 import copy
 import importlib.util
@@ -46,6 +46,33 @@ def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def commits(run, shard, replica=0):
+    return [json.loads(line) for line in
+            (run / f"shard{shard}" / f"node{replica}" / "commits.jsonl").read_text().splitlines()]
+
+
+def assert_single_consensus_slot(case, run):
+    """Receiving dependencies/ACKs must finish the existing slot, not propose more."""
+    for shard in (1, 2, 5):
+        for replica in range(4):
+            entries = commits(run, shard, replica)
+            case.assertEqual([entry["seq"] for entry in entries], [1])
+            value = entries[0]["certificate"]["proposal"]["body"]["value"]
+            case.assertNotIn("cst_decisions", value)
+            case.assertNotIn("cst_finalizations", value)
+            if shard == 5:
+                case.assertTrue(value["requests"])
+                case.assertEqual(value["cst_order_index"], 1)
+            else:
+                case.assertEqual(len(value["cst_orders"]), 1)
+            events = [json.loads(line) for line in
+                      (run / f"shard{shard}" / f"node{replica}" / "events.jsonl").read_text().splitlines()]
+            case.assertFalse(any(event["event"] in {
+                "cst_ready_forwarded", "cst_decision_forwarded", "cst_decided",
+                "cst_done_forwarded"} for event in events))
+    case.assertTrue(all(row["applied_batches"] == 1 for row in c.statuses(run)))
+
+
 def wait_status(run, predicate, timeout=15):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -67,6 +94,72 @@ def config(name):
 
 
 class CrossShardExecution(unittest.TestCase):
+    def test_same_keys_across_client_requests_share_one_ordered_batch(self):
+        run = c.start(config("same-key-group"), TEST_ROOT / "same-key-group")
+        try:
+            cfg = c.read(run / "config.json")
+            workload = c.prepare_workload(cfg, 2, 1000, 9, "same-key", participants=[1, 2], batch=1, timeout=15)
+            key1, key2 = "account:1:shared", "account:2:shared"
+            for request, values in zip(workload["requests"], [(10, 20), (30, 40)]):
+                tx = request["txs"][0]
+                tx["accesses"] = [{"shard": 1, "key": key1, "value": values[0]},
+                                  {"shard": 2, "key": key2, "value": values[1]}]
+                tx["key"], tx["value"] = key1, values[0]
+            job, output = run / "same-key.workload.json", run / "same-key.result.json"
+            c.write(job, workload)
+            rc = subprocess.run([str(c.BIN), "client", str(run / "config.json"), str(job), str(output)]).returncode
+            self.assertEqual(rc, 0)
+            result = c.read(output)
+            self.assertEqual((result["completed_requests"], result["executed_transactions"]), (2, 2))
+            rows = wait_status(run, lambda rows: all(
+                r["executed_transactions"] == 2 for r in rows if r["shard"] in (1, 2)))
+            root_journal = run / "shard5" / "node0" / "commits.jsonl"
+            orders = [json.loads(line)["certificate"]["proposal"]["body"]["value"]
+                      for line in root_journal.read_text().splitlines()]
+            orders = [value for value in orders if value["requests"]]
+            self.assertEqual(len(orders), 1)
+            self.assertEqual(len(orders[0]["requests"]), 2)
+            self.assertTrue(all(r["finalized_cst_batches"] == 1 for r in rows if r["shard"] in (1, 2)))
+            self.assertTrue(all(r["kv_entries"] == 1 for r in rows if r["shard"] in (1, 2)))
+            assert_single_consensus_slot(self, run)
+        finally:
+            c.stop_run(run)
+
+    def test_small_batches_continue_across_checkpoints(self):
+        cfg = c.read(ROOT / "config/two_layer.json")
+        cfg["base_port"] = free_range(12)
+        cfg["consensus"]["cross_shard_batch_wait_ms"] = 80
+        cfg["consensus"]["checkpoint_batches"] = 4
+        path = TEST_ROOT / "small-batches.json"
+        c.write(path, cfg)
+        run = c.start(path, TEST_ROOT / "small-batches")
+        try:
+            rc, result = c.load(run, count=256, rate=1000, participants=[1, 2], batch=8, timeout=45)
+            self.assertEqual(rc, 0)
+            self.assertEqual(result["completed_requests"], 32)
+            self.assertEqual(result["executed_transactions"], 256)
+            # Execution completion and checkpoint stability are separate
+            # asynchronous facts; wait for both before inspecting digests.
+            rows = wait_status(run, lambda rows: all(r["stable_seq"] >= 4 for r in rows) and all(
+                r["executed_transactions"] == 256 and r["staged_cst_batches"] == 0
+                for r in rows if r["shard"] in (1, 2)) and all(
+                    len({r["state_digest"] for r in rows if r["shard"] == shard}) == 1
+                    for shard in (1, 2, 5)), timeout=10)
+            self.assertTrue(all(r["stable_seq"] >= 4 for r in rows))
+            for shard in (1, 2, 5):
+                self.assertEqual(len({r["state_digest"] for r in rows if r["shard"] == shard}), 1)
+            journal = run / "shard5" / "node0" / "commits.jsonl"
+            order_sizes = []
+            for line in journal.read_text().splitlines():
+                value = json.loads(line)["certificate"]["proposal"]["body"]["value"]
+                if value["requests"]:
+                    order_sizes.append(sum(len(req["body"]["txs"]) for req in value["requests"]))
+            self.assertEqual(sum(order_sizes), 256)
+            self.assertTrue(all(size <= 64 for size in order_sizes))
+            self.assertTrue(any(size > 8 for size in order_sizes))
+        finally:
+            c.stop_run(run)
+
     def test_one_leaf_backup_offline_still_forms_quorum(self):
         run = c.start(config("one-backup-offline"), TEST_ROOT / "one-backup-offline")
         try:
@@ -129,17 +222,15 @@ class CrossShardExecution(unittest.TestCase):
             self.assertTrue(all(r["ordered_cst_transactions"] == 2 for r in root_rows))
             self.assertTrue(all(r["executed_transactions"] == 0 for r in root_rows))
 
+            assert_single_consensus_slot(self, run)
             root_node = next(n for n in cfg["nodes"] if n["shard"] == 5 and n["replica"] == 0)
-            commits = [json.loads(line) for line in
-                       (Path(root_node["directory"]) / "commits.jsonl").read_text().splitlines()]
-            decisions = [entry["certificate"] for entry in commits if
-                         "cst_decisions" in entry["certificate"]["proposal"]["body"]["value"]]
-            self.assertEqual(len(decisions), 1)
-            self.assertGreaterEqual(len(decisions[0]["commits"]), 3)
+            order = commits(run, 5)[0]["certificate"]
+            self.assertGreaterEqual(len(order["commits"]), 3)
             leaf_node = next(n for n in cfg["nodes"] if n["shard"] == 1 and n["replica"] == 0)
             bad_ack = c.signed({"type": "CST_ACK", "run": cfg["run_id"], "shard": 1, "from": 0,
                                 "view": 0, "target": 5, "batch_key": "5:1",
-                                "decision_digest": "0" * 64, "result_digest": "0" * 64},
+                                "order_digest": "0" * 64, "execution_digest": "0" * 64,
+                                "result_digest": "0" * 64},
                                leaf_node["private_key"], run)
             before = c.read(Path(root_node["directory"]) / "status.json")["rejected_messages"]
             c.send_frame(root_node["host"], root_node["port"], bad_ack)
@@ -156,8 +247,9 @@ class CrossShardExecution(unittest.TestCase):
             self.assertEqual(replay_rc, 0)
             self.assertEqual(replay_result["executed_transactions"], 0)
             self.assertEqual(replay_result["duplicate_transactions"], 2)
+            assert_single_consensus_slot(self, run)
             replay_rows = wait_status(run, lambda rows: all(
-                sum(r["finalized_cst_batches"] == 2 for r in rows if r["shard"] == leaf) == 4
+                sum(r["finalized_cst_batches"] == 1 for r in rows if r["shard"] == leaf) == 4
                 for leaf in (1, 2)))
             self.assertTrue(all(r["executed_transactions"] == 2 and
                                 r["kv_digest"] == digest(packed({key1: a}))
@@ -194,11 +286,15 @@ class CrossShardExecution(unittest.TestCase):
             self.assertEqual(result["executed_transactions"], 0)
             self.assertEqual(result["ordered_only_transactions"], 0)
             rows = wait_status(run, lambda rows: sum(
-                r["leaf_ordered_cst_transactions"] == 2 and r["staged_cst_batches"] == 1
+                r["staged_cst_batches"] == 1 and r["applied_batches"] == 0
                 for r in rows if r["shard"] == 1) == 4, timeout=5)
             self.assertTrue(all(r["executed_transactions"] == 0 and r["kv_entries"] == 0
                                 for r in rows if r["shard"] == 1))
-            self.assertTrue(all(r["decided_cst_batches"] == 0 for r in rows if r["shard"] == 5))
+            self.assertTrue(all(r["completed_cst_transactions"] == 0 and r["applied_batches"] == 1
+                                for r in rows if r["shard"] == 5))
+            self.assertTrue(all(r.get("decided_cst_batches", 0) == 0
+                                for r in rows if r["shard"] == 5))
+            self.assertTrue(all(not commits(run, 1, replica) for replica in range(4)))
         finally:
             c.stop_run(run)
 

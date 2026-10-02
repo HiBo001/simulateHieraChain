@@ -1,6 +1,6 @@
 # Arbor 仿真系统：第一阶段与第二阶段 B
 
-第一阶段提供可手动配置拓扑的多分片 PBFT 底座。第二阶段 B 已支持恰好两个叶子的二层跨片交易：协调者 PBFT 排序，两个叶子分别 PBFT 排序、执行并交换带三副本签名的读写依赖，协调者 PBFT 确认提交后，叶子最终写入并回 ACK。每个分片固定 4 个独立 C++ 进程，通过 TCP 交换真实签名消息。片内交易也在叶子共识提交后执行斐波那契计算。
+第一阶段提供可手动配置拓扑的多分片 PBFT 底座。第二阶段 B 支持恰好两个叶子的二层跨片交易：协调者运行一次 PBFT 排序，两个叶子各运行一次 PBFT，交换带三副本签名的读写依赖后，在同一已共识槽内完成执行和本片写入。叶子 forward 汇总完成 ACK QC，协调者收齐两叶的有效证明后直接回复客户端，**不再共识、不下发提交决定，也不等待额外 DONE 回执**。正常一批共 3 次分片 PBFT。每个分片固定 4 个独立 C++ 进程，通过 TCP 交换真实签名消息；片内交易也在叶子共识提交后执行斐波那契计算。
 
 支持 macOS / Linux 本机多进程运行。构建依赖 C++17 编译器、Python 3.9+ 和 OpenSSL 3 开发库；不依赖 FISCO、Python 第三方包或额外 JSON 包安装。nlohmann/json 3.11.3 单头文件及 MIT 许可证已放入 `third_party/nlohmann/`。
 
@@ -48,7 +48,11 @@ OPENSSL_BIN=/your/openssl/prefix/bin/openssl ./start_all.sh
 make test
 ```
 
-详细手动测试见 [TESTING.md](TESTING.md)，协议与实现说明见 [docs/STAGE1_DESIGN.md](docs/STAGE1_DESIGN.md) 和 [docs/STAGE2B_DESIGN.md](docs/STAGE2B_DESIGN.md)。
+当前完整设计和待审阅边界见 [docs/CURRENT_IMPLEMENTATION_DESIGN.md](docs/CURRENT_IMPLEMENTATION_DESIGN.md)，覆盖 PBFT、跨片时序、forward 聚合、去重、批处理、网络延迟、故障恢复与性能统计。详细手动测试见 [TESTING.md](TESTING.md)，阶段演进说明见 [docs/STAGE1_DESIGN.md](docs/STAGE1_DESIGN.md) 和 [docs/STAGE2B_DESIGN.md](docs/STAGE2B_DESIGN.md)。最近工程修改记录见 [docs/ENGINEERING_REVIEW.md](docs/ENGINEERING_REVIEW.md)。
+
+协议审阅更正后的目标流程见 [docs/CROSS_SHARD_PROTOCOL_REVISION.md](docs/CROSS_SHARD_PROTOCOL_REVISION.md)：上层排序一次，各叶子排序并执行一次，上层收齐完成证明后直接回复，无第二轮上层共识。此修订尚未替换当前协议代码。
+
+一键性能测试使用 `python3 scripts/benchmark.py`（或 `make benchmark`）：自动编译，逐轮启动独立集群，运行片内/跨片负载，停止节点，保存 TPS、秒延时及网络指标。默认每类各测试 4000 笔、速率 1000 和 4000；详见 [docs/BENCHMARK.md](docs/BENCHMARK.md)。
 
 ## 配置分片与拓扑
 
@@ -102,7 +106,7 @@ python3 scripts/cluster.py probe --source 1:0 --to 2:3 --samples 5
 python3 scripts/cluster.py probe --source 1:0 --to 5:0 --samples 5
 ```
 
-探测请求由指定源副本发出，PONG 从目标副本返回，RTT 使用源副本的单调时钟计算。探测结果还会写入运行目录中的 `probe-*.json`。开启 `network.trace` 后，各节点额外输出 `network.jsonl`，记录 `enqueue_ms`、`due_ms`、`release_ms`、`delay_ms` 和目标端口。`release_ms` 是开始非阻塞连接/发送的时间，不是对端收到完整消息的时间。
+探测请求由指定源副本发出，PONG 从目标副本返回，RTT 使用源副本的单调时钟计算。探测结果还会写入运行目录中的 `probe-*.json`。开启 `network.trace` 后，各节点额外输出 `network.jsonl`，记录 `enqueue_ms`、`due_ms`、`release_ms`、`delay_ms` 和目标端口。`release_ms` 是消息交给目标长连接发送队列的时间，不是对端收到完整消息的时间。运行状态中的 `network_failures` 及分类字段可用于诊断连接、写入或消息解析错误。
 
 ## 共识与执行参数
 
@@ -110,6 +114,8 @@ python3 scripts/cluster.py probe --source 1:0 --to 5:0 --samples 5
 "consensus": {
   "batch_size": 32,
   "batch_wait_ms": 10,
+  "cross_shard_batch_size": 32,
+  "cross_shard_batch_wait_ms": 200,
   "view_timeout_ms": 2000,
   "checkpoint_batches": 16
 },
@@ -122,6 +128,8 @@ python3 scripts/cluster.py probe --source 1:0 --to 5:0 --samples 5
 |---|---|
 | `batch_size` | 一个 PBFT 批次最多容纳的交易数量，默认 32 |
 | `batch_wait_ms` | 主节点组批等待时间，默认 10 ms |
+| `cross_shard_batch_size` | 二层协调分片一个跨片批次最多容纳的交易数量，默认 `min(64, batch_size)`；不得大于 `batch_size` |
+| `cross_shard_batch_wait_ms` | 协调分片等待跨片批次凑满的最长时间，默认 200 ms；示例二层配置为 600 ms |
 | `view_timeout_ms` | 等待交易取得进展的基础超时，默认 2000 ms；应明显大于正常共识耗时 |
 | `checkpoint_batches` | 每隔多少个批次广播检查点，默认 16，允许 1–32 |
 | `fib_iterations` | 每笔叶子交易实际执行的迭代斐波那契循环数，默认 10000 |
@@ -152,9 +160,13 @@ python3 scripts/cluster.py load --participants 1,2 --count 40 --rate 100 --batch
 
 二层双叶子的跨片交易由 `accesses` 为两个叶子各声明一个 key 和输入值。新请求若重放相同交易 ID 与内容，客户端显示 `duplicates`，不计入完成 TPS；同一 ID 对应不同内容会返回 `id_conflict`。
 
-每个客户端请求包含最多 `batch_size` 笔交易，也可通过 `--batch` 降低。请求首次广播到目标分片全部 4 个副本，超时重发。客户端验证副本 Ed25519 签名，等到 `f+1=2` 个不同副本返回相同结果后计为确认。
+片内请求默认最多 `batch_size` 笔，跨片请求默认最多 `cross_shard_batch_size` 笔；`--batch` 可降低请求大小，超过对应上限会报错。协调分片会把**参与分片集合相同且连续**的请求合并成至多 `cross_shard_batch_size` 笔的 PBFT 跨片批次。示例配置下，`--batch 8` 的 8 个请求可合成一个 64 笔跨片批次。此处按参与分片集合组批，不要求 key 或读写集完全相同；叶子对批内重复 key 只交换一次批前读状态，再按共识顺序逐笔执行写入。客户端请求首次广播到目标分片全部 4 个副本，超时重发。客户端验证副本 Ed25519 签名，等到 `f+1=2` 个不同副本返回相同结果后计为确认。
 
 所有请求成功确认后，终端同一行显示 `completed_tps`、`avg_latency_s`、`p50_s`、`p95_s`、`p99_s`；若超时或交易报错，则显示 `incomplete=true` 和已确认交易的延时，并返回非零退出码。结果文件 `client-*.json` 也保存这些指标、逐交易确认耗时和完整输入。交易延时统一以秒为单位，逐笔记录使用 `latency_s`，完成时刻使用相对于测试开始的 `completion_s`。延时口径为客户端发送请求到收到两个一致副本回复；平均值和分位数按已确认交易统计。二层双叶子的跨片回复必须等到两个叶子最终写入并返回各自三副本 ACK，因而计入真实完成延时；其他拓扑当前仍只返回 `ordered_only`。这里的平均 TPS 包括本次客户端的发送及排空时间，**不是饱和稳态吞吐**。批内交易共用请求发送时间，确认在整批回复时观察到。重复测试中客户端确认数表示收到的有效回复，是否发生新的执行要看节点累计执行数；不要拿重放请求测试计算业务吞吐。
+
+`--timeout` 从开始发送时计时，包含发送和排空。`--count 4000 --rate 100` 光发送至少约 40 秒，因此 `--timeout 30` 必定显示 `incomplete=true`。小批次跨片负载还需留出多轮 PBFT 和跨片证明交换时间；可先从较小 count 验证，再按实际完成速率增加超时。
+
+例如 4000 笔跨片交易以 `--rate 100 --batch 8` 发送，即使系统处理更快，整轮平均 TPS 也不能超过约 100。要测试更高处理能力，应提高 `--rate` 并同时查看延时；发送速度超过处理速度时，排队延时会升高。
 
 ## 运行目录和启停
 
@@ -185,12 +197,28 @@ python3 scripts/cluster.py status --json
 
 每次 `start` 是一轮新实验，初始状态清空、生成新的 run ID 和密钥。旧日志不删除。已存在的运行目录禁止覆盖；重复启动当前运行或端口冲突会直接报错并避免留下半启动集群。
 
+## 清理日志和实验记录
+
+在项目根目录执行：
+
+```bash
+make clean
+```
+
+此命令先停止 `runtime/`、`test-results/` 中登记且进程身份匹配的节点，再删除整个 `build/`，清空运行记录和测试/性能结果（包括日志、密钥、客户端输入/结果、JSON/CSV 报告和性能基线），并删除 Python 缓存及顶层 `shard*/node.log`。`runtime/.lifecycle.lock` 保留用于启停互斥；源码、`config/`、文档、论文、旧源码归档和分片身份文件保留。
+
+正在运行的 `load`、`benchmark` 或测试需要先结束，否则清理会报错并保留记录，避免它们继续生成新数据。仓库外自定义 `--run-dir`、`--output-dir`、`--output` 不自动清理；目录是符号链接时只删除链接。新的工程专项测试记录也统一保存在 `test-results/engineering-*/`，以前生成在系统临时目录的记录不在本命令范围内。
+
+执行清理时不要同时启动新的负载、benchmark 或测试任务。
+
+清理后重新运行需要先 `make`，再启动集群。需要保留的实验报告或基线应在清理前复制到其他目录。
+
 ## 当前实现边界
 
 - 包括真实 PBFT 三阶段、批处理、Ed25519 签名、检查点、带 prepared 证明的视图切换，以及滞后但未重启副本的状态追赶。
 - 包括独立分片的排序和叶子的本地执行，以及所有分片对之间的延迟探测。
-- 恰好两个叶子的二层拓扑中，协调者将带 PBFT 证书的有序批次下发给叶子；叶子 PBFT 排序、暂存读写结果并交换准备证明。协调者 PBFT 决定提交，叶子 PBFT 最终写入并回 ACK，客户端此时才计入 `completed_tps`。多层冲突调度、SharPer、重分片和扩缩容尚未实现；三层或更多叶子的跨片负载仍仅计 `ordered_only`。
-- 参与分片永久失效时不会出现部分写入，但当前还没有带证书的 abort/超时回收；客户端会超时，存活叶子保持暂存状态。
+- 恰好两个叶子的二层拓扑中，协调者下发 PBFT 排序证书；叶子各一次 PBFT 固定顺序，依赖齐全后完成同槽执行、写入并回 ACK QC。协调者验证、去重并收齐两叶证明即结束，不新增共识槽；客户端此时才计入 `completed_tps`。多层冲突调度、SharPer、重分片和扩缩容尚未实现；三层或更多叶子的跨片负载仍仅计 `ordered_only`。
+- 所需依赖未齐时不写入正式 KV、不推进叶子应用序号。当前没有带证书的 abort/超时回收，参与分片永久失效可能令交易等待和客户端超时；若一叶已经写入，另一叶之后不可用，不能保证两片同一物理时刻可见。
 - 正常路径每片最多一个新批次在途，视图恢复可涉及多个历史序号；这一阶段不以极限性能为目标。
 - 进程崩溃后在同一次运行中重启该身份还未提供完整 WAL 恢复。节点检测到已有提交日志会拒绝启动，防止丢失投票状态后重新投票。请停止整个集群并新建实验；暂停后恢复进程可通过状态追赶恢复。
 - 状态、请求去重索引在内存中，适合有限负载的验收。检查点会清理旧共识消息，历史状态和去重信息仍随有效交易增长；不是生产存储引擎。

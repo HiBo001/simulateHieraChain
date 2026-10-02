@@ -1,5 +1,7 @@
 # 第一阶段实现说明
 
+> 本文记录第一阶段交付时的设计，包含当时的短 TCP 连接和仅跨片排序行为。当前版本已改为长连接，并实现二层双叶跨片提交；完整现状及边界见 [CURRENT_IMPLEMENTATION_DESIGN.md](CURRENT_IMPLEMENTATION_DESIGN.md)。
+
 ## 模块
 
 | 文件 | 职责 |
