@@ -205,7 +205,7 @@ python3 scripts/cluster.py status --json
 make clean
 ```
 
-此命令先停止 `runtime/`、`test-results/` 中登记且进程身份匹配的节点，再删除整个 `build/`，清空运行记录和测试/性能结果（包括日志、密钥、客户端输入/结果、JSON/CSV 报告和性能基线），并删除 Python 缓存及顶层 `shard*/node.log`。`runtime/.lifecycle.lock` 保留用于启停互斥；源码、`config/`、文档、论文、旧源码归档和分片身份文件保留。
+此命令先停止 `runtime/`、`test-results/` 中登记且进程身份匹配的节点，再删除整个 `build/`，清空运行记录和测试/性能结果（包括日志、密钥、客户端输入/结果、JSON/CSV 报告和性能基线），并删除 Python 缓存及顶层 `shard*/node.log`。`runtime/.lifecycle.lock` 保留用于启停互斥；源码、`config/`、文档、论文和分片身份文件保留。
 
 正在运行的 `load`、`benchmark` 或测试需要先结束，否则清理会报错并保留记录，避免它们继续生成新数据。仓库外自定义 `--run-dir`、`--output-dir`、`--output` 不自动清理；目录是符号链接时只删除链接。新的工程专项测试记录也统一保存在 `test-results/engineering-*/`，以前生成在系统临时目录的记录不在本命令范围内。
 
@@ -224,4 +224,4 @@ make clean
 - 状态、请求去重索引在内存中，适合有限负载的验收。检查点会清理旧共识消息，历史状态和去重信息仍随有效交易增长；不是生产存储引擎。
 - 附加延迟是应用层消息模型，不模拟链路带宽、丢包或 TCP 拥塞控制。节点进程会共享本机 CPU，规模实验需要后续独立规划资源。
 
-原运行入口和源码在部署本阶段时备份至 `legacy/pre-stage1/`，其中保留了修改前的工作区内容。旧格式配置文件现在位于 `config/`；`shard*/shardId`、`shard*/lldb_commands.txt` 位于对应分片目录，均不由新入口读取；`shard*/node.log` 是历史日志。历史 PDF 不改动。旧 `llb_start_all.sh` 仅提示使用新的启动方式。
+第一阶段改造前的源码和运行入口快照保留在历史标签 `stage1-pbft` 的 `legacy/pre-stage1/` 中，当前工作区已移除该目录。旧格式配置文件现在位于 `config/`；`shard*/shardId`、`shard*/lldb_commands.txt` 位于对应分片目录，均不由新入口读取；`shard*/node.log` 是历史日志。历史 PDF 不改动。旧 `llb_start_all.sh` 仅提示使用新的启动方式。

@@ -37,7 +37,7 @@ class CleanTests(unittest.TestCase):
         self.kill = self.patch(os, "kill", side_effect=AssertionError("real process signals are forbidden"))
         self.saved = {}
         for name in ("source/main.cpp", "config/two_layer.json", "config/accessControlList",
-                     "docs/CURRENT_IMPLEMENTATION_DESIGN.md", "legacy/pre-stage1/node.log",
+                     "docs/CURRENT_IMPLEMENTATION_DESIGN.md", "docs/archived-note.log",
                      "shard1/shardId", "shard2/config.txt", "README.md", "Makefile",
                      ".git/HEAD"):
             self.saved[name] = f"preserve {name}\n"
