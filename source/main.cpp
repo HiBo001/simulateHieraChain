@@ -1,4 +1,5 @@
 #include "network.h"
+#include "state_digest.h"
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -21,6 +22,8 @@ struct Membership {
     std::set<int> leaves;
     Key clientKey;
     explicit Membership(const json& c): config(c), run(c.at("run_id")) {
+        if(c.at("consensus").contains("pipeline_window"))
+            throw std::runtime_error("consensus.pipeline_window has been removed; remove this option and start a fresh run");
         for (const auto& s:c.at("shards")) {
             int id=s.at("id");
             parent[id]=s.at("parent").is_null() ? -1 : s.at("parent").get<int>();
@@ -67,11 +70,15 @@ struct Membership {
             const auto& b=env.at("body");
             if (b.at("run")!=run) return false;
             auto it=publicKeys.find(identity(b.at("shard"),b.at("from")));
-            return it!=publicKeys.end() && verify(env,it->second);
+            if(it==publicKeys.end()) return false;
+            return verify(env,it->second);
         } catch (...) { return false; }
     }
     bool clientMessage(const json& env) const {
-        try { return env.at("body").at("run")==run && verify(env,clientKey); }
+        try {
+            const auto& body=env.at("body");if(body.at("run")!=run) return false;
+            return verify(env,clientKey);
+        }
         catch (...) { return false; }
     }
 };
@@ -96,6 +103,7 @@ class Replica {
     std::map<int,Slot> slots;
     std::map<int,json> preparedHistory, certificates;
     std::map<int,json> snapshots;
+    std::map<int,std::string> snapshotDigests;
     std::map<int,std::map<int,json>> checkpointVotes;
     std::map<int,std::map<int,json>> viewChanges;
     json stableProof=json::array(), stableState;
@@ -109,6 +117,9 @@ class Replica {
     // the first owner's result rather than launching concurrent consensus.
     std::map<std::string,json> deferredRequests, completedTxResults;
     std::map<std::string,std::pair<std::string,std::string>> pendingTx;
+    std::map<std::string,std::set<std::string>> deferredByTx;
+    std::set<std::string> changedTx;
+    uint64_t dedupIndexRebuilds=0, dedupPendingChecks=0, dedupWaiterChecks=0;
     std::map<std::string,json> pendingCst;
     std::map<std::string,json> stagedRecords, executionWitnesses, orderCertificates;
     std::map<int,json> slotWitnesses;
@@ -122,6 +133,8 @@ class Replica {
     std::set<std::string> completedCstBatches;
     size_t completedCstTransactions=0;
     std::string cachedStateDigest, cachedKvDigest;
+    StateDigest stateDigest;
+    bool kvDirty=true;
     mutable std::set<std::string> checkedOrders, checkedRecords, checkedProofs,
                                   checkedWitnesses;
     std::map<std::string,Clock::time_point> pingStarts;
@@ -154,8 +167,16 @@ class Replica {
     void sendShard(int destination,const json& env) {
         for(int replica=0;replica<4;++replica) sendTo(destination,replica,env);
     }
-    void refreshDigests() {
-        cachedStateDigest=hash(state.dump()); cachedKvDigest=hash(state["kv"].dump());
+    void refreshDigests(bool rebuild=false) {
+        if(rebuild) {stateDigest.rebuild(state);kvDirty=true;}
+        else {
+            for(const char* field:{"seq","chain","executed","ordered_cst","leaf_ordered_cst",
+                                  "last_cst_seq","cst_order_index"}) stateDigest.markField(field);
+        }
+        cachedStateDigest=stateDigest.refresh(state);
+        // Keep the public KV digest compatible with SHA256(canonical JSON).
+        // Root ORDERs do not change KV, so they do not serialize it again.
+        if(kvDirty) {cachedKvDigest=hash(state["kv"].dump());kvDirty=false;}
     }
     int coordinator() const {
         for(const auto& [id,parent]:members.parent) if(parent==-1) return id;
@@ -494,7 +515,7 @@ class Replica {
             int seq=s.at("seq");
             if(seq==0) return s.at("state")==genesis() && s.at("proof").empty();
             if(seq<0 || s.at("state").at("seq")!=seq) return false;
-            auto digest=hash(s.at("state").dump()); std::set<int> voters;
+            auto digest=StateDigest::fromState(s.at("state")); std::set<int> voters;
             for(const auto& e:s.at("proof")) {
                 const auto& b=e.at("body");
                 if(!members.replicaMessage(e) || b.at("shard")!=shard || b.at("type")!="CHECKPOINT" ||
@@ -565,9 +586,10 @@ class Replica {
     }
     void installStable(const json& s) {
         int h=s.at("seq"); if(h<stableSeq) return;
-        if(h>applied) {
+        bool restored=h>applied;
+        if(restored) {
             state=s.at("state"); applied=h;
-            refreshDigests();
+            refreshDigests(true);
             log("state_sync",{{"seq",h}});
             pendingLocalAckQcs.clear();
             if(members.leaves.count(shard)) for(auto it=state["cst_finalized"].begin();it!=state["cst_finalized"].end();++it)
@@ -578,16 +600,9 @@ class Replica {
         for(auto it=preparedHistory.begin();it!=preparedHistory.end();) it=it->first<=h?preparedHistory.erase(it):std::next(it);
         for(auto it=certificates.begin();it!=certificates.end();) it=it->first<=h?certificates.erase(it):std::next(it);
         for(auto it=snapshots.begin();it!=snapshots.end();) it=it->first<h?snapshots.erase(it):std::next(it);
+        for(auto it=snapshotDigests.begin();it!=snapshotDigests.end();) it=it->first<h?snapshotDigests.erase(it):std::next(it);
         for(auto it=checkpointVotes.begin();it!=checkpointVotes.end();) it=it->first<h?checkpointVotes.erase(it):std::next(it);
-        for(auto it=pending.begin();it!=pending.end();) {
-            if(state["requests"].contains(it->first)) {
-                if(state["requests"].at(it->first).at("txs_hash")!=hash(it->second.at("body").at("txs").dump()))
-                    replyConflict(it->second,"request_id_conflict");
-                else if(completedCstResults.count(it->first)) reply(it->second,completedCstResults.at(it->first));
-                else if(members.leaves.count(shard) || !members.twoLayer()) reply(it->second,state["requests"][it->first]["results"]);
-                it=pending.erase(it);
-            } else ++it;
-        }
+        if(restored) rebuildPendingIndex();
         for(auto it=pendingCst.begin();it!=pendingCst.end();)
             it=state["cst_batches"].contains(it->first)?pendingCst.erase(it):std::next(it);
         for(auto it=stagedRecords.begin();it!=stagedRecords.end();)
@@ -631,8 +646,11 @@ class Replica {
         // a full commit proof. Share it as evidence, without another PBFT vote.
         json waiting=json::array();
         for(const auto& [n,proof]:certificates) if(n>applied) waiting.push_back(proof);
-        if(!waiting.empty()) broadcast(make("SYNC",{{"stable",{{"seq",stableSeq},{"state",stableState},{"proof",stableProof}}},
-            {"certificates",waiting},{"execution_witnesses",json::array()}}));
+        if(!waiting.empty()) {
+            json fields={{"stable",{{"seq",stableSeq},{"state",stableState},{"proof",stableProof}}},
+                {"certificates",waiting},{"execution_witnesses",json::array()}};
+            broadcast(make("SYNC",fields));
+        }
     }
     void acceptProposal(const json& e,bool recovered=false) {
         const auto& b=e.at("body"); int n=b.at("seq");
@@ -705,37 +723,84 @@ class Replica {
         }
         reply(req,results); duplicates+=results.size(); return true;
     }
+    bool awaitingResult(const std::string& id) const {
+        return shard==coordinator() && members.twoLayer() &&
+            state.at("seen").contains(id) && !completedTxResults.count(id);
+    }
+    void erasePending(const std::string& rid) {
+        auto it=pending.find(rid);if(it==pending.end()) return;
+        for(const auto& tx:it->second.at("body").at("txs")) {
+            auto id=tx.at("id").get<std::string>();auto owner=pendingTx.find(id);
+            if(owner!=pendingTx.end() && owner->second.second==rid) {
+                pendingTx.erase(owner);changedTx.insert(id);
+            }
+        }
+        pending.erase(it);
+    }
+    void deferRequest(const json& request) {
+        auto rid=request.at("body").at("id").get<std::string>();
+        if(!deferredRequests.emplace(rid,request).second) return;
+        for(const auto& tx:request.at("body").at("txs"))
+            deferredByTx[tx.at("id").get<std::string>()].insert(rid);
+    }
+    json takeDeferred(const std::string& rid) {
+        auto request=deferredRequests.at(rid);
+        for(const auto& tx:request.at("body").at("txs")) {
+            auto id=tx.at("id").get<std::string>();auto it=deferredByTx.find(id);
+            if(it==deferredByTx.end()) continue;
+            it->second.erase(rid);if(it->second.empty()) deferredByTx.erase(it);
+        }
+        deferredRequests.erase(rid);return request;
+    }
+    void rebuildPendingIndex() {
+        // Only snapshot catchup changes state without visiting committed txs.
+        // Re-admit whole signed requests against that restored state.
+        dedupIndexRebuilds++;
+        std::vector<json> requests;
+        for(const auto& [rid,request]:pending) {(void)rid;requests.push_back(request);}
+        for(const auto& [rid,request]:deferredRequests) {(void)rid;requests.push_back(request);}
+        pending.clear();pendingTx.clear();deferredRequests.clear();deferredByTx.clear();changedTx.clear();
+        for(const auto& request:requests) handle(request);
+    }
     void drainDeferred() {
-        // Rebuild the ownership index after commit/state sync. Never change a
-        // signed client's transaction list while coalescing its retries.
-        for(auto it=pending.begin();it!=pending.end();) {
-            if(replyCompletedTransactions(it->second)) {it=pending.erase(it);continue;}
-            bool waitingForResult=false;
-            if(shard==coordinator() && members.twoLayer())
+        // Commit/completion releases owners and wakes only requests indexed by
+        // affected tx IDs. Unrelated backlog is never rehashed or scanned.
+        while(!changedTx.empty()) {
+            auto changed=std::move(changedTx);changedTx.clear();
+            std::set<std::string> owners,waiters;
+            for(const auto& id:changed) {
+                auto owner=pendingTx.find(id);
+                if(owner!=pendingTx.end()) owners.insert(owner->second.second);
+                auto waiting=deferredByTx.find(id);
+                if(waiting!=deferredByTx.end()) waiters.insert(waiting->second.begin(),waiting->second.end());
+            }
+            for(const auto& rid:owners) {
+                auto it=pending.find(rid);if(it==pending.end()) continue;
+                dedupPendingChecks++;
+                if(replyCompletedTransactions(it->second)) {erasePending(rid);continue;}
+                bool blocked=false;
                 for(const auto& tx:it->second.at("body").at("txs")) {
                     auto id=tx.at("id").get<std::string>();
-                    if(state["seen"].contains(id) && !completedTxResults.count(id)) {waitingForResult=true;break;}
+                    if(awaitingResult(id)) blocked=true;
+                    auto owner=pendingTx.find(id);
+                    if(state["seen"].contains(id) && owner!=pendingTx.end() && owner->second.second==rid) {
+                        pendingTx.erase(owner);changedTx.insert(id);
+                    }
                 }
-            if(waitingForResult) {deferredRequests.emplace(it->first,it->second);it=pending.erase(it);}
-            else ++it;
-        }
-        pendingTx.clear();
-        for(const auto& [rid,request]:pending) for(const auto& tx:request.at("body").at("txs"))
-            if(!state["seen"].contains(tx.at("id").get<std::string>()))
-                pendingTx.emplace(tx.at("id"),std::make_pair(hash(tx.dump()),rid));
-        std::vector<json> resume;
-        for(auto it=deferredRequests.begin();it!=deferredRequests.end();) {
-            if(replyCompletedTransactions(it->second)) {it=deferredRequests.erase(it);continue;}
-            bool blocked=false;
-            for(const auto& tx:it->second.at("body").at("txs")) {
-                auto id=tx.at("id").get<std::string>();
-                if(pendingTx.count(id) || (state["seen"].contains(id) && shard==coordinator() &&
-                    members.twoLayer() && !completedTxResults.count(id))) {blocked=true;break;}
+                if(blocked) {auto request=it->second;erasePending(rid);deferRequest(request);}
             }
-            if(blocked) {++it;continue;}
-            resume.push_back(it->second);it=deferredRequests.erase(it);
+            for(const auto& rid:waiters) {
+                auto it=deferredRequests.find(rid);if(it==deferredRequests.end()) continue;
+                dedupWaiterChecks++;
+                if(replyCompletedTransactions(it->second)) {takeDeferred(rid);continue;}
+                bool blocked=false;
+                for(const auto& tx:it->second.at("body").at("txs")) {
+                    auto id=tx.at("id").get<std::string>();
+                    if(pendingTx.count(id) || awaitingResult(id)) {blocked=true;break;}
+                }
+                if(!blocked) handle(takeDeferred(rid));
+            }
         }
-        for(const auto& request:resume) handle(request);
     }
     void forwardCstOrder(const json& cert,const json& value,bool retry=false) {
         if(members.leaves.count(shard) || !members.twoLayer()) return;
@@ -855,12 +920,16 @@ class Replica {
             localWrites.push_back({{"id",tx.at("id")},{"key",ak},{"state",nextA}});
             state["cst_seen"][tx.at("id").get<std::string>()]={{"tx_digest",hash(tx.dump())},
                 {"coordinator_batch",key},{"committed",true}};
+            stateDigest.markEntry("cst_seen",tx.at("id").get<std::string>());
             state["executed"]=state["executed"].get<uint64_t>()+1;
             state["leaf_ordered_cst"]=state["leaf_ordered_cst"].get<uint64_t>()+1;
         }
-        for(auto it=working.at(shard).begin();it!=working.at(shard).end();++it) state["kv"][it.key()]=it.value();
+        for(auto it=working.at(shard).begin();it!=working.at(shard).end();++it) {
+            state["kv"][it.key()]=it.value();stateDigest.markEntry("kv",it.key());kvDirty=true;
+        }
         state["cst_finalized"][key]={{"order_digest",mine.at("order_digest")},
             {"execution_digest",executionDigest(witness)},{"result_digest",hash(localWrites.dump())}};
+        stateDigest.markEntry("cst_finalized",key);
         executionWitnesses[key]=witness;stagedRecords.erase(key);preparedProofs.erase(key);
         if(!ackProofs.count(key) || !ackProofs.at(key).count(shard)) pendingLocalAckQcs.insert(key);
         for(auto it=preparedVotes.begin();it!=preparedVotes.end();) it=it->first.rfind(key+"|",0)==0?preparedVotes.erase(it):std::next(it);
@@ -939,6 +1008,7 @@ class Replica {
                         execution+digests.begin()->second+digests.rbegin()->second)}};
                 if(duplicate) {result=completedTxResults.at(tx.at("id").get<std::string>());result["kind"]="duplicate";}
                 else completedTxResults.emplace(tx.at("id"),result);
+                changedTx.insert(tx.at("id").get<std::string>());
                 results.push_back(result);
             }
             completedCstResults[rid]=results;completedCstTransactions+=results.size();
@@ -968,6 +1038,7 @@ class Replica {
                     duplicates.push_back(state["seen"].contains(tx.at("id").get<std::string>()));
                 state["cst_orders"][cstKey(cert)]={{"order_digest",cert.at("proposal").at("body").at("digest")},
                     {"order_index",value.at("cst_order_index")},{"requests",value.at("requests")},{"duplicates",duplicates}};
+                stateDigest.markEntry("cst_orders",cstKey(cert));
             }
             for(const auto& req:value.at("requests")) {
                 const auto& rb=req.at("body"); std::string rid=rb.at("id");
@@ -976,7 +1047,7 @@ class Replica {
                 if(state["requests"].contains(rid) && state["requests"][rid]["txs_hash"]!=requestHash) {
                     for(const auto& tx:rb.at("txs")) results.push_back({{"id",tx.at("id")},{"error","request_id_conflict"}});
                     if(members.leaves.count(shard) || !members.twoLayer()) reply(req,results);
-                    pending.erase(rid); continue;
+                    erasePending(rid); continue;
                 }
                 for(const auto& tx:rb.at("txs")) {
                     std::string id=tx.at("id"); auto d=hash(tx.dump());
@@ -995,12 +1066,15 @@ class Replica {
                         json previous=state["kv"].contains(key)?state["kv"][key]:json{{"version",0},{"digest",hash("initial")}};
                         auto digest=hash(previous.dump()+tx.dump()+std::to_string(a));
                         state["kv"][key]={{"version",previous["version"].get<int>()+1},{"digest",digest},{"value",tx.at("value")},{"fib",a}};
+                        stateDigest.markEntry("kv",key);kvDirty=true;
                         result["digest"]=digest; state["executed"]=state["executed"].get<uint64_t>()+1;
                     } else { result["digest"]=d; state["ordered_cst"]=state["ordered_cst"].get<uint64_t>()+1; }
                     state["seen"][id]={{"tx_digest",d},{"result",result}}; results.push_back(result);
+                    changedTx.insert(id);stateDigest.markEntry("seen",id);
                 }
                 state["requests"][rid]={{"txs_hash",requestHash},{"results",results}};
-                pending.erase(rid);
+                stateDigest.markEntry("requests",rid);
+                erasePending(rid);
                 if(members.leaves.count(shard) || !members.twoLayer()) reply(req,results);
             }
             if(value.contains("cst_order_index")) state["cst_order_index"]=value.at("cst_order_index");
@@ -1008,6 +1082,7 @@ class Replica {
                 const auto& root=value.at("cst_orders")[0];auto key=cstKey(root);
                 finalizeCst(witness);
                 state["cst_batches"][key]=root.at("proposal").at("body").at("digest");
+                stateDigest.markEntry("cst_batches",key);
                 state["last_cst_seq"]=root.at("proposal").at("body").at("value").at("cst_order_index");
                 pendingCst.erase(key);slotWitnesses[n]=witness;
                 log("cst_ordered_at_leaf",{{"coordinator_batch",key},{"digest",state["cst_batches"].at(key)}});
@@ -1025,7 +1100,7 @@ class Replica {
             } else if(value.contains("cst_orders")) sendAck(cstKey(value.at("cst_orders")[0]));
             lastProgress=Clock::now();
             if(n%checkpointEvery==0) {
-                snapshots[n]=state;
+                snapshots[n]=state;snapshotDigests[n]=cachedStateDigest;
                 broadcast(make("CHECKPOINT",{{"seq",n},{"digest",cachedStateDigest}}));
                 checkStable(n);
             }
@@ -1034,7 +1109,7 @@ class Replica {
     }
     void checkStable(int n) {
         if(!snapshots.count(n) || n<=stableSeq) return;
-        auto d=hash(snapshots[n].dump()); json proof=json::array();
+        const auto& d=snapshotDigests.at(n); json proof=json::array();
         for(const auto& [r,e]:checkpointVotes[n]) { (void)r; if(e.at("body").at("digest")==d) proof.push_back(e); }
         if(proof.size()>=3) installStable({{"seq",n},{"state",snapshots[n]},{"proof",proof}});
     }
@@ -1083,7 +1158,7 @@ class Replica {
             if(state["requests"].contains(it->first)) {
                 if(completedCstResults.count(it->first)) reply(it->second,completedCstResults.at(it->first));
                 else if(members.leaves.count(shard) || !members.twoLayer()) reply(it->second,state["requests"][it->first]["results"]);
-                it=pending.erase(it); continue;
+                auto rid=it->first;++it;erasePending(rid);continue;
             }
             int size=it->second.at("body").at("txs").size();
             if(crossShardOrder) {
@@ -1093,7 +1168,7 @@ class Replica {
                     if((state["seen"].contains(id) && state["seen"].at(id).at("tx_digest")!=digest) ||
                        (selectedIds.count(id) && selectedIds.at(id)!=digest)) conflict=true;
                 }
-                if(conflict) {replyConflict(it->second);it=pending.erase(it);continue;}
+                if(conflict) {replyConflict(it->second);auto rid=it->first;++it;erasePending(rid);continue;}
             }
             bool overlap=false;
             for(const auto& tx:it->second.at("body").at("txs"))
@@ -1129,9 +1204,10 @@ class Replica {
     void handle(const json& e) {
         const auto& b=e.at("body"); std::string type=b.at("type");
         if(type=="CLIENT") {
-            if(members.clientMessage(e) && shard==coordinator() && members.twoLayer() &&
+            if(shard==coordinator() && members.twoLayer() &&
                b.at("target")==shard && b.at("txs").is_array() && int(b.at("txs").size())>crossShardBatchSize &&
                int(b.at("txs").size())<=batchSize) {
+                if(!members.clientMessage(e)) {rejected++;return;}
                 json results=json::array();
                 for(const auto& tx:b.at("txs")) results.push_back({{"id",tx.at("id")},{"error","cross_shard_batch_too_large"}});
                 reply(e,results);rejected++;return;
@@ -1169,7 +1245,7 @@ class Replica {
                 auto tid=tx.at("id").get<std::string>();
                 if(pendingTx.count(tid) || (shard==coordinator() && members.twoLayer() &&
                    state["seen"].contains(tid) && !completedTxResults.count(tid))) {
-                    deferredRequests.emplace(id,e);
+                    deferRequest(e);
                     if(me!=view%4) sendTo(shard,view%4,e);
                     return;
                 }
@@ -1205,6 +1281,8 @@ class Replica {
             }
             return;
         }
+        // Reject messages from the removed protocol before they reach PBFT.
+        if(type.rfind("PIPE_",0)==0) {rejected++;return;}
         if(type=="CST_ORDER") {
             if(!members.leaves.count(shard) || !members.twoLayer() || b.at("target")!=shard ||
                source!=members.parent.at(shard) || !validCoordinatorCertificate(b.at("certificate"))) {rejected++;return;}
@@ -1436,7 +1514,8 @@ class Replica {
             json checkpoint=b.value("stable_seq",0)>=stableSeq ?
                 json{{"seq",0},{"state",genesis()},{"proof",json::array()}} :
                 json{{"seq",stableSeq},{"state",stableState},{"proof",stableProof}};
-            sendTo(shard,sender,make("SYNC",{{"stable",checkpoint},{"certificates",cs},{"execution_witnesses",witnesses}}));
+            json fields={{"stable",checkpoint},{"certificates",cs},{"execution_witnesses",witnesses}};
+            sendTo(shard,sender,make("SYNC",fields));
             log("sync_proofs_sent",{{"destination_replica",sender},{"after",start},{"certificates",cs.size()},
                 {"execution_witnesses",witnesses.size()},{"committed_waiting",waiting}});
             return;
@@ -1494,8 +1573,10 @@ class Replica {
             {"finalized_cst_batches",state["cst_finalized"].size()},
             {"decided_cst_batches",0},{"completed_cst_transactions",completedCstTransactions},
             {"kv_entries",state["kv"].size()},{"kv_digest",cachedKvDigest},
-            {"state_digest",cachedStateDigest},{"chain_digest",state["chain"]},{"pending_requests",pending.size()},
+            {"state_digest",cachedStateDigest},{"state_digest_algorithm","arbor-merkle-v1"},{"chain_digest",state["chain"]},{"pending_requests",pending.size()},
             {"dedup_waiting_requests",deferredRequests.size()},
+            {"dedup_index_rebuilds",dedupIndexRebuilds},{"dedup_pending_checks",dedupPendingChecks},
+            {"dedup_waiter_checks",dedupWaiterChecks},
             {"rejected_messages",rejected},{"duplicate_messages",duplicates},{"view_changes",viewCount},
             {"execution_ns",executionNs},{"messages_sent",net.sent.load()},{"messages_received",net.received.load()},
             {"network_failures",net.failed.load()},{"network_socket_errors",net.socket_errors.load()},
@@ -1520,7 +1601,7 @@ public:
         crossShardBatchWaitMs=cfg.at("consensus").at("cross_shard_batch_wait_ms");
         checkpointEvery=cfg.at("consensus").at("checkpoint_batches"); stableState=state;
         expectedFib=fibonacci();
-        refreshDigests();
+        refreshDigests(true);
         if(std::filesystem::exists(dir+"/commits.jsonl")) throw std::runtime_error("replica restart within a run is not supported; start a fresh run to prevent double voting");
         journal.open(dir+"/commits.jsonl"); events.open(dir+"/events.jsonl");
         if(!journal || !events) throw std::runtime_error("cannot open node logs");
@@ -1562,7 +1643,9 @@ public:
                 if(!changing || viewChanges[targetView].size()>=3) startViewChange(std::max(view,targetView)+1);
             }
             if(std::chrono::duration_cast<std::chrono::milliseconds>(now-lastRetry).count()>250) {
-                if(isForward()) broadcast(make("FORWARD_HEARTBEAT"));
+                if(isForward()) {
+                    broadcast(make("FORWARD_HEARTBEAT"));
+                }
                 if(changing && !myViewChange.is_null()) broadcast(myViewChange);
                 if(!lastNewView.is_null() && lastNewView.at("body").at("view")==view && me==view%4) broadcast(lastNewView);
                 for(const auto& [n,s]:slots) if(n>applied && !s.proposal.is_null()) {
@@ -1593,7 +1676,7 @@ public:
                     }
                     lastCstRetry=now;
                 }
-                if(applied>stableSeq && snapshots.count(applied)) broadcast(make("CHECKPOINT",{{"seq",applied},{"digest",hash(snapshots[applied].dump())}}));
+                if(applied>stableSeq && snapshots.count(applied)) broadcast(make("CHECKPOINT",{{"seq",applied},{"digest",snapshotDigests.at(applied)}}));
                 // Sync is a recovery path, not periodic traffic on a healthy
                 // replica. Replies carry a checkpoint snapshot and can grow
                 // large as cross-shard order metadata accumulates.
@@ -1606,6 +1689,7 @@ public:
                 }
                 lastRetry=now;
             }
+            drainDeferred();
             propose();
             if(std::chrono::duration_cast<std::chrono::milliseconds>(now-lastStatus).count()>100) {status();lastStatus=now;}
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1631,7 +1715,9 @@ static int client(const json& cfg,const json& workload,const std::string& output
             auto body=jobs[next++];int shard=body.at("target");std::string id=body.at("id");
             body["type"]="CLIENT";body["run"]=members.run;body["reply"]={{"host",workload.value("host",std::string("127.0.0.1"))},{"port",net.localPort()}};
             auto env=sign(body,key);requests.emplace(id,Request{env,shard,now,now,{},false,0});
-            for(int r=0;r<4;++r) net.send(members.endpoints.at(identity(shard,r)),env,0);
+            // f=1: two distinct initial recipients guarantee one honest node.
+            // Backups relay to the current primary; retries expand to all four.
+            for(int r=0;r<2;++r) net.send(members.endpoints.at(identity(shard,r)),env,0);
             nextDue += body.at("txs").size()/rate;lastSend=now;
         }
         std::vector<json> messages;

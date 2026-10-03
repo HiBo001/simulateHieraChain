@@ -88,6 +88,8 @@ def validate(raw):
     }
     for group, fields in defaults.items():
         current = c.setdefault(group, {})
+        if group == "consensus" and isinstance(current, dict) and "pipeline_window" in current:
+            raise ValueError("consensus.pipeline_window 已废弃，流水线协议已移除；请删除该配置项后重新启动")
         if not isinstance(current, dict) or set(current) - set(fields):
             raise ValueError(f"{group} 包含未知配置项")
         for name, default in fields.items():

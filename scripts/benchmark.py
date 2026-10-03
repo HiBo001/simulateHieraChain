@@ -39,6 +39,11 @@ def validate_selection(cfg, mode, shard, participants):
     if mode in ("intra", "all") and shard not in leaves:
         raise ValueError("片内 --shard 必须是叶子分片")
     if mode in ("cross", "all"):
+        if len(participants) < 2:
+            raise ValueError("--participants 必须包含至少两个不同的叶子分片")
+        coordinator = c.lca(cfg, participants)
+        if coordinator in leaves:
+            raise ValueError("跨片交易必须由参与叶子的公共祖先协调")
         root = next(s for s, p in parent.items() if p is None)
         if len(parent) != 3 or len(leaves) != 2 or any(parent[s] != root for s in leaves):
             raise ValueError("跨片性能测试目前只支持一个根、两个直接叶子的二层拓扑")
@@ -53,7 +58,7 @@ def settlement_errors(case, cfg, rows):
     problems = []
     if actual != expected or len(rows) != len(expected):
         return ["节点状态不完整"]
-    root = next(s for s, p in parent.items() if p is None)
+    coordinator = c.lca(cfg, case["participants"]) if case["mode"] == "cross" else None
     for sid in parent:
         peers = [r for r in rows if r["shard"] == sid]
         if not all(r.get("alive") and r.get("ready") and not r.get("changing_view") for r in peers):
@@ -65,10 +70,10 @@ def settlement_errors(case, cfg, rows):
             case["mode"] == "cross" and sid in case["participants"]) else 0
         if any(r.get("executed_transactions") != wanted for r in peers):
             problems.append(f"分片 {sid} 执行计数不符")
-        ordered = case["count"] if case["mode"] == "cross" and sid == root else 0
+        ordered = case["count"] if case["mode"] == "cross" and sid == coordinator else 0
         if any(r.get("ordered_cst_transactions") != ordered for r in peers):
             problems.append(f"分片 {sid} 跨片排序计数不符")
-        if case["mode"] == "cross" and sid == root and any(
+        if case["mode"] == "cross" and sid == coordinator and any(
                 r.get("completed_cst_transactions") != case["count"] for r in peers):
             problems.append("协调片完成结果尚未收齐")
         if any(r.get(field, 0) for r in peers for field in (

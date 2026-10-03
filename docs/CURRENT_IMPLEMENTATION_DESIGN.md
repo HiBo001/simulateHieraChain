@@ -1,6 +1,8 @@
-# Arbor 仿真系统当前实现详细设计（审阅稿）
+# Arbor 仿真系统详细设计（审阅稿）
 
-核对日期：2026-10-02。本文描述当前仓库的实际实现，主要依据 `source/main.cpp`、`source/network.h`、`scripts/cluster.py`、`scripts/benchmark.py` 与自动测试。本文中的“已实现”表示代码中存在相应路径；测试覆盖范围另见第 16 节，不表示所有故障组合均已验证。
+> 2026-10-03 已按用户要求移除流水线、逐交易推测执行、多版本历史及重做路径，恢复本文描述的叶子逐批处理协议。二层三分片支持双方跨片完整执行；多层拓扑继续支持片内执行和 NCA 排序验证，跨片返回 `ordered_only`。客户端首次发送两个副本、请求去重、TCP 长连接、增量状态摘要等独立工程优化保留。
+
+核对日期：2026-10-03。本文描述当前仓库的实际实现，主要依据 `source/main.cpp`、`source/network.h`、`scripts/cluster.py`、`scripts/benchmark.py` 与自动测试。本文中的“已实现”表示代码中存在相应路径；测试覆盖范围另见第 16 节，不表示所有故障组合均已验证。
 
 > **本轮协议更正：** 上层一次 PBFT 排序，两叶各一次 PBFT 将订单纳入本片顺序；叶子在同一已共识槽内等待依赖、执行并写入，上层收齐双方完成证明后直接回复。正常共 3 次分片 PBFT，删除 READY、上层 DECISION、叶子 FINALIZE 和 DONE 阶段。改造依据见 [CROSS_SHARD_PROTOCOL_REVISION.md](CROSS_SHARD_PROTOCOL_REVISION.md)。本次改造的测试和性能以本轮实际报告为准，旧路径结果不作为新路径验证证据。
 
@@ -32,6 +34,7 @@
 | 模块 | 职责 |
 |---|---|
 | [`source/common.h`](../source/common.h) | JSON、SHA-256、Ed25519、单调时钟、文件输出 |
+| [`source/state_digest.h`](../source/state_digest.h) | 按变化条目更新确定性 Merkle 状态摘要，完整快照重建验证 |
 | [`source/network.h`](../source/network.h) | 非阻塞 TCP、长连接复用、长度前缀帧、定时发送队列、发送缓存和网络指标 |
 | [`source/main.cpp`](../source/main.cpp) | 分片成员、PBFT、检查点、视图切换、状态追赶、跨片状态机、执行器、原生客户端 |
 | [`scripts/cluster.py`](../scripts/cluster.py) | 配置校验、拓扑/LCA、密钥与运行目录生成、进程管理、随机负载、探测 |
@@ -93,6 +96,8 @@ flowchart TB
 | `network.trace` | false | false | 是否逐消息记录调度时间 |
 
 当前两层拓扑为根 5、叶子 1/2；链路为 1↔2：50 ms，1↔5：10 ms，2↔5：30 ms。延迟单位是毫秒，交易统计延时单位是秒。
+
+配置不再包含 `consensus.pipeline_window`。旧自定义配置即使取值 0 也会被拒绝，需删除该项；旧运行目录是历史快照，升级代码后应新建实验，不在原目录重启节点。
 
 启动前校验：单一根、无环、父节点存在、ID 不重复、链路不重复、端口可容纳全部节点。普通批次范围 1–1024，跨片批次不超过普通批次；等待时间范围 0–10000 ms，检查点间隔 1–32；基础视图超时范围 200–300000 ms，并要求大于 `4 × intra_shard_delay_ms + batch_wait_ms`。这只是基础配置检查，不保证超时大于所有真实处理耗时。
 
@@ -334,7 +339,7 @@ newB.value = inputB + oldA.value + fib
 | 混合批中的旧交易只恢复了 ORDER，尚缺原完成结果 | 根等待原批次完成证据恢复，再复制原结果并标记 duplicate | 不用新批次摘要伪造旧交易结果，不重执行 |
 | 两个混合请求共享同一旧交易 | proposer 的 selectedIds 防止同一提案重复 tx ID | 分开提案，避免组成非法值 |
 
-`pendingTx` 是每个副本的本地请求拥有者索引，不是跨节点的全局锁。副本接收顺序可能不同，最终以认证提案和已提交状态为准。`drainDeferred()` 在应用、完成和同步之后重建索引、清理已完成别名并移动不再重叠的请求，避免备份先收到别名后长期残留。
+`pendingTx` 是每个副本的本地请求拥有者索引，不是跨节点的全局锁。副本接收顺序可能不同，最终以认证提案和已提交状态为准。`drainDeferred()` 在提交或完成后只检查本批受影响的交易 ID。`erasePending()` 仅释放属于该请求的所有权，`deferredByTx` 从交易 ID 反查等待请求，唤醒后仍使用整份签名请求。正常提交不扫描或重建无关 backlog；只有安装更高检查点状态时完整重建索引，避免备份先收到别名后长期残留。
 
 相同请求 ID 的缓存重试可能仍返回原 `executed` 结果，以保证丢失回复后的幂等确认；换新请求 ID 重放完整旧交易才明确返回 `duplicate`。新客户端重放旧请求会再次看到确认，不能因此推断节点又执行了交易。性能测试使用新集群和新交易标识。
 
@@ -344,7 +349,7 @@ newB.value = inputB + oldA.value + fib
 
 新交易 ID 即使访问完全相同的 key、输入也相同，仍是新业务交易，应执行一次。相同读写集是调度条件，相同交易 ID 是幂等条件，二者不能混为一类去重。
 
-## 10. 批处理、顺序与流水线
+## 10. 批处理与顺序
 
 ### 10.1 三种不同的“批/窗口”
 
@@ -394,7 +399,7 @@ due_time = enqueue_time（steady_clock）+ configured_delay
 到期后把帧交给对应长连接的非阻塞发送队列
 ```
 
-主线程不为某条链路 `sleep(delay)`，网络线程也不会因一个失联节点阻塞所有目标。每轮最多释放 256 个到期任务；poll 最多等待 10 ms，并依据最近 due 缩短等待。
+主线程不为某条链路 `sleep(delay)`，网络线程也不会因一个失联节点阻塞所有目标。每轮最多释放 256 个到期任务；poll 最多等待 10 ms，并依据最近 due 缩短等待。正剩余时间向上取整到毫秒，避免不足 1 ms 时反复 `poll(..., 0)` 空转；已到期任务仍立即处理。新消息通过唤醒管道打断旧等待，发送前再次比较真实 due，不提前释放。
 
 延迟选择顺序：同副本消息直接入本地 inbox；同片不同副本使用 intra delay；不同分片使用指定分片对 delay，未指定则使用默认 inter delay。客户端请求和回复附加 delay 为 0，但仍有真实 TCP/处理时间。
 
@@ -425,7 +430,9 @@ due_time = enqueue_time（steady_clock）+ configured_delay
 
 ### 12.1 检查点与状态追赶
 
-每应用 `checkpoint_batches` 个 PBFT 批次，副本保存完整内存业务快照并广播签名 state digest。三个不同副本对相同 seq/state digest 签名后形成稳定检查点。
+每应用 `checkpoint_batches` 个 PBFT 批次，副本保存完整内存业务快照及其冻结摘要，并广播签名 state digest。三个不同副本对相同 seq/state digest 签名后形成稳定检查点；后续检查票及重传直接复用该快照摘要。
+
+状态摘要采用 `arbor-merkle-v1`：按字段/条目路径建立确定性 Merkle treap，名称、类型、值及子树摘要均纳入 SHA-256，包含完整去重和订单历史。每批仅标记变化条目，重复写同一 key 合并为最终值；单条更新期望 O(log N)，不再每批序列化全部历史状态。收到远端快照时仍从全部 JSON 状态独立重建摘要，核对三份检查点签名。`kv_digest` 保留原来的 `SHA256(kv.dump())` 格式，只在 KV 实际变化时重算。新旧状态摘要格式不同，集群必须统一使用同一版本并重新启动。
 
 稳定后裁剪旧 PBFT 槽、prepare 历史、提交证书和旧快照；交易/请求/CST 业务历史不会因此全部删除。state sync 验证检查点和后续提交证书，再安装 state 和按序追赶。叶子检查点之后的 ORDER 证书只证明顺序，已有完整执行证据时 SYNC 后缀还携带按叶子本地 seq 对应的 `execution_witnesses`。追赶副本验证订单和双方依赖证明，在原槽重演确定性执行；不能另开最终化槽或仅依赖异步到达的未认证远片读值。
 
@@ -661,3 +668,7 @@ python3 scripts/benchmark.py --mode cross --count 4000 --rates 1000 --cross-batc
 ```
 
 更多故障注入、去重、网络探测步骤见 [`TESTING.md`](../TESTING.md)；性能参数、报告和基线命令见 [`BENCHMARK.md`](BENCHMARK.md)；最近工程修改记录见 [`ENGINEERING_REVIEW.md`](ENGINEERING_REVIEW.md)。
+
+客户端两节点发送、增量去重及摘要、网络等待优化的具体实现和测试见 [PERFORMANCE_OPTIMIZATION.md](PERFORMANCE_OPTIMIZATION.md)。叶子按原顺序逐批处理，流水线相关路径和测试已删除；本次删除后的实际回归和性能以新报告为准。
+
+2026-10-03 此前工程优化版本完整 `make test` 共 **97 项通过**，详见 [PERFORMANCE_OPTIMIZATION.md](PERFORMANCE_OPTIMIZATION.md) 的测试分类、前后同配置三轮测量和日志位置。10000 笔跨片负载的 TPS 中位数由 541.33 到 656.52，p95 由 15.889025 到 12.794971 秒；4000 笔的变化约 1.4%，与轮间波动相近。这些是历史验证，不代替本次删除流水线后的回归。

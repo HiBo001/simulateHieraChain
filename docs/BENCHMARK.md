@@ -9,7 +9,9 @@ python3 scripts/benchmark.py
 
 默认使用 `config/two_layer.json`，分别测试片内和跨片交易；每轮 4000 笔，发送速率为 1000、4000 笔/秒，各运行一次。片内默认客户端批次取配置的 `batch_size`，跨片默认每个客户端请求包含 8 笔。需要直接使用已编译二进制时加 `--skip-build`。
 
-每个用例都会在空闲端口启动一个新集群，结束或按 Ctrl+C 后停止本轮节点，不修改 `runtime/latest`，不停止已有集群。每个分片仍有 4 个真实运行的 PBFT 副本。跨片测试目前要求一个根分片和两个直接叶子；默认片内目标为分片 1，跨片参与分片为 1、2，可用 `--shard`、`--participants` 调整。
+每个用例都会在空闲端口启动一个新集群，结束或按 Ctrl+C 后停止本轮节点，不修改 `runtime/latest`，不停止已有集群。每个分片仍有 4 个真实运行的 PBFT 副本。完整跨片性能测试要求恰好三个分片：一个根和两个直属叶子，`--participants` 必须指定这两个叶子。默认片内目标为分片 1，跨片参与分片为 1、2，可用 `--shard`、`--participants` 调整。多层拓扑可测片内性能；其中跨片请求只有 `ordered_only` 排序验证，benchmark 会拒绝将它作为完整跨片性能测试。
+
+当前版本已移除流水线。自定义配置若含 `consensus.pipeline_window`（包括 0），请删除后再运行。
 
 ## 常用指令
 
@@ -37,6 +39,13 @@ python3 scripts/benchmark.py --mode intra --shard 1 --count 10000 --rates 1000,4
 
 ```bash
 python3 scripts/benchmark.py --mode all --count 10000 --rates 1000,4000 --repeat 3
+```
+
+复测此前两层三分片、仅双方参与的负载：
+
+```bash
+python3 scripts/benchmark.py --config config/two_layer.json --mode cross --participants 1,2 --count 4000 --rates 4000 --cross-batch 8 --repeat 3 --seed 42 --timeout 90
+python3 scripts/benchmark.py --config config/two_layer.json --mode cross --participants 1,2 --count 10000 --rates 4000 --cross-batch 8 --repeat 3 --seed 42 --timeout 90
 ```
 
 客户端每轮默认超时为 `count / rate + 60` 秒，包含负载发送和等待确认；之后最多等待 30 秒，让其余副本排空并收敛。需要更长时间时指定：

@@ -23,7 +23,8 @@ b = module("benchmark_under_test", ROOT / "scripts/benchmark.py")
 
 
 def configuration():
-    return c.validate(c.read(ROOT / "config/two_layer.json"))
+    raw = c.read(ROOT / "config/two_layer.json")
+    return c.validate(raw)
 
 
 def workload_case(mode="cross"):
@@ -40,15 +41,18 @@ def client_result(case):
             "p50_s": 0.10, "p95_s": 0.25, "p99_s": 0.31, "timings": []}
 
 
-def status_rows(case, completed=True):
+def status_rows(case, completed=True, cfg=None):
     """One transaction executes at each replica, but counts once in client TPS."""
     rows = []
-    for shard in [1, 2, 5]:
+    cfg = cfg or configuration()
+    parent, leaves = c.topology(cfg)
+    coordinator = c.lca(cfg, case["participants"]) if case["mode"] == "cross" else None
+    for shard in parent:
         leaf_count = case["count"] if completed and (
-            case["mode"] == "cross" and shard in [1, 2]
+            case["mode"] == "cross" and shard in case["participants"]
             or case["mode"] == "intra" and shard == case["shard"]
         ) else 0
-        root_count = case["count"] if completed and case["mode"] == "cross" and shard == 5 else 0
+        root_count = case["count"] if completed and case["mode"] == "cross" and shard == coordinator else 0
         for replica in range(4):
             rows.append({"shard": shard, "replica": replica, "ready": True, "alive": True,
                          "view": 0, "view_changes": 0, "changing_view": False,
@@ -211,7 +215,8 @@ class ResultAccounting(unittest.TestCase):
 
 class ParameterValidation(unittest.TestCase):
     def test_cross_benchmark_rejects_ordering_only_topologies(self):
-        cfg = c.validate(c.read(ROOT / "config/three_layer.json"))
+        raw = c.read(ROOT / "config/three_layer.json")
+        cfg = c.validate(raw)
         with self.assertRaises(ValueError):
             b.validate_selection(cfg, "cross", None, [1, 2])
         with self.assertRaises(ValueError):

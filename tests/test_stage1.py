@@ -106,6 +106,16 @@ class Configuration(unittest.TestCase):
             with self.subTest(config=raw), self.assertRaises(ValueError):
                 c.validate(raw)
 
+    def test_removed_pipeline_setting_is_rejected(self):
+        # Both old settings must fail explicitly rather than silently selecting
+        # a protocol that has been removed from the executable.
+        for value in (0, 8):
+            with self.subTest(pipeline_window=value):
+                raw = c.read(ROOT / "config/two_layer.json")
+                raw["consensus"]["pipeline_window"] = value
+                with self.assertRaisesRegex(ValueError, "pipeline_window"):
+                    c.validate(raw)
+
     def test_workload_reproducibility(self):
         cfg = c.validate(c.read(ROOT / "config/three_layer.json"))
         a = c.prepare_workload(cfg, 101, 100, 42, "test")
@@ -158,6 +168,48 @@ class Integration(unittest.TestCase):
             time.sleep(.3)
             self.assertGreater(c.read(Path(n["directory"]) / "status.json")["rejected_messages"], before)
             wait_state(run, 1, 81)
+            # An authenticated packet from the removed protocol is rejected
+            # even though its signer is a real member of this shard.
+            status_path = Path(n["directory"]) / "status.json"
+            baseline = c.read(status_path)
+            self.assertFalse(any(name.startswith(("pipe_", "pipeline")) for name in baseline))
+            removed_message = c.signed({"type": "PIPE_ARCHIVE_QUERY", "run": cfg["run_id"],
+                                        "shard": 1, "from": 1, "view": baseline["view"],
+                                        "target": 1}, cfg["nodes"][1]["private_key"], run)
+            c.send_frame(n["host"], n["port"], removed_message)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                after = c.read(status_path)
+                if after["rejected_messages"] > baseline["rejected_messages"]:
+                    break
+                time.sleep(.05)
+            self.assertGreater(after["rejected_messages"], baseline["rejected_messages"])
+            for field in ("executed_transactions", "ordered_cst_transactions", "applied_batches",
+                          "state_digest", "chain_digest", "kv_digest", "view"):
+                self.assertEqual(after[field], baseline[field], field)
+            self.assertTrue(all(not any(name.startswith(("pipe_", "pipeline")) for name in row)
+                                for row in c.statuses(run)))
+
+            # Bypassing the Python validator must not revive the removed
+            # setting in either executable entry point.
+            workload_path = run / "removed-setting.workload.json"
+            c.write(workload_path, c.prepare_workload(cfg, 1, 100, 11, "removed-setting", shard=1))
+            for value in (0, 8):
+                obsolete = copy.deepcopy(cfg)
+                obsolete["consensus"]["pipeline_window"] = value
+                obsolete_path = run / f"removed-setting-{value}.json"
+                c.write(obsolete_path, obsolete)
+                commands = [
+                    [str(c.BIN), "client", str(obsolete_path), str(workload_path),
+                     str(run / f"removed-setting-{value}.result.json")],
+                    [str(c.BIN), "node", str(obsolete_path), "1", "0",
+                     str(run / f"removed-setting-{value}.node")],
+                ]
+                for command in commands:
+                    with self.subTest(entrypoint=command[1], pipeline_window=value):
+                        rejected = subprocess.run(command, capture_output=True, text=True, timeout=3)
+                        self.assertEqual(rejected.returncode, 1, rejected.stdout + rejected.stderr)
+                        self.assertIn("pipeline_window", rejected.stderr)
 
     def test_backup_offline(self):
         with running("backup-offline") as run:

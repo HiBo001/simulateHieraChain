@@ -105,6 +105,44 @@ static void independentDelays() {
     std::cout<<"PASS independent destination delay scheduling\n";
 }
 
+static void deadlineWaitRoundingAndWake() {
+    using namespace std::chrono;
+    check(detail::networkPollTimeout(nanoseconds(-1))==0,"overdue deadline must not sleep");
+    check(detail::networkPollTimeout(Clock::duration::zero())==0,"due deadline must not sleep");
+    check(detail::networkPollTimeout(nanoseconds(1))==1,"positive sub-ms deadline busy-spins");
+    check(detail::networkPollTimeout(microseconds(999))==1,"sub-ms deadline was rounded down");
+    check(detail::networkPollTimeout(milliseconds(1))==1,"exact ms deadline changed");
+    check(detail::networkPollTimeout(microseconds(1001))==2,"fractional ms deadline was rounded down");
+    check(detail::networkPollTimeout(microseconds(9999))==10,"near-cap deadline was rounded down");
+    check(detail::networkPollTimeout(milliseconds(10))==10,"exact poll cap changed");
+    check(detail::networkPollTimeout(Clock::duration::max())==10,"large deadline overflowed poll cap");
+
+    Network sender, receiver;
+    std::mutex mutex; std::vector<int> ids; std::vector<double> elapsed;
+    receiver.start({"127.0.0.1",0},[&](json value){
+        std::lock_guard<std::mutex> lock(mutex);
+        ids.push_back(value.at("id"));
+        elapsed.push_back(millis(Clock::now())-value.at("begin_ms").get<double>());
+    });
+    sender.start({"127.0.0.1",0},[](json){});
+    Endpoint target{"127.0.0.1",receiver.localPort()};
+    auto enqueue=[&](int id,int delay){
+        check(sender.send(target,{{"id",id},{"begin_ms",millis(Clock::now())}},delay),"deadline enqueue");
+    };
+    enqueue(1,200);
+    // Let the worker enter its timed poll before adding an earlier deadline.
+    std::this_thread::sleep_for(milliseconds(5));
+    enqueue(2,0); enqueue(3,1);
+    check(waitFor([&]{return receiver.received==3;}),"staggered deadline messages missing");
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        check(ids==std::vector<int>({2,3,1}),"new earlier deadline failed to interrupt timed wait");
+        check(elapsed.at(1)>=1 && elapsed.at(2)>=200,"message was released before its configured delay");
+    }
+    sender.stop(); receiver.stop();
+    std::cout<<"PASS deadline ceiling, poll cap, wakeup and no early delayed delivery\n";
+}
+
 static void slowPeerBackpressureAndProgressDeadline() {
     Listener stalled; Network sender, healthy; std::atomic<int> arrivals{0};
     healthy.start({"127.0.0.1",0},[&](json){++arrivals;});
@@ -151,6 +189,7 @@ int main() {
     signal(SIGPIPE,SIG_IGN);
     try {
         persistentAndFragmentedFrames(); reconnectAfterPeerCloses(); independentDelays();
+        deadlineWaitRoundingAndWake();
         slowPeerBackpressureAndProgressDeadline(); timedQueueGlobalByteBudget();
     } catch(const std::exception& error) {std::cerr<<"FAIL "<<error.what()<<'\n';return 1;}
     return 0;

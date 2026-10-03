@@ -17,6 +17,16 @@
 #include <thread>
 
 namespace arbor {
+namespace detail {
+inline int networkPollTimeout(Clock::duration remaining) {
+    if (remaining <= Clock::duration::zero()) return 0;
+    // poll accepts whole milliseconds. Truncating a positive remainder below
+    // 1 ms produces poll(..., 0) and burns CPU until the message becomes due.
+    // Keep the existing 10 ms cap; a new earlier task interrupts via wake.
+    if (remaining >= std::chrono::milliseconds(10)) return 10;
+    return int(std::chrono::ceil<std::chrono::milliseconds>(remaining).count());
+}
+}
 struct Endpoint { std::string host; int port; };
 
 // One nonblocking I/O thread. Timed messages never sleep in the PBFT thread,
@@ -128,7 +138,7 @@ class Network {
                     auto t = pending.top(); pending.pop(); openTask(t);
                 }
                 if (!pending.empty())
-                    timeout = std::max(0, std::min(10, int(std::chrono::duration_cast<std::chrono::milliseconds>(pending.top().due - Clock::now()).count())));
+                    timeout = detail::networkPollTimeout(pending.top().due - Clock::now());
             }
             std::vector<pollfd> fds{{listener,POLLIN,0},{wake[0],POLLIN,0}};
             for (const auto& [fd,c] : connections)

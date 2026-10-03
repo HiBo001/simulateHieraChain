@@ -394,6 +394,33 @@ class Integration(unittest.TestCase):
                             entry["certificate"]["proposal"]["body"]["value"]["requests"]]
                 self.assertEqual(len(requests), 1)
 
+    def test_backlog_aliases_do_not_rebuild_unrelated_pending_index(self):
+        with running("incremental-index", consensus={"checkpoint_batches": 16}) as run:
+            cfg = c.read(run / "config.json")
+            workload = c.prepare_workload(cfg, 160, 4000, 31, "index-backlog",
+                                         participants=[1, 2], batch=4, timeout=30)
+            aliases = copy.deepcopy(workload["requests"])
+            for request in aliases:
+                request["id"] += ":alias"
+            workload["requests"].extend(aliases)
+            rc, result = run_client(run, "index-backlog", workload)
+            self.assertEqual((rc, result["executed_transactions"], result["completed_requests"]),
+                             (0, 160, 80))
+            settled(run, {1: 160, 2: 160}, 160, 40)
+            rows = wait_status(run, lambda rows: all(r["pending_requests"] == 0 and
+                               r["dedup_waiting_requests"] == 0 for r in rows))
+            for row in rows:
+                self.assertEqual(row["dedup_index_rebuilds"], 0,
+                                 "healthy commit path rebuilt the whole pending index")
+                self.assertLessEqual(row["dedup_pending_checks"], 160)
+                self.assertLessEqual(row["dedup_waiter_checks"], 320)
+            for replica in range(4):
+                entries = journal_entries(run, 5, replica)
+                requests = [request for entry in entries for request in
+                            entry["certificate"]["proposal"]["body"]["value"]["requests"]]
+                self.assertEqual(len(requests), 40)
+            assert_no_invalid_proposals_or_view_changes(self, run)
+
     def test_mixed_requests_sharing_completed_transaction_finish_in_separate_batches(self):
         for name, selector in [("local-mixed", {"shard": 1}),
                                ("cross-mixed", {"participants": [1, 2]})]:
