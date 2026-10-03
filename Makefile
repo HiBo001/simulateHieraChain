@@ -27,6 +27,7 @@ test: $(BIN) $(NETWORK_TEST) $(DIGEST_TEST)
 	python3 tests/test_stage1.py
 	python3 tests/test_stage2a.py
 	python3 tests/test_stage2b.py
+	python3 -B tests/test_multilayer.py
 	python3 -B tests/test_client_fanout.py
 	python3 -B tests/test_snapshot_digest.py
 	python3 -B tests/test_engineering.py

@@ -141,6 +141,55 @@ class ResultAccounting(unittest.TestCase):
         self.assertEqual(summary["status"], "PASS")
         self.assertEqual(summary["executed_transactions"], 128)
 
+    def test_multilayer_empty_round_slots_are_not_business_transactions(self):
+        cfg = c.validate(c.read(ROOT / "config/three_layer.json"))
+        case = workload_case()
+        case["participants"] = [1, 2, 3]
+        rows = status_rows(case, cfg=cfg)
+        for row in rows:
+            if row["shard"] in (5, 6):
+                # Every coordinator certifies a round close, including empty
+                # closes. These consume PBFT slots but never business counts.
+                row["applied_batches"] = 7
+                row["cst_round"] = 7
+                row["rounds_requested"] = 7
+        self.assertTrue(b.settled(case, cfg, rows))
+        result = self.summary(case=case, cfg=cfg, after=rows,
+                              before=status_rows(case, False, cfg))
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["executed_transactions"], case["count"])
+        self.assertEqual(result["per_shard"]["4"]["executed_each_replica"], [0] * 4)
+        self.assertEqual(result["per_shard"]["5"]["executed_each_replica"], [0] * 4)
+        for sid, field in [(4, "executed_transactions"),
+                           (5, "ordered_cst_transactions"),
+                           (5, "completed_cst_transactions"),
+                           (6, "executed_transactions")]:
+            bad = copy.deepcopy(rows)
+            for row in bad:
+                if row["shard"] == sid:
+                    row[field] = 1
+            with self.subTest(shard=sid, field=field):
+                self.assertFalse(b.settled(case, cfg, bad))
+
+    def test_unrelated_coordinator_must_finish_requested_empty_close(self):
+        cfg = c.validate(c.read(ROOT / "config/three_layer.json"))
+        case = workload_case()
+        case["participants"] = [1, 3]
+        rows = status_rows(case, cfg=cfg)
+        for row in rows:
+            if row["shard"] == 6:
+                row["cst_round"] = 4
+                row["rounds_requested"] = 5
+        self.assertFalse(b.settled(case, cfg, rows))
+        result = self.summary(case=case, cfg=cfg, after=rows,
+                              before=status_rows(case, False, cfg))
+        self.assert_failure(result)
+        self.assertTrue(any("未封闭轮次" in problem for problem in result["failure_reasons"]))
+        for row in rows:
+            if row["shard"] == 6:
+                row["cst_round"] = 5
+        self.assertTrue(b.settled(case, cfg, rows))
+
     def test_incomplete_client_is_failure_even_with_a_tps_number(self):
         result = copy.deepcopy(self.result)
         result["completed_requests"] = 10
@@ -214,14 +263,21 @@ class ResultAccounting(unittest.TestCase):
 
 
 class ParameterValidation(unittest.TestCase):
-    def test_cross_benchmark_rejects_ordering_only_topologies(self):
-        raw = c.read(ROOT / "config/three_layer.json")
-        cfg = c.validate(raw)
-        with self.assertRaises(ValueError):
-            b.validate_selection(cfg, "cross", None, [1, 2])
-        with self.assertRaises(ValueError):
-            b.validate_selection(cfg, "all", 1, [1, 2])
+    def test_cross_benchmark_accepts_multilayer_and_multiple_participants(self):
+        cfg = c.validate(c.read(ROOT / "config/three_layer.json"))
+        for participants in ([1, 2], [1, 3], [1, 2, 3], [1, 2, 3, 4]):
+            with self.subTest(participants=participants):
+                b.validate_selection(cfg, "cross", None, participants)
+                b.validate_selection(cfg, "all", 1, participants)
         b.validate_selection(cfg, "intra", 1, [])
+
+    def test_four_layer_nonuniform_topology_selection(self):
+        cfg = c.validate(c.read(ROOT / "config/four_layer.json"))
+        for participants, coordinator in [([1, 2], 5), ([1, 3], 7),
+                                           ([1, 8], 9), ([1, 3, 8], 9)]:
+            with self.subTest(participants=participants):
+                self.assertEqual(c.lca(cfg, participants), coordinator)
+                b.validate_selection(cfg, "cross", None, participants)
 
     def test_selected_shards_must_be_valid_leaves(self):
         cfg = configuration()

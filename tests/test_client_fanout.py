@@ -109,7 +109,7 @@ class ClientFanout(unittest.TestCase):
                 "kv": {}, "seen": {}, "requests": {}, "executed": 0,
                 "ordered_cst": 0, "cst_batches": {}, "cst_seen": {},
                 "leaf_ordered_cst": 0, "last_cst_seq": 0,
-                "cst_finalized": {}, "cst_orders": {}, "cst_order_index": 0,
+                "cst_finalized": {}, "cst_orders": {}, "cst_order_index": 0, "cst_round": 0, "cst_indices": {}, "participant_indices": {}, "cst_rounds": {},
             }
             stable = {"seq": 0, "state": genesis, "proof": []}
             changes = [engineering.replica_message(

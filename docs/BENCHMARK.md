@@ -9,7 +9,7 @@ python3 scripts/benchmark.py
 
 默认使用 `config/two_layer.json`，分别测试片内和跨片交易；每轮 4000 笔，发送速率为 1000、4000 笔/秒，各运行一次。片内默认客户端批次取配置的 `batch_size`，跨片默认每个客户端请求包含 8 笔。需要直接使用已编译二进制时加 `--skip-build`。
 
-每个用例都会在空闲端口启动一个新集群，结束或按 Ctrl+C 后停止本轮节点，不修改 `runtime/latest`，不停止已有集群。每个分片仍有 4 个真实运行的 PBFT 副本。完整跨片性能测试要求恰好三个分片：一个根和两个直属叶子，`--participants` 必须指定这两个叶子。默认片内目标为分片 1，跨片参与分片为 1、2，可用 `--shard`、`--participants` 调整。多层拓扑可测片内性能；其中跨片请求只有 `ordered_only` 排序验证，benchmark 会拒绝将它作为完整跨片性能测试。
+每个用例都会在空闲端口启动一个新集群，结束或按 Ctrl+C 后停止本轮节点，不修改 `runtime/latest`，不停止已有集群。每个分片仍有 4 个真实运行的 PBFT 副本。片内目标须是叶子；跨片 `--participants` 须指定至少两个不重复叶子，目标自动取最近公共祖先 NCA。三层、四层、非均匀深度树和超过两个参与叶子的完整执行均可测试。默认片内目标为分片 1，跨片参与分片为 1、2，可用 `--shard`、`--participants` 调整。
 
 当前版本已移除流水线。自定义配置若含 `consensus.pipeline_window`（包括 0），请删除后再运行。
 
@@ -54,6 +54,17 @@ python3 scripts/benchmark.py --config config/two_layer.json --mode cross --parti
 python3 scripts/benchmark.py --mode cross --count 10000 --rates 1000 --timeout 180 --drain-timeout 60
 ```
 
+## 多层性能测试
+
+```bash
+python3 scripts/benchmark.py --config config/three_layer.json --mode cross --participants 1,2 --count 256 --rates 100 --cross-batch 8 --repeat 3 --timeout 180 --drain-timeout 60
+python3 scripts/benchmark.py --config config/three_layer.json --mode cross --participants 1,3 --count 256 --rates 100 --cross-batch 8 --repeat 3 --timeout 180 --drain-timeout 60
+python3 scripts/benchmark.py --config config/three_layer.json --mode cross --participants 1,2,3 --count 256 --rates 100 --cross-batch 8 --repeat 3 --timeout 180 --drain-timeout 60
+python3 scripts/benchmark.py --config config/four_layer.json --mode cross --participants 1,8 --count 128 --rates 100 --cross-batch 8 --repeat 3 --timeout 240 --drain-timeout 60
+```
+
+多协调者拓扑有按需轮次和 PBFT 封闭控制槽，每个协调者即使本轮没有业务请求也必须证明该轮已封闭。只有实际 NCA 的排序和完成业务计数应为 count，只有参与叶子执行 count 笔；无关协调者允许出现空封闭槽，但业务计数应为 0，其他叶子也不应执行本轮交易。benchmark 检查这些条件，并要求每个分片内部四副本应用槽数及摘要一致。所有进程共享 CPU，因此跨层数量与节点数量都会影响本机结果；控制槽的网络与共识成本计入测量。
+
 ## 结果与统计口径
 
 脚本打印结果目录，默认保存在 `test-results/benchmark-时间-随机标识/`。可用 `--output-dir` 指定一个尚不存在的目录。
@@ -65,7 +76,7 @@ python3 scripts/benchmark.py --mode cross --count 10000 --rates 1000 --timeout 1
 - `case-*/client.json`、`workload.json`、`client.log`：客户端逐笔确认时间、输入负载和输出。
 - `case-*/status-before.json`、`status-after.json` 与 `case-*/run/`：负载前后节点状态和各节点日志。
 
-TPS 以客户端确认的唯一交易数除以客户端负载时间计算。它包含发送过程、等待两个一致的签名回复以及协议提交完成所需的时间；不包含集群启动时间和客户端结束后等待其他副本排空的时间。4 个副本执行同一笔交易只计一笔，两个叶子执行同一笔跨片交易也只计一笔。
+TPS 以客户端确认的唯一交易数除以客户端负载时间计算。它包含发送过程、等待两个一致的签名回复以及协议提交完成所需的时间；不包含集群启动时间和客户端结束后等待其他副本排空的时间。4 个副本执行同一笔交易只计一笔，多个叶子执行同一笔跨片交易也只计一笔。
 
 `PASS` 要求请求全部确认、执行笔数正确，以及各分片四副本状态摘要一致，待处理交易和网络发送缓存排空。超时或未完成的轮次标为 `FAIL`，TPS 和延时汇总留空，原始客户端结果仍保留；不能把局部完成的 TPS 用作性能对照。
 
@@ -95,7 +106,7 @@ python3 scripts/benchmark.py --mode cross --count 4000 --rates 1000 --cross-batc
 
 使用本机 `config/two_layer.json`，跨片 4000 笔、速率 1000、客户端批次 8、随机种子 42，旧路径某单轮全部成功：`completed_tps=258.34`、`avg_latency_s=5.431696`、`p95_s=10.361180`、`p99_s=14.004256`，网络失败差值为 0。历史报告位置为 `test-results/benchmark-20261002-154253-7a84612f/summary.json`，若已执行 `make clean`，该记录可能已被删除。**这不是新 3 次 PBFT 协议的实测值。** 之前的 230.40 TPS 也不是经脚本验证的同负载、多轮基线。
 
-当前正常跨片路径为根一次 ORDER PBFT、两叶各一次 PBFT；叶子在同一槽内等待依赖并完成执行，上层收齐两叶完成 QC 后直接确认。以下是该新路径的最终复测，不能把旧单轮 258.34 TPS 当作正式多轮基线来宣称固定倍数。
+下面保留的是两层历史路径：根一次 ORDER PBFT、两叶各一次 PBFT；叶子在同一槽内等待依赖并完成执行，上层收齐两叶完成 QC 后直接确认。以下是该新路径的最终复测，不能把旧单轮 258.34 TPS 当作正式多轮基线来宣称固定倍数。
 
 ## 新 3 次 PBFT 版本的最终验证（2026-10-02）
 

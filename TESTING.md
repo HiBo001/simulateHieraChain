@@ -2,11 +2,11 @@
 
 所有命令在项目根目录执行。每一组手动故障测试建议先停止旧集群、启动一轮新实验；停止的副本不要在原运行目录直接重启。
 
-当前版本已移除流水线、推测执行和重做路径，恢复叶子逐批处理。完整跨片执行测试使用根 5、叶子 1/2 的两层三分片配置；多层配置继续验证片内执行及 NCA 排序，跨片结果为 `ordered_only`，不能作为完成 TPS。当前实现设计见 [docs/CURRENT_IMPLEMENTATION_DESIGN.md](docs/CURRENT_IMPLEMENTATION_DESIGN.md)。
+当前版本支持两层、三层、四层及非均匀深度树上的完整跨片执行，也支持超过两个参与叶子。叶子逐批处理，未恢复流水线、推测执行或重做路径。多协调者使用认证轮次和祖先封闭证书防止跨层相反顺序；成功跨片请求应报告 `ordered_only=0`。当前实现设计见 [docs/MULTILAYER_DESIGN.md](docs/MULTILAYER_DESIGN.md) 和 [docs/CURRENT_IMPLEMENTATION_DESIGN.md](docs/CURRENT_IMPLEMENTATION_DESIGN.md)。
 
 客户端取得 `f+1` 个一致回复后，其余副本可能仍在传播最后 ACK；应等待待处理请求、跨片队列、暂存批次及网络发送队列清空，再检查四副本摘要和检查点。本文保留的历史测试数字不代替本次修改后的回归结果，当前验收以实际 `make test` 和 benchmark 报告为准。
 
-2026-10-03 移除流水线后的实际验收：`make test` 退出码 0，**98 项全部通过**（网络 6、状态摘要 5、清理 18、第一阶段 15、阶段 A 1、阶段 B 5、客户端投递 3、快照摘要 1、工程 21、benchmark 23）。其中验证了旧 `pipeline_window` 配置与已签名旧协议消息被拒绝，正常共识和两层跨片仍可执行。两层双方跨片在 rate=4000、客户端批次 8、seed=42 下，4000/10000 笔各三轮均完成并收敛，TPS 中位数为 **658.30/648.21**，平均延时为 **2.625234/6.528560 秒**，p95 为 **5.663333/12.983486 秒**。六轮均无视图切换；10000 笔第二轮网络 failure 计数为 3，未导致确认或收敛失败，具体限制见[本次验收报告](/Users/tanghaibo_office/Documents/ChatGPT/Arbor系统搭建/remove-pipeline-validation-20261003/REPORT.md)。
+此前 2026-10-03 移除流水线时的历史验收（不代表本轮多层扩展的结果）：`make test` 退出码 0，**98 项全部通过**（网络 6、状态摘要 5、清理 18、第一阶段 15、阶段 A 1、阶段 B 5、客户端投递 3、快照摘要 1、工程 21、benchmark 23）。其中验证了旧 `pipeline_window` 配置与已签名旧协议消息被拒绝，正常共识和两层跨片仍可执行。两层双方跨片在 rate=4000、客户端批次 8、seed=42 下，4000/10000 笔各三轮均完成并收敛，TPS 中位数为 **658.30/648.21**，平均延时为 **2.625234/6.528560 秒**，p95 为 **5.663333/12.983486 秒**。六轮均无视图切换；10000 笔第二轮网络 failure 计数为 3，未导致确认或收敛失败，具体限制见[本次验收报告](/Users/tanghaibo_office/Documents/ChatGPT/Arbor系统搭建/remove-pipeline-validation-20261003/REPORT.md)。
 
 ## 1. 一键自动测试
 
@@ -15,7 +15,7 @@ make
 make test
 ```
 
-`make test` 依次运行网络、状态摘要、隔离清理、第一阶段、第二阶段 A/B、客户端发送、冻结快照、工程及性能脚本检查。测试会选择空闲端口范围，创建独立运行目录，启动真实节点进程，结束时自动停止；不改变普通运行的 `runtime/latest` 指向。第一阶段结果保留在 `test-results/<时间-编号>/`，其中 `summary.json` 应显示：
+`make test` 依次运行网络、状态摘要、隔离清理、第一阶段、第二阶段 A/B、客户端发送、冻结快照、工程、多层及性能脚本检查。测试会选择空闲端口范围，创建独立运行目录，启动真实节点进程，结束时自动停止；不改变普通运行的 `runtime/latest` 指向。第一阶段结果保留在 `test-results/<时间-编号>/`，其中 `summary.json` 应显示：
 
 ```json
 {"tests": 15, "failures": 0, "errors": 0, "passed": true}
@@ -123,7 +123,7 @@ python3 scripts/cluster.py load --participants 1,2 --count 20 --rate 100
 python3 scripts/cluster.py load --participants 1,3 --count 20 --rate 100
 ```
 
-预期：`topology --config` 与启动后的 `topology` 打印相同的树：根 7，下接协调者 5、6，叶子 1、2 在 5 下，叶子 3、4 在 6 下；兄弟分片按 ID 升序排列。28 个节点运行；分片 4 四副本执行 40 笔；协调者 5 和 7 各排序 20 笔。协调者显示 `ordered_only=20`、`executed=0`。这些排序样例用来验证 NCA 和协调者 PBFT，不代表跨片执行已完成。
+预期：`topology --config` 与启动后的 `topology` 打印相同的树：根 7，下接协调者 5、6，叶子 1、2 在 5 下，叶子 3、4 在 6 下；兄弟分片按 ID 升序排列。28 个节点运行；两轮跨片请求均应完成 20 笔并报告 `ordered_only=0`。排空后，叶子 1 四副本执行 40 笔，叶子 2、3 各执行 20 笔，叶子 4 执行原片内 40 笔；协调者 5、7 各排序并完成 20 笔，协调者不执行叶子程序。协调者 6 可能应用轮次封闭控制槽，但业务排序、完成和执行计数均为 0。
 
 ## 9. 一键停止与再次启动
 
@@ -151,7 +151,7 @@ python3 scripts/cluster.py status
 
 ## 第二阶段 A：带证书的二层跨片排序下发
 
-这一节及下一节检查当前保留的二层跨片协议：根排序一次，两叶各纳入本片 PBFT 顺序并在同一槽内完成执行，根收齐完成证明后直接回复。
+这一节及下一节检查两层配置中的跨片协议：根排序一次，两叶各纳入本片 PBFT 顺序并在同一槽内完成执行，根收齐完成证明后直接回复。
 
 ```bash
 make
@@ -249,3 +249,61 @@ python3 scripts/benchmark.py --mode cross --count 4000 --rates 1000 --repeat 3 -
 ```
 
 三轮均 4000 笔/400 请求全部完成、全副本收敛、网络失败为 0。TPS 为 **645.82 / 619.01 / 635.82**，中位数 **635.82**；平均延时、p95、p99 的轮次中位数分别为 **1.197158 / 2.178143 / 2.294141 秒**。报告为 `test-results/benchmark-20261002-220743-387996e2/summary.json` 和 `summary.csv`。前后两组报告客户端批次不同，不能直接用作同参数加速倍数对照；`make clean` 同样会删除这组历史报告与日志。
+
+
+## 多层完整执行专项
+
+先编译；自动测试会创建隔离集群并在结束时停止节点，不改变 `runtime/latest`：
+
+```bash
+make
+python3 -B tests/test_multilayer.py
+python3 -B tests/test_benchmark.py
+```
+
+手动三层测试使用三轮不同参与集合，检查相邻祖先与根均能协调：
+
+```bash
+./stop_all.sh
+python3 scripts/cluster.py validate --config config/three_layer.json
+python3 scripts/cluster.py topology --config config/three_layer.json
+./start_all.sh --config config/three_layer.json
+python3 scripts/cluster.py load --participants 1,2 --count 64 --rate 100 --batch 8 --seed 42 --timeout 120
+python3 scripts/cluster.py load --participants 1,3 --count 64 --rate 100 --batch 8 --seed 43 --timeout 120
+python3 scripts/cluster.py load --participants 1,2,3 --count 64 --rate 100 --batch 8 --seed 44 --timeout 120
+python3 scripts/cluster.py status --json
+./stop_all.sh
+```
+
+三轮均应 `completed=64 ordered_only=0 requests=8/8`，并显示真实完成 TPS 与秒单位延时。排空后叶子 1 四副本各执行 192 笔、叶子 2 各执行 128 笔、叶子 3 各执行 128 笔、叶子 4 执行 0 笔；协调者 5 排序并完成 64 笔、协调者 7 排序并完成 128 笔、协调者 6 业务计数仍为 0。每个分片的四副本业务摘要和应用槽数应一致；不同分片的摘要不要求相同。空封闭槽可能使非 NCA 协调者的 `applied_batches` 增加，这是协议控制开销。
+
+四层非均匀拓扑验证三个不同祖先层级：
+
+```bash
+python3 scripts/cluster.py validate --config config/four_layer.json
+python3 scripts/cluster.py topology --config config/four_layer.json
+./start_all.sh --config config/four_layer.json
+python3 scripts/cluster.py load --participants 1,2 --count 32 --rate 100 --batch 8 --seed 45 --timeout 180
+python3 scripts/cluster.py load --participants 1,3 --count 32 --rate 100 --batch 8 --seed 46 --timeout 180
+python3 scripts/cluster.py load --participants 1,8 --count 32 --rate 100 --batch 8 --seed 47 --timeout 180
+python3 scripts/cluster.py load --participants 1,3,8 --count 32 --rate 100 --batch 8 --seed 48 --timeout 180
+python3 scripts/cluster.py status --json
+./stop_all.sh
+```
+
+NCA 分别为 5、7、9、9。均应完整确认，不出现仅排序客户端结果。36 个副本进程共享本机 CPU；测试超时可以提高，不以两层历史 TPS 推断本轮吞吐。
+
+性能测试每轮创建新集群，以客户端唯一完成数计数：
+
+```bash
+python3 scripts/benchmark.py --config config/three_layer.json --mode cross --participants 1,3 --count 256 --rates 100 --cross-batch 8 --repeat 3 --timeout 180 --drain-timeout 60
+python3 scripts/benchmark.py --config config/three_layer.json --mode cross --participants 1,2,3 --count 256 --rates 100 --cross-batch 8 --repeat 3 --timeout 180 --drain-timeout 60
+python3 scripts/benchmark.py --config config/four_layer.json --mode cross --participants 1,8 --count 128 --rates 100 --cross-batch 8 --repeat 3 --timeout 240 --drain-timeout 60
+```
+
+只有所有请求完成、参与叶子执行计数正确、NCA 排序和完成计数正确、非参与分片业务计数为 0、所有分片内副本收敛并排空，才显示 `PASS`。持续片内负载的公平调度、自适应扩缩容、状态重分区、整片断电恢复与跨片统一可见性不属于本轮验收范围。
+
+
+## 2026-10-03 多层版本验收
+
+完整 `make test` 退出码 0，112 项检查全部通过。两层兼容、三层两方、三层三方及四层不同深度两方的隔离集群测量共 12 轮全部 PASS，交易完整完成、副本收敛，网络失败与视图切换均为 0。配置与负载不同，不能据此直接比较层数性能；详细指标、复测命令和原始报告路径见 [docs/MULTILAYER_VALIDATION.md](docs/MULTILAYER_VALIDATION.md)。

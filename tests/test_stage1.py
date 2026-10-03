@@ -286,7 +286,7 @@ class Integration(unittest.TestCase):
             d = digest(value)
             pp = replica_msg("PREPREPARE", 0, 0, seq=1, digest=d, value=value)
             prepared = {"proposal": pp, "prepares": [replica_msg("PREPARE", r, 0, seq=1, digest=d) for r in [1, 2]]}
-            initial = {"seq": 0, "chain": __import__("hashlib").sha256(b"arbor-genesis").hexdigest(), "kv": {}, "seen": {}, "requests": {}, "executed": 0, "ordered_cst": 0, "cst_batches": {}, "cst_seen": {}, "leaf_ordered_cst": 0, "last_cst_seq": 0, "cst_finalized": {}, "cst_orders": {}, "cst_order_index": 0}
+            initial = {"seq": 0, "chain": __import__("hashlib").sha256(b"arbor-genesis").hexdigest(), "kv": {}, "seen": {}, "requests": {}, "executed": 0, "ordered_cst": 0, "cst_batches": {}, "cst_seen": {}, "leaf_ordered_cst": 0, "last_cst_seq": 0, "cst_finalized": {}, "cst_orders": {}, "cst_order_index": 0, "cst_round": 0, "cst_indices": {}, "participant_indices": {}, "cst_rounds": {}}
             checkpoint = {"seq": 0, "state": initial, "proof": []}
             vcs = [replica_msg("VIEW_CHANGE", r, 1, stable=checkpoint, prepared=[prepared] if r == 2 else []) for r in [1, 2, 3]]
             bad = replica_msg("NEW_VIEW", 1, 1, changes=vcs, proposals=[])
@@ -323,7 +323,7 @@ class Integration(unittest.TestCase):
             initial = {"seq": 0, "chain": __import__("hashlib").sha256(b"arbor-genesis").hexdigest(),
                        "kv": {}, "seen": {}, "requests": {}, "executed": 0, "ordered_cst": 0,
                        "cst_batches": {}, "cst_seen": {}, "leaf_ordered_cst": 0, "last_cst_seq": 0,
-                       "cst_finalized": {}, "cst_orders": {}, "cst_order_index": 0}
+                       "cst_finalized": {}, "cst_orders": {}, "cst_order_index": 0, "cst_round": 0, "cst_indices": {}, "participant_indices": {}, "cst_rounds": {}}
             checkpoint = {"seq": 0, "state": initial, "proof": []}
             changes = [msg("VIEW_CHANGE", who, 1, stable=checkpoint,
                            prepared=[certificate] if who == 2 else []) for who in (1, 2, 3)]
@@ -404,17 +404,24 @@ class Integration(unittest.TestCase):
                 self.assertEqual(result["executed_transactions"], count)
                 wait_state(run, 1, expected, timeout=20)
 
-    def test_three_layer_all_shards_and_order_only_accounting(self):
-        with running("three-layer", "three_layer.json") as run:
+    def test_three_layer_all_shards_and_full_execution_accounting(self):
+        def tune(raw):
+            raw["consensus"].update(view_timeout_ms=3000, cross_shard_batch_wait_ms=30)
+            raw["execution"] = {"fib_iterations": 1}
+        with running("three-layer", "three_layer.json", modify=tune) as run:
             self.assertEqual(len(c.statuses(run)), 28)
-            self.assertEqual(c.load(run, count=16, rate=100, shard=1, timeout=12)[0], 0)
+            self.assertEqual(c.load(run, count=16, rate=100, shard=1, timeout=20)[0], 0)
             wait_state(run, 1, 16)
+            leaf_counts = {1: 16, 2: 0, 3: 0, 4: 0}
             for participants, coordinator in [([1,2],5),([3,4],6),([1,3],7)]:
-                rc, result = c.load(run, count=8, rate=100, participants=participants, timeout=12)
+                rc, result = c.load(run, count=8, rate=100, participants=participants, timeout=30)
                 self.assertEqual(rc, 0)
-                self.assertEqual(result["executed_transactions"], 0)
-                self.assertEqual(result["ordered_only_transactions"], 8)
-                wait_state(run, coordinator, 0, ordered=8)
+                self.assertEqual(result["executed_transactions"], 8)
+                self.assertEqual(result["ordered_only_transactions"], 0)
+                wait_state(run, coordinator, 0, ordered=8, timeout=20)
+                for leaf in participants:
+                    leaf_counts[leaf] += 8
+                    wait_state(run, leaf, leaf_counts[leaf], timeout=20)
 
     def test_restart_script_and_port_conflict(self):
         latest = ROOT / "runtime/latest"

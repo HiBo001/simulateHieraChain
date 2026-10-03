@@ -1,8 +1,8 @@
 # Arbor 仿真系统：PBFT 与跨片执行
 
-每个分片固定 4 个独立 C++ 进程，通过 TCP 和真实签名运行 PBFT。当前完整跨片执行支持一个根协调分片和两个直属叶子：根通过 PBFT 排序，两叶各通过一次 PBFT 纳入本片顺序，交换依赖证明后执行并写入。叶子 forward 汇总完成 ACK QC，协调者收齐双方证明后直接回复客户端。交易执行实际计算 Fibonacci。
+每个分片固定 4 个独立 C++ 进程，通过 TCP 和真实签名运行 PBFT。跨片交易支持多层树和两个以上参与叶子：最近公共祖先（NCA）通过 PBFT 排序，将认证订单直接发给参与叶子；每个叶子通过一次 PBFT 纳入本片顺序，交换依赖证明后执行并写入。叶子 forward 汇总完成 ACK QC，NCA 收齐所有参与叶子的证明后直接回复客户端。交易执行实际计算 Fibonacci。
 
-流水线的逐交易推测执行、多版本历史和重做路径已移除；原有批次依赖证明继续使用。叶子按批次顺序处理，等待当前批次依赖并完成执行后再处理下一批。多层拓扑仍可启动并运行片内交易，跨片请求保留 NCA 排序验证、返回 `ordered_only`，尚不支持完整跨片执行。详细实现见 [docs/CURRENT_IMPLEMENTATION_DESIGN.md](docs/CURRENT_IMPLEMENTATION_DESIGN.md)。
+叶子按批次顺序处理，等待当前批次依赖并完成执行后再处理下一批。多协调者拓扑使用按需开启的认证轮次：各协调者通过 PBFT 封闭本轮订单，叶子收齐其所有祖先的封闭证书后，按 `(round, coordinator_id)` 顺序处理适用订单，避免不同层级订单形成相互等待。当前没有逐交易推测执行、多版本历史或重做路径。详细说明见 [docs/MULTILAYER_DESIGN.md](docs/MULTILAYER_DESIGN.md) 和 [当前实现设计](docs/CURRENT_IMPLEMENTATION_DESIGN.md)。
 
 支持 macOS / Linux 本机多进程运行。构建依赖 C++17 编译器、Python 3.9+ 和 OpenSSL 3 开发库；不依赖 FISCO、Python 第三方包或额外 JSON 包安装。nlohmann/json 3.11.3 单头文件及 MIT 许可证已放入 `third_party/nlohmann/`。
 
@@ -26,7 +26,7 @@ python3 scripts/cluster.py probe --source 1:0 --to 2:0 --samples 5
 ./stop_all.sh
 ```
 
-`two_layer.json` 定义叶子 1、2 和协调者 5，总共启动 **12 个节点进程**。节点编号为 0、1、2、3，初始主节点为 0。单分片示例在 `config/single_shard.json`；三层 7 分片、28 节点示例在 `config/three_layer.json`。
+`two_layer.json` 定义叶子 1、2 和协调者 5，总共启动 **12 个节点进程**。节点编号为 0、1、2、3，初始主节点为 0。单分片示例在 `config/single_shard.json`；三层 7 分片、28 节点示例在 `config/three_layer.json`；四层 9 分片、36 节点示例在 `config/four_layer.json`。
 
 `topology` 默认读取 `runtime/latest/config.json`，打印最近一次运行实际保存的分片树；指定运行目录可用 `--run-dir 路径`。启动前可用 `python3 scripts/cluster.py topology --config config/three_layer.json` 预览并校验配置。启动成功时也会打印同一棵树。两层示例输出：
 
@@ -166,11 +166,28 @@ python3 scripts/cluster.py load --participants 1,2 --count 40 --rate 100 --batch
 
 `rate` 是全局目标交易到达率，按请求批次发送，不是指定系统 TPS。单条 `load` 命令只接受一组 `--shard`、`--count`、`--rate`；这些参数重复时会报错。省略 `--shard` 时，批次按叶子分片轮流分配；如需两个独立客户端同时发送，可在两个终端分别运行单片 `load`。客户端默认给交易加随机运行前缀；`--seed` 固定账户和值的序列，`--id-prefix` 再固定交易标识。实际发出的负载保存在 `client-*.workload.json`，便于检查。
 
-跨片交易由 `accesses` 为每个参与叶子声明一个 key 和输入值，目标是其最近公共祖先（NCA）。完整执行使用 `config/two_layer.json` 中的叶子 1、2；其他拓扑的跨片请求只验证排序，返回 `ordered_only`，不能计为完成 TPS。新请求若重放相同交易 ID 与内容，客户端显示 `duplicates`，不计入完成 TPS；同一 ID 对应不同内容会返回 `id_conflict`。
+多层手动测试：
+
+```bash
+./stop_all.sh
+./start_all.sh --config config/three_layer.json
+# 同父叶子：NCA=5
+python3 scripts/cluster.py load --participants 1,2 --count 64 --rate 100 --batch 8 --timeout 120
+# 不同子树：NCA=7
+python3 scripts/cluster.py load --participants 1,3 --count 64 --rate 100 --batch 8 --timeout 120
+# 三个参与叶子：NCA=7
+python3 scripts/cluster.py load --participants 1,2,3 --count 64 --rate 100 --batch 8 --timeout 120
+python3 scripts/cluster.py status
+./stop_all.sh
+```
+
+完整跨片请求成功时均显示 `ordered_only=0`。四层可改用 `config/four_layer.json`，参与者 `1,8` 的 NCA 是根 9，参与者 `1,3` 的 NCA 是协调者 7。
+
+跨片交易由 `accesses` 为每个参与叶子声明一个 key 和输入值，目标是其最近公共祖先（NCA）。两个以上不重复叶子可共同参与；三层、四层及非均匀深度拓扑均走完整执行路径。中间协调者不为祖先的订单重复发起交易共识。新请求若重放相同交易 ID 与内容，客户端显示 `duplicates`，不计入完成 TPS；同一 ID 对应不同内容会返回 `id_conflict`。
 
 片内请求默认最多 `batch_size` 笔，跨片请求默认最多 `cross_shard_batch_size` 笔；`--batch` 可降低请求大小，超过对应上限会报错。协调分片会把参与分片集合相同的请求合并成至多 `cross_shard_batch_size` 笔的 PBFT 跨片批次。示例配置下，`--batch 8` 的 8 个请求可合成一个 64 笔跨片批次。此处按参与分片集合组批，不要求 key 或读写集完全相同；批前读快照按唯一 key 复用，批内按交易顺序更新 working state。客户端请求首次发送到目标分片的副本 0、1，即 `f+1=2` 个不同节点；备份转交给当前主节点，超过 500 ms 未确认才向全部 4 个副本重试，后续重试逐步退避。客户端验证副本 Ed25519 签名，等到 `f+1=2` 个不同副本返回相同结果后计为确认。
 
-所有请求成功确认后，终端同一行显示 `completed_tps`、`avg_latency_s`、`p50_s`、`p95_s`、`p99_s`；若超时或交易报错，则显示 `incomplete=true` 和已确认交易的延时，并返回非零退出码。结果文件 `client-*.json` 也保存这些指标、逐交易确认耗时和完整输入。交易延时统一以秒为单位，逐笔记录使用 `latency_s`，完成时刻使用相对于测试开始的 `completion_s`。延时口径为客户端发送请求到收到两个一致副本回复；平均值和分位数按已确认交易统计。二层跨片回复必须等到两叶最终写入并返回各自三副本 ACK，因而计入真实完成延时；其他拓扑为 `ordered_only`。这里的平均 TPS 包括本次客户端的发送及排空时间，**不是饱和稳态吞吐**。批内交易共用请求发送时间，确认在整批回复时观察到。重复测试中客户端确认数表示收到的有效回复，是否发生新的执行要看节点累计执行数；不要拿重放请求测试计算业务吞吐。
+所有请求成功确认后，终端同一行显示 `completed_tps`、`avg_latency_s`、`p50_s`、`p95_s`、`p99_s`；若超时或交易报错，则显示 `incomplete=true` 和已确认交易的延时，并返回非零退出码。结果文件 `client-*.json` 也保存这些指标、逐交易确认耗时和完整输入。交易延时统一以秒为单位，逐笔记录使用 `latency_s`，完成时刻使用相对于测试开始的 `completion_s`。延时口径为客户端发送请求到收到两个一致副本回复；平均值和分位数按已确认交易统计。跨片回复必须等到所有参与叶子最终写入并返回各自三副本 ACK，因而计入真实完成延时；多层跨片也按此标准确认完成。这里的平均 TPS 包括本次客户端的发送及排空时间，**不是饱和稳态吞吐**。批内交易共用请求发送时间，确认在整批回复时观察到。重复测试中客户端确认数表示收到的有效回复，是否发生新的执行要看节点累计执行数；不要拿重放请求测试计算业务吞吐。
 
 `--timeout` 从开始发送时计时，包含发送和排空。`--count 4000 --rate 100` 光发送至少约 40 秒，因此 `--timeout 30` 必定显示 `incomplete=true`。小批次跨片负载还需留出多轮 PBFT 和跨片证明交换时间；可先从较小 count 验证，再按实际完成速率增加超时。
 
@@ -227,12 +244,14 @@ make clean
 
 - 包括真实 PBFT 三阶段、批处理、Ed25519 签名、检查点、带 prepared 证明的视图切换，以及滞后但未重启副本的状态追赶。
 - 包括独立分片的排序和叶子的本地执行，以及所有分片对之间的延迟探测。
-- 完整跨片执行仅支持一个根和两个直属叶子的二层拓扑；根收齐两叶完成证明后直接回复。多层和更多参与叶子保留仅排序验证，不代表执行完成。SharPer、重分片和扩缩容尚未实现。
+- 完整跨片执行支持多层及两个以上参与叶子。NCA 收齐实际参与叶子的完成证明后直接回复；多协调者的轮次封闭证书会增加 PBFT 控制开销，空封闭不增加业务交易数。SharPer、状态重分区和自适应扩缩容尚未实现。
 - 每个参与叶子的合成交易访问一个 key；尚未支持任意合约动态提取多 key 读写集。
 - 所需依赖未齐时不写入正式 KV、不推进叶子应用序号。当前没有带证书的 abort/超时回收，参与分片永久失效可能令交易等待和客户端超时；若一叶已经写入，另一叶之后不可用，不能保证两片同一物理时刻可见。
-- 叶子按批次顺序等待依赖并执行，当前批次未完成时不处理后续业务槽。根仍可提前排序有限数量的跨片批次；这不表示叶子并行执行。尚未实现单副本内多 CPU 线程执行。
+- 叶子按批次顺序等待依赖并执行，当前批次未完成时不处理后续业务槽。协调者仍可提前排序有限数量的跨片批次；这不表示叶子并行执行。片内请求仍优先选择，持续片内负载下的跨片公平调度尚未实现。尚未实现单副本内多 CPU 线程执行。
 - 进程崩溃后在同一次运行中重启该身份还未提供完整 WAL 恢复。节点检测到已有提交日志会拒绝启动，防止丢失投票状态后重新投票。请停止整个集群并新建实验；暂停后恢复进程可通过状态追赶恢复。
 - 状态、请求去重索引在内存中，适合有限负载的验收。检查点会清理旧共识消息，历史状态和去重信息仍随有效交易增长；不是生产存储引擎。
 - 附加延迟是应用层消息模型，不模拟链路带宽、丢包或 TCP 拥塞控制。节点进程会共享本机 CPU，规模实验需要后续独立规划资源。
 
 第一阶段改造前的源码和运行入口快照保留在历史标签 `stage1-pbft` 的 `legacy/pre-stage1/` 中，当前工作区已移除该目录。旧格式配置文件现在位于 `config/`；`shard*/shardId`、`shard*/lldb_commands.txt` 位于对应分片目录，均不由新入口读取；`shard*/node.log` 是历史日志。历史 PDF 不改动。旧 `llb_start_all.sh` 仅提示使用新的启动方式。
+
+多层实现的详细设计见 [docs/MULTILAYER_DESIGN.md](docs/MULTILAYER_DESIGN.md)，本轮验收与复测记录见 [docs/MULTILAYER_VALIDATION.md](docs/MULTILAYER_VALIDATION.md)。

@@ -1,0 +1,127 @@
+{
+  "base_port": 19600,
+  "shards": [
+    {
+      "id": 1,
+      "parent": 5
+    },
+    {
+      "id": 2,
+      "parent": 5
+    },
+    {
+      "id": 3,
+      "parent": 6
+    },
+    {
+      "id": 4,
+      "parent": 6
+    },
+    {
+      "id": 5,
+      "parent": 7
+    },
+    {
+      "id": 6,
+      "parent": 7
+    },
+    {
+      "id": 7,
+      "parent": 9
+    },
+    {
+      "id": 8,
+      "parent": 9
+    },
+    {
+      "id": 9,
+      "parent": null
+    }
+  ],
+  "consensus": {
+    "batch_size": 64,
+    "cross_shard_batch_size": 64,
+    "cross_shard_batch_wait_ms": 200,
+    "view_timeout_ms": 5000
+  },
+  "execution": {
+    "fib_iterations": 1
+  },
+  "network": {
+    "intra_shard_delay_ms": 1,
+    "default_inter_shard_delay_ms": 10,
+    "shard_links": [
+      {
+        "shards": [
+          1,
+          2
+        ],
+        "delay_ms": 5
+      },
+      {
+        "shards": [
+          3,
+          4
+        ],
+        "delay_ms": 5
+      },
+      {
+        "shards": [
+          1,
+          5
+        ],
+        "delay_ms": 5
+      },
+      {
+        "shards": [
+          2,
+          5
+        ],
+        "delay_ms": 5
+      },
+      {
+        "shards": [
+          3,
+          6
+        ],
+        "delay_ms": 5
+      },
+      {
+        "shards": [
+          4,
+          6
+        ],
+        "delay_ms": 5
+      },
+      {
+        "shards": [
+          1,
+          7
+        ],
+        "delay_ms": 10
+      },
+      {
+        "shards": [
+          3,
+          7
+        ],
+        "delay_ms": 10
+      },
+      {
+        "shards": [
+          1,
+          9
+        ],
+        "delay_ms": 15
+      },
+      {
+        "shards": [
+          8,
+          9
+        ],
+        "delay_ms": 15
+      }
+    ],
+    "trace": false
+  }
+}

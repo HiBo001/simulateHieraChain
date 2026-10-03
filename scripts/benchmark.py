@@ -44,11 +44,6 @@ def validate_selection(cfg, mode, shard, participants):
         coordinator = c.lca(cfg, participants)
         if coordinator in leaves:
             raise ValueError("跨片交易必须由参与叶子的公共祖先协调")
-        root = next(s for s, p in parent.items() if p is None)
-        if len(parent) != 3 or len(leaves) != 2 or any(parent[s] != root for s in leaves):
-            raise ValueError("跨片性能测试目前只支持一个根、两个直接叶子的二层拓扑")
-        if len(participants) != 2 or set(participants) != set(leaves):
-            raise ValueError("--participants 必须包含两个不同的叶子分片")
 
 
 def settlement_errors(case, cfg, rows):
@@ -73,9 +68,15 @@ def settlement_errors(case, cfg, rows):
         ordered = case["count"] if case["mode"] == "cross" and sid == coordinator else 0
         if any(r.get("ordered_cst_transactions") != ordered for r in peers):
             problems.append(f"分片 {sid} 跨片排序计数不符")
-        if case["mode"] == "cross" and sid == coordinator and any(
-                r.get("completed_cst_transactions") != case["count"] for r in peers):
-            problems.append("协调片完成结果尚未收齐")
+        if sid not in leaves and any(
+                r.get("completed_cst_transactions") != ordered for r in peers):
+            problems.append(f"协调片 {sid} 完成计数不符")
+        # Demand-driven empty closes consume real coordinator PBFT slots.
+        # Client completion is insufficient if another coordinator still owes
+        # a requested round, even when its business queues are already empty.
+        if sid not in leaves and any(
+                r.get("rounds_requested", 0) > r.get("cst_round", 0) for r in peers):
+            problems.append(f"协调片 {sid} 仍有未封闭轮次")
         if any(r.get(field, 0) for r in peers for field in (
                 "pending_requests", "pending_cst_batches", "staged_cst_batches", "dedup_waiting_requests",
                 "network_queue", "network_buffered_bytes")):

@@ -59,7 +59,7 @@ class CrossShardOrdering(unittest.TestCase):
                 if all(sum(r["leaf_ordered_cst_transactions"] == 40 and
                            r["executed_transactions"] == 40 and r["staged_cst_batches"] == 0
                            for r in rows if r["shard"] == leaf) == 4
-                       for leaf in [1, 2]):
+                       for leaf in [1, 2]) and all(r["completed_cst_transactions"] == 40 for r in rows if r["shard"] == 5):
                     break
                 time.sleep(.1)
             else:

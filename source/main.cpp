@@ -51,12 +51,21 @@ struct Membership {
         }
         return candidate;
     }
-    bool twoLayer() const {
-        int root=-1;
-        for(const auto& [id,p]:parent) if(p==-1) root=id;
-        if(root<0 || leaves.size()!=2) return false;
-        for(int leaf:leaves) if(parent.at(leaf)!=root) return false;
-        return true;
+    std::set<int> coordinators() const {
+        std::set<int> result;
+        for(const auto& [id,p]:parent) { (void)p;if(!leaves.count(id)) result.insert(id); }
+        return result;
+    }
+    bool multiLayer() const { return coordinators().size()>1; }
+    std::set<int> ancestors(int leaf) const {
+        std::set<int> result;
+        for(int id=parent.at(leaf);id!=-1;id=parent.at(id)) result.insert(id);
+        return result;
+    }
+    std::set<int> descendants(int origin) const {
+        std::set<int> result;
+        for(int leaf:leaves) if(ancestors(leaf).count(origin)) result.insert(leaf);
+        return result;
     }
     int delay(int from,int to) const {
         const auto& n=config.at("network");
@@ -94,7 +103,7 @@ class Replica {
     Membership members;
     int shard, me, view=0, targetView=0;
     bool changing=false;
-    int applied=0, stableSeq=0;
+    int applied=0, stableSeq=0, catchupTarget=0;
     std::string dir;
     Key privateKey;
     Network net;
@@ -111,7 +120,8 @@ class Replica {
                 {"seen",json::object()},{"requests",json::object()},{"executed",0},{"ordered_cst",0},
                 {"cst_batches",json::object()},{"cst_seen",json::object()},{"leaf_ordered_cst",0},{"last_cst_seq",0},
                 {"cst_finalized",json::object()},{"cst_orders",json::object()},
-                {"cst_order_index",0}};
+                {"cst_order_index",0},{"cst_round",0},{"cst_indices",json::object()},
+                {"participant_indices",json::object()},{"cst_rounds",json::object()}};
     std::map<std::string,json> pending;
     // CLIENT envelopes remain signed and intact. Overlapping requests wait for
     // the first owner's result rather than launching concurrent consensus.
@@ -121,8 +131,15 @@ class Replica {
     std::set<std::string> changedTx;
     uint64_t dedupIndexRebuilds=0, dedupPendingChecks=0, dedupWaiterChecks=0;
     std::map<std::string,json> pendingCst;
+    // Local selection cache. Its verdict is invalidated by every dependency
+    // or replicated-state change; it is never an authentication shortcut.
+    mutable bool cstSelectionDirty=true;
+    mutable json cstSelection=nullptr;
+    mutable uint64_t cstSelectionLookups=0, cstSelectionRebuilds=0;
     std::map<std::string,json> stagedRecords, executionWitnesses, orderCertificates;
     std::map<int,json> slotWitnesses;
+    std::map<int,std::map<int,json>> roundCertificates;
+    int desiredRound=0;
     std::set<std::string> completionResendNeeded, pendingLocalAckQcs;
     std::map<std::string,std::map<int,json>> preparedVotes, ackVotes;
     std::map<std::string,std::map<int,json>> preparedProofs, ackProofs;
@@ -135,7 +152,7 @@ class Replica {
     std::string cachedStateDigest, cachedKvDigest;
     StateDigest stateDigest;
     bool kvDirty=true;
-    mutable std::set<std::string> checkedOrders, checkedRecords, checkedProofs,
+    mutable std::set<std::string> checkedCloses, checkedOrders, checkedRecords, checkedProofs,
                                   checkedWitnesses;
     std::map<std::string,Clock::time_point> pingStarts;
     std::map<std::string,std::string> pingPeers;
@@ -171,20 +188,42 @@ class Replica {
         if(rebuild) {stateDigest.rebuild(state);kvDirty=true;}
         else {
             for(const char* field:{"seq","chain","executed","ordered_cst","leaf_ordered_cst",
-                                  "last_cst_seq","cst_order_index"}) stateDigest.markField(field);
+                                  "last_cst_seq","cst_order_index","cst_round"}) stateDigest.markField(field);
         }
         cachedStateDigest=stateDigest.refresh(state);
         // Keep the public KV digest compatible with SHA256(canonical JSON).
         // Root ORDERs do not change KV, so they do not serialize it again.
         if(kvDirty) {cachedKvDigest=hash(state["kv"].dump());kvDirty=false;}
     }
-    int coordinator() const {
-        for(const auto& [id,parent]:members.parent) if(parent==-1) return id;
-        throw std::runtime_error("missing coordinator");
+    bool isCoordinator() const { return !members.leaves.count(shard); }
+    int batchOrigin(const std::string& key) const {
+        auto colon=key.find(':');
+        if(colon==std::string::npos) throw std::runtime_error("invalid batch key");
+        size_t usedOrigin=0,usedSequence=0;
+        int id=std::stoi(key.substr(0,colon),&usedOrigin),sequence=std::stoi(key.substr(colon+1),&usedSequence);
+        if(usedOrigin!=colon || usedSequence!=key.size()-colon-1 || sequence<=0 ||
+           std::to_string(id)+":"+std::to_string(sequence)!=key || !members.coordinators().count(id))
+            throw std::runtime_error("invalid coordinator batch key");
+        return id;
     }
-    int otherLeaf(int leaf) const {
-        for(int id:members.leaves) if(id!=leaf) return id;
-        throw std::runtime_error("missing peer leaf");
+    std::set<int> participants(const json& requests) const {
+        std::set<int> result;
+        for(const auto& req:requests) for(const auto& tx:req.at("body").at("txs"))
+            for(auto id:tx.at("participants")) result.insert(id.get<int>());
+        return result;
+    }
+    std::set<int> orderParticipants(const json& cert) const {
+        return participants(cert.at("proposal").at("body").at("value").at("requests"));
+    }
+    static bool touches(const json& tx,int owner) {
+        for(auto id:tx.at("participants")) if(id==owner) return true;
+        return false;
+    }
+    int projection(const json& value,int owner) const {
+        return value.at("cst_watermarks").at(std::to_string(owner)).get<int>();
+    }
+    int localProjection(int origin) const {
+        return state.at("cst_indices").value(std::to_string(origin),0);
     }
     json initialAccount() const { return {{"version",uint64_t(0)},{"digest",hash("initial")},{"value",uint64_t(0)}}; }
     uint64_t fibonacci() const {
@@ -206,7 +245,7 @@ class Replica {
             const auto& b=e.at("body");
             if(b.at("type")!="CLIENT" || b.at("target")!=target || !b.at("id").is_string() ||
                b.at("id").get<std::string>().size()>200 || !b.at("txs").is_array() || b.at("txs").empty() || int(b.at("txs").size())>batchSize) return false;
-            if(members.twoLayer() && target==coordinator() && int(b.at("txs").size())>crossShardBatchSize) return false;
+            if(!members.leaves.count(target) && int(b.at("txs").size())>crossShardBatchSize) return false;
             const auto& reply=b.at("reply");
             in_addr address{};
             if (inet_pton(AF_INET,reply.at("host").get<std::string>().c_str(),&address)!=1 || reply.at("port").get<int>()<=0 || reply.at("port").get<int>()>65535) return false;
@@ -256,34 +295,106 @@ class Replica {
             return prepares.size()>=2 && commits.size()>=3;
         } catch (...) { return false; }
     }
+    bool validOrderClose(const json& c) const {
+        try {
+            auto fingerprint=hash(c.dump());if(checkedCloses.count(fingerprint)) return true;
+            const auto& b=c.at("proposal").at("body");int origin=b.at("shard");
+            if(!members.coordinators().count(origin) || !validForeignCertificate(c,origin)) return false;
+            const auto& value=b.at("value");const auto& requests=value.at("requests");
+            if(!requests.is_array() || !value.at("cst_watermarks").is_object()) return false;
+            auto descendants=members.descendants(origin);
+            if(value.at("cst_watermarks").size()!=descendants.size()) return false;
+            for(int leaf:descendants) {
+                const auto& index=value.at("cst_watermarks").at(std::to_string(leaf));
+                if(!index.is_number_integer() || index.get<int>()<0) return false;
+            }
+            if(members.multiLayer()) {
+                if(!value.at("cst_round").is_number_integer() || value.at("cst_round").get<int>()<=0) return false;
+            } else if(value.contains("cst_round")) return false;
+            size_t fields=2+(members.multiLayer()?1:0)+(requests.empty()?0:1);
+            if(value.size()!=fields || (requests.empty() && (!members.multiLayer() || value.contains("cst_order_index")))) return false;
+            if(!requests.empty() && (!value.at("cst_order_index").is_number_integer() || value.at("cst_order_index").get<int>()<=0)) return false;
+            int total=0;std::string group;std::set<std::string> rids,txids;
+            for(const auto& req:requests) {
+                if(!validRequestForShard(req,origin) || !rids.insert(req.at("body").at("id")).second) return false;
+                auto candidate=participantGroup(req);
+                if(group.empty()) group=candidate;else if(group!=candidate) return false;
+                for(const auto& tx:req.at("body").at("txs")) {
+                    if(!txids.insert(tx.at("id")).second) return false;
+                    ++total;
+                }
+            }
+            for(int leaf:participants(requests)) if(projection(value,leaf)<=0) return false;
+            if(total>crossShardBatchSize) return false;
+            if(checkedCloses.size()<10000) checkedCloses.insert(fingerprint);return true;
+        } catch(...) { return false; }
+    }
     bool validCoordinatorCertificate(const json& c) const {
         try {
             auto fingerprint=hash(c.dump());
             if(checkedOrders.count(fingerprint)) return true;
-            if(!members.twoLayer() || !validForeignCertificate(c,coordinator())) return false;
-            const auto& b=c.at("proposal").at("body");
-            const auto& value=b.at("value");
-            if(!value.at("requests").is_array() || value.at("requests").empty() ||
-               value.size()!=2 || !value.contains("cst_order_index")) return false;
-            if(!value.at("cst_order_index").is_number_integer() || value.at("cst_order_index").get<int>()<=0) return false;
-            int total=0,local=0;
-            for(const auto& req:value.at("requests")) {
-                if(!validRequestForShard(req,coordinator())) return false;
-                for(const auto& tx:req.at("body").at("txs")) {
-                    ++total;
-                    for(auto participant:tx.at("participants")) if(participant==shard) ++local;
+            if(!validOrderClose(c) || c.at("proposal").at("body").at("value").at("requests").empty()) return false;
+            if(checkedOrders.size()<10000) checkedOrders.insert(fingerprint);
+            return true;
+        } catch(...) {return false;}
+    }
+    bool validLeafOrder(const json& cert,const json& frontier) const {
+        try {
+            if(!members.leaves.count(shard) || !validCoordinatorCertificate(cert) || !orderParticipants(cert).count(shard) ||
+               state.at("cst_batches").contains(cstKey(cert))) return false;
+            const auto& body=cert.at("proposal").at("body");int origin=body.at("shard");const auto& value=body.at("value");
+            if(!members.multiLayer()) return frontier.empty() && projection(value,shard)==localProjection(origin)+1;
+            int round=value.at("cst_round");
+            if(round<state.at("cst_round").get<int>() || !frontier.is_array() || frontier.size()!=members.ancestors(shard).size()) return false;
+            std::map<int,json> closes;
+            for(const auto& close:frontier) {
+                const auto& cb=close.at("proposal").at("body");int co=cb.at("shard");
+                if(!members.ancestors(shard).count(co) || !validOrderClose(close) ||
+                   cb.at("value").at("cst_round")!=round || !closes.emplace(co,close).second) return false;
+            }
+            int first=-1;
+            for(const auto& [co,close]:closes) {
+                const auto& cv=close.at("proposal").at("body").at("value");
+                bool has=orderParticipants(close).count(shard)>0;
+                bool done=has && state.at("cst_batches").contains(cstKey(close));
+                if(done && state.at("cst_batches").at(cstKey(close))!=close.at("proposal").at("body").at("digest")) return false;
+                if(projection(cv,shard)!=localProjection(co)+(has&&!done?1:0)) return false;
+                if(has && !done && first==-1) first=co;
+            }
+            return first==origin && closes.at(origin).at("proposal").at("body").at("digest")==body.at("digest");
+        } catch(...) {return false;}
+    }
+    const json& nextCstOrder() const {
+        ++cstSelectionLookups;
+        if(!cstSelectionDirty) return cstSelection;
+        ++cstSelectionRebuilds;
+        cstSelection=nullptr;
+        std::map<std::pair<int,int>,const json*> candidates;
+        for(const auto& [key,message]:pendingCst) {
+            if(state.at("cst_batches").contains(key)) continue;
+            const auto& cert=message.at("body").at("certificate");const auto& b=cert.at("proposal").at("body");
+            int round=members.multiLayer()?b.at("value").at("cst_round").get<int>():b.at("value").at("cst_order_index").get<int>();
+            candidates.emplace(std::make_pair(round,b.at("shard").get<int>()),&cert);
+        }
+        for(const auto& [position,certificate]:candidates) {
+            const auto& cert=*certificate;
+            json frontier=json::array();
+            if(members.multiLayer()) {
+                auto row=roundCertificates.find(position.first);if(row==roundCertificates.end()) continue;
+                bool complete=true;
+                for(int co:members.ancestors(shard)) {
+                    if(!row->second.count(co)) {complete=false;break;}
+                    frontier.push_back(row->second.at(co));
                 }
+                if(!complete) continue;
             }
-            std::string group;
-            for(const auto& req:value.at("requests")) {
-                auto candidate=participantGroup(req);
-                if(group.empty()) group=candidate;
-                else if(group!=candidate) return false;
+            if(validLeafOrder(cert,frontier)) {
+                cstSelection={{"certificate",cert},{"frontier",frontier}};
+                break;
             }
-            bool valid=total<=crossShardBatchSize && (!members.leaves.count(shard) || local>0);
-            if(valid && checkedOrders.size()<10000) checkedOrders.insert(fingerprint);
-            return valid;
-        } catch (...) { return false; }
+        }
+        cstSelectionDirty=false;
+        return cstSelection;
     }
     static std::string cstKey(const json& cert) {
         const auto& b=cert.at("proposal").at("body");
@@ -310,6 +421,7 @@ class Replica {
             auto fingerprint=std::to_string(origin)+":"+hash(record.dump());
             if(checkedRecords.count(fingerprint)) return true;
             if(!members.leaves.count(origin) || !validCoordinatorCertificate(record.at("order_certificate")) ||
+               !orderParticipants(record.at("order_certificate")).count(origin) ||
                record.at("shard")!=origin || record.at("batch_key")!=cstKey(record.at("order_certificate")) ||
                record.at("order_digest")!=record.at("order_certificate").at("proposal").at("body").at("digest") ||
                !record.at("reads").is_object() || !record.at("writes").is_array()) return false;
@@ -317,6 +429,7 @@ class Replica {
             size_t index=0;
             const auto& requests=record.at("order_certificate").at("proposal").at("body").at("value").at("requests");
             for(const auto& request:requests) for(const auto& tx:request.at("body").at("txs")) {
+                if(!touches(tx,origin)) continue;
                 auto access=accessFor(tx,origin);
                 if(index>=record.at("writes").size()) return false;
                 const auto& write=record.at("writes")[index++];
@@ -342,7 +455,7 @@ class Replica {
             const auto& body=vote.at("body"); int origin=body.at("shard");
             return members.replicaMessage(vote) && body.at("type")=="CST_PREPARED" &&
                 body.at("batch_key")==vote.at("record").at("batch_key") &&
-                body.at("record_digest")==hash(vote.at("record").dump()) &&
+                body.at("record_digest")==hash(recordPayload(vote.at("record")).dump()) &&
                 validPreparedRecord(vote.at("record"),origin);
         } catch (...) { return false; }
     }
@@ -353,7 +466,7 @@ class Replica {
             const auto& votes=proof.at("votes");
             const auto& record=proof.at("record");
             if(!votes.is_array() || votes.size()!=3 || !validPreparedRecord(record,origin)) return false;
-            auto recordDigest=hash(record.dump());
+            auto recordDigest=hash(recordPayload(record).dump());
             std::set<int> signers;
             for(const auto& vote:votes) {
                 const auto& b=vote.at("body");
@@ -380,29 +493,27 @@ class Replica {
     }
     std::string executionDigest(const json& witness) const {
         json records=json::array();
-        for(int leaf:members.leaves) records.push_back(recordPayload(witnessRecord(witness,leaf)));
+        for(const auto& proof:witness.at("proofs")) records.push_back(recordPayload(proof.at("record")));
         return hash(records.dump());
     }
     bool validExecutionWitness(const json& witness) const {
         try {
-            auto fingerprint=hash(witness.dump());
-            if(checkedWitnesses.count(fingerprint)) return true;
-            if(!members.twoLayer() || !witness.at("batch_key").is_string() ||
-               !witness.at("proofs").is_array() || witness.at("proofs").size()!=2) return false;
-            int previous=-1; std::set<int> owners; std::string order;
+            auto fingerprint=hash(witness.dump());if(checkedWitnesses.count(fingerprint)) return true;
+            if(!witness.at("batch_key").is_string() || !witness.at("proofs").is_array() || witness.at("proofs").size()<2) return false;
+            int previous=-1;std::set<int> owners;std::string order;json cert;
+            std::map<std::string,bool> duplicateFlags;
             for(const auto& proof:witness.at("proofs")) {
                 const auto& record=proof.at("record");int owner=record.at("shard");
-                if(owner<=previous || !owners.insert(owner).second || !validPreparedProof(proof,owner) ||
-                   record.at("batch_key")!=witness.at("batch_key")) return false;
+                if(owner<=previous || !owners.insert(owner).second || !validPreparedProof(proof,owner) || record.at("batch_key")!=witness.at("batch_key")) return false;
                 previous=owner;
-                if(order.empty()) order=record.at("order_digest");
+                if(order.empty()) {order=record.at("order_digest");cert=record.at("order_certificate");}
                 else if(record.at("order_digest")!=order) return false;
+                for(const auto& write:record.at("writes")) {
+                    auto [it,inserted]=duplicateFlags.emplace(write.at("id"),write.at("duplicate").get<bool>());
+                    if(!inserted && it->second!=write.at("duplicate").get<bool>()) return false;
+                }
             }
-            if(owners!=members.leaves) return false;
-            auto left=witnessRecord(witness,*members.leaves.begin()),right=witnessRecord(witness,*members.leaves.rbegin());
-            if(left.at("writes").size()!=right.at("writes").size()) return false;
-            for(size_t i=0;i<left.at("writes").size();++i)
-                if(left.at("writes")[i].at("duplicate")!=right.at("writes")[i].at("duplicate")) return false;
+            if(owners!=orderParticipants(cert)) return false;
             if(checkedWitnesses.size()<10000) checkedWitnesses.insert(fingerprint);
             return true;
         } catch(...) {return false;}
@@ -427,7 +538,7 @@ class Replica {
                 }
                 n+=e.at("body").at("txs").size();
             }
-            if(shard==coordinator() && members.twoLayer()) {
+            if(isCoordinator()) {
                 std::map<std::string,std::string> ids;
                 std::string group;
                 for(const auto& request:value.at("requests"))
@@ -444,28 +555,37 @@ class Replica {
                 }
             }
             for(auto it=value.begin();it!=value.end();++it)
-                if(it.key()!="requests" && it.key()!="cst_order_index" && it.key()!="cst_orders") return false;
+                if(it.key()!="requests" && it.key()!="cst_order_index" && it.key()!="cst_orders" && it.key()!="cst_watermarks" && it.key()!="cst_round" && it.key()!="cst_frontier") return false;
             if(value.contains("cst_order_index")) {
-                if(shard!=coordinator() || !members.twoLayer() || value.at("requests").empty() ||
+                if(!isCoordinator() || value.at("requests").empty() ||
                    value.contains("cst_orders") ||
                    value.at("cst_order_index")!=state.at("cst_order_index").get<int>()+1) return false;
-            } else if(shard==coordinator() && members.twoLayer() && !value.at("requests").empty()) return false;
+            } else if(isCoordinator() && !value.at("requests").empty()) return false;
+            if(isCoordinator()) {
+                bool close=value.contains("cst_watermarks");
+                if(close) {
+                    if(value.at("requests").empty() && !members.multiLayer()) return false;
+                    auto ps=participants(value.at("requests"));auto expected=json::object();
+                    for(int leaf:members.descendants(shard)) expected[std::to_string(leaf)]=
+                        state.at("participant_indices").value(std::to_string(leaf),0)+(ps.count(leaf)?1:0);
+                    if(value.at("cst_watermarks")!=expected) return false;
+                    if(members.multiLayer() && value.at("cst_round")!=state.at("cst_round").get<int>()+1) return false;
+                    if(!members.multiLayer() && value.contains("cst_round")) return false;
+                } else if(!value.at("requests").empty() || value.contains("cst_round")) return false;
+                if(value.contains("cst_frontier") || value.contains("cst_orders")) return false;
+            } else if(value.contains("cst_watermarks") || value.contains("cst_round")) return false;
             if(value.contains("cst_orders")) {
-                if(!members.leaves.count(shard) || !members.twoLayer() || !value.at("cst_orders").is_array() ||
-                   value.at("cst_orders").size()!=1 || !value.at("requests").empty()) return false;
-                for(const auto& cert:value.at("cst_orders")) {
-                    if(!validCoordinatorCertificate(cert) ||
-                       cert.at("proposal").at("body").at("value").at("cst_order_index").get<int>()!=
-                           state.at("last_cst_seq").get<int>()+1) return false;
-                    for(const auto& req:cert.at("proposal").at("body").at("value").at("requests"))
-                        for(const auto& tx:req.at("body").at("txs")) {
-                            auto id=tx.at("id").get<std::string>();
-                            if(state.at("cst_seen").contains(id) && state.at("cst_seen").at(id).at("tx_digest")!=hash(tx.dump())) return false;
-                            for(auto participant:tx.at("participants")) if(participant==shard) ++n;
-                        }
-                }
-            }
-            return n<=(shard==coordinator() && members.twoLayer() && !value.at("requests").empty()
+                if(!members.leaves.count(shard) || !value.at("cst_orders").is_array() || value.at("cst_orders").size()!=1 || !value.at("requests").empty()) return false;
+                json frontier=value.value("cst_frontier",json::array());
+                if(!validLeafOrder(value.at("cst_orders")[0],frontier)) return false;
+                for(const auto& req:value.at("cst_orders")[0].at("proposal").at("body").at("value").at("requests"))
+                    for(const auto& tx:req.at("body").at("txs")) {
+                        auto id=tx.at("id").get<std::string>();
+                        if(state.at("cst_seen").contains(id) && state.at("cst_seen").at(id).at("tx_digest")!=hash(tx.dump())) return false;
+                        if(touches(tx,shard)) ++n;
+                    }
+            } else if(value.contains("cst_frontier")) return false;
+            return n<=(isCoordinator() && !value.at("requests").empty()
                         ?crossShardBatchSize:batchSize);
         } catch (...) { return false; }
     }
@@ -528,7 +648,8 @@ class Replica {
                 {"seen",json::object()},{"requests",json::object()},{"executed",0},{"ordered_cst",0},
                 {"cst_batches",json::object()},{"cst_seen",json::object()},{"leaf_ordered_cst",0},{"last_cst_seq",0},
                 {"cst_finalized",json::object()},{"cst_orders",json::object()},
-                {"cst_order_index",0}}; }
+                {"cst_order_index",0},{"cst_round",0},{"cst_indices",json::object()},
+                {"participant_indices",json::object()},{"cst_rounds",json::object()}}; }
     bool validVC(const json& e,int v) const {
         try {
             const auto& b=e.at("body");
@@ -586,6 +707,7 @@ class Replica {
     }
     void installStable(const json& s) {
         int h=s.at("seq"); if(h<stableSeq) return;
+        cstSelectionDirty=true;
         bool restored=h>applied;
         if(restored) {
             state=s.at("state"); applied=h;
@@ -655,6 +777,10 @@ class Replica {
     void acceptProposal(const json& e,bool recovered=false) {
         const auto& b=e.at("body"); int n=b.at("seq");
         if(changing || b.at("view")!=view || n<=applied || n>stableSeq+window) return;
+        // A certified future slot can expose a missing prefix even when its
+        // state-dependent frontier is not yet admissible. Request catchup,
+        // without treating this recovery evidence as a view-change timeout.
+        if(n>applied+1 && validSignedProposal(e)) catchupTarget=std::max(catchupTarget,n-1);
         auto existing=slots.find(n);
         if(existing!=slots.end() && !existing->second.proposal.is_null()) {
             if(existing->second.proposal.at("body").at("digest")!=b.at("digest")) rejected++;
@@ -717,14 +843,14 @@ class Replica {
         for(const auto& tx:req.at("body").at("txs")) {
             auto id=tx.at("id").get<std::string>();
             if(!state["seen"].contains(id)) return false;
-            if(shard==coordinator() && members.twoLayer() && !completedTxResults.count(id)) return false;
+            if(isCoordinator() && !completedTxResults.count(id)) return false;
             json result=completedTxResults.count(id)?completedTxResults.at(id):state["seen"].at(id).at("result");
             result["kind"]="duplicate"; results.push_back(result);
         }
         reply(req,results); duplicates+=results.size(); return true;
     }
     bool awaitingResult(const std::string& id) const {
-        return shard==coordinator() && members.twoLayer() &&
+        return isCoordinator() &&
             state.at("seen").contains(id) && !completedTxResults.count(id);
     }
     void erasePending(const std::string& rid) {
@@ -803,29 +929,71 @@ class Replica {
         }
     }
     void forwardCstOrder(const json& cert,const json& value,bool retry=false) {
-        if(members.leaves.count(shard) || !members.twoLayer()) return;
-        std::set<int> destinations;
-        for(const auto& req:value.at("requests"))
-            for(const auto& tx:req.at("body").at("txs"))
-                for(auto participant:tx.at("participants")) destinations.insert(participant.get<int>());
+        if(!isCoordinator() || !value.contains("cst_watermarks")) return;
+        auto destinations=orderParticipants(cert);
         if(!destinations.empty() && !retry) {
             orderCertificates[cstKey(cert)]=cert;
-            outstandingOrders[cert.at("proposal").at("body").at("value").at("cst_order_index")]=cert;
+            outstandingOrders[value.at("cst_order_index").get<int>()]=cert;
+        }
+        if(members.multiLayer()) {
+            roundCertificates[value.at("cst_round").get<int>()][shard]=cert;
+            cstSelectionDirty=true;
         }
         if(!isForward()) return;
-        for(int leaf:destinations) {
-            auto message=make("CST_ORDER",{{"target",leaf},{"certificate",cert}});
-            for(int replica=0;replica<4;++replica) sendTo(leaf,replica,message);
+        if(members.multiLayer()) {
+            for(int leaf:members.descendants(shard)) sendShard(leaf,make("CST_ROUND_CLOSE",{{"target",leaf},{"certificate",cert}}));
+        } else for(int leaf:destinations) sendShard(leaf,make("CST_ORDER",{{"target",leaf},{"certificate",cert}}));
+        log("cst_order_forwarded",{{"coordinator_seq",cert.at("proposal").at("body").at("seq")},{"destinations",destinations},{"forward",me},{"retry",retry}});
+    }
+    void requestRound(int round) {
+        desiredRound=std::max(desiredRound,round);
+        if(!isForward()) return;
+        for(int co:members.coordinators()) if(co!=shard)
+            sendShard(co,make("CST_ROUND_REQUEST",{{"target",co},{"round",round}}));
+    }
+    bool rememberRound(const json& cert) {
+        if(!validOrderClose(cert)) return false;
+        const auto& b=cert.at("proposal").at("body");int origin=b.at("shard"),round=b.at("value").at("cst_round");
+        if(members.leaves.count(shard)?!members.ancestors(shard).count(origin):origin!=shard) return false;
+        if(roundCertificates.size()>=100000 && !roundCertificates.count(round)) return false;
+        auto [it,inserted]=roundCertificates[round].emplace(origin,cert);
+        if(inserted) cstSelectionDirty=true;
+        if(!inserted && it->second.at("proposal").at("body").at("digest")!=b.at("digest")) return false;
+        if(members.leaves.count(shard) && orderParticipants(cert).count(shard) && !state["cst_batches"].contains(cstKey(cert))) {
+            if(pendingCst.size()>=10000 && !pendingCst.count(cstKey(cert))) return false;
+            // This local envelope is only a cache; its certificate is independently authenticated.
+            // No network sender may use it as a signed replica message.
+            if(pending.empty() && pendingCst.empty()) {lastProgress=Clock::now();batchStart=Clock::now();}
+            pendingCst.emplace(cstKey(cert),json{{"body",{{"certificate",cert}}}});
+            cstSelectionDirty=true;
         }
-        if(!destinations.empty()) {
-            log("cst_order_forwarded",{{"coordinator_seq",cert.at("proposal").at("body").at("seq")},
-                {"destinations",destinations},{"forward",me},{"retry",retry}});
+        return true;
+    }
+    void queryRounds() {
+        if(!members.multiLayer() || !isForward()) return;
+        if(members.leaves.count(shard)) {
+            if(pendingCst.empty() && stagedRecords.empty()) return;
+            std::set<int> rounds;
+            for(const auto& [key,msg]:pendingCst) {
+                (void)key;rounds.insert(msg.at("body").at("certificate").at("proposal").at("body").at("value").at("cst_round").get<int>());
+                if(rounds.size()>=32) break;
+            }
+            for(int co:members.ancestors(shard)) sendShard(co,make("CST_ROUND_QUERY",
+                {{"target",co},{"rounds",rounds},{"leaf",shard},{"after_index",localProjection(co)}}));
+        } else if(roundCertificates.size()<state.at("cst_rounds").size()) {
+            json missing=json::array();
+            for(auto it=state.at("cst_rounds").begin();it!=state.at("cst_rounds").end();++it) {
+                int round=std::stoi(it.key());
+                if(!roundCertificates.count(round)) missing.push_back(round);
+                if(missing.size()>=32) break;
+            }
+            if(!missing.empty()) broadcast(make("CST_ROUND_QUERY",{{"target",shard},{"rounds",missing},{"leaf",-1},{"after_index",-1}}));
         }
     }
     void sendPrepared(const std::string& key) {
         if(!members.leaves.count(shard) || !stagedRecords.count(key)) return;
         const auto& record=stagedRecords.at(key);
-        auto vote=make("CST_PREPARED",{{"batch_key",key},{"record_digest",hash(record.dump())}});
+        auto vote=make("CST_PREPARED",{{"batch_key",key},{"record_digest",hash(recordPayload(record).dump())}});
         vote["record"]=record;sendTo(shard,view%4,vote);
     }
     json dependencyProof(const std::string& key,int owner) const {
@@ -840,7 +1008,8 @@ class Replica {
         auto token=key+":"+std::to_string(view);
         if(!retry && !forwardedPrepared.insert(token).second) return;
         broadcast(make("CST_PREPARED_QC",{{"target",shard},{"proof",proof}}));
-        sendShard(otherLeaf(shard),make("CST_PREPARED_QC",{{"target",otherLeaf(shard)},{"proof",proof}}));
+        for(int leaf:orderParticipants(proof.at("record").at("order_certificate"))) if(leaf!=shard)
+            sendShard(leaf,make("CST_PREPARED_QC",{{"target",leaf},{"proof",proof}}));
         log("cst_prepared_forwarded",{{"batch_key",key},{"forward",me},{"signers",proof.at("votes").size()}});
     }
     void stageCst(const json& cert) {
@@ -851,6 +1020,7 @@ class Replica {
                      {"order_certificate",cert},{"reads",json::object()},{"writes",json::array()}};
         for(const auto& request:cert.at("proposal").at("body").at("value").at("requests"))
             for(const auto& tx:request.at("body").at("txs")) {
+                if(!touches(tx,shard)) continue;
                 auto access=accessFor(tx,shard);auto localKey=access.at("key").get<std::string>();
                 std::string id=tx.at("id");bool duplicate=state["cst_seen"].contains(id);
                 if(duplicate && state["cst_seen"].at(id).at("tx_digest")!=hash(tx.dump()))
@@ -868,13 +1038,17 @@ class Replica {
     }
     json availableWitness(const std::string& key) const {
         if(executionWitnesses.count(key)) return executionWitnesses.at(key);
-        if(!preparedProofs.count(key) || preparedProofs.at(key).size()!=members.leaves.size()) return nullptr;
+        if(!preparedProofs.count(key) || preparedProofs.at(key).empty()) return nullptr;
+        auto ps=orderParticipants(preparedProofs.at(key).begin()->second.at("record").at("order_certificate"));
         json proofs=json::array();
-        for(int leaf:members.leaves) proofs.push_back(preparedProofs.at(key).at(leaf));
+        for(int leaf:ps) {
+            if(!preparedProofs.at(key).count(leaf)) return nullptr;
+            proofs.push_back(preparedProofs.at(key).at(leaf));
+        }
         return {{"batch_key",key},{"proofs",proofs}};
     }
     bool importWitness(const json& witness) {
-        if(!validExecutionWitness(witness)) return false;
+        if(!validExecutionWitness(witness) || !orderParticipants(witness.at("proofs")[0].at("record").at("order_certificate")).count(shard)) return false;
         auto key=witness.at("batch_key").get<std::string>();
         if(state["cst_finalized"].contains(key)) {
             if(executionDigest(witness)!=state["cst_finalized"].at(key).at("execution_digest")) return false;
@@ -890,36 +1064,40 @@ class Replica {
         return true;
     }
     void requestDependencies(const std::string& key) {
-        auto local=make("CST_DEPENDENCY_QUERY",{{"target",shard},{"batch_keys",json::array({key})}});
-        sendTo(shard,view%4,local);
-        if(isForward()) sendShard(otherLeaf(shard),make("CST_DEPENDENCY_QUERY",
-            {{"target",otherLeaf(shard)},{"batch_keys",json::array({key})}}));
+        sendTo(shard,view%4,make("CST_DEPENDENCY_QUERY",{{"target",shard},{"batch_keys",json::array({key})}}));
+        if(!isForward() || !stagedRecords.count(key)) return;
+        for(int leaf:orderParticipants(stagedRecords.at(key).at("order_certificate"))) if(leaf!=shard)
+            sendShard(leaf,make("CST_DEPENDENCY_QUERY",{{"target",leaf},{"batch_keys",json::array({key})}}));
     }
     void finalizeCst(const json& witness) {
-        auto key=witness.at("batch_key").get<std::string>();
-        auto mine=witnessRecord(witness,shard),peer=witnessRecord(witness,otherLeaf(shard));
-        if(recordPayload(mine)!=recordPayload(stagedRecords.at(key)))
-            throw std::runtime_error("local execution record differs from certified dependency");
-        std::map<int,json> working={{shard,mine.at("reads")},{otherLeaf(shard),peer.at("reads")}};
+        auto key=witness.at("batch_key").get<std::string>();auto mine=witnessRecord(witness,shard);
+        if(recordPayload(mine)!=recordPayload(stagedRecords.at(key))) throw std::runtime_error("local execution record differs from certified dependency");
+        std::map<int,json> working;std::map<std::string,bool> flags;
+        for(const auto& proof:witness.at("proofs")) {
+            const auto& record=proof.at("record");working[record.at("shard").get<int>()]=record.at("reads");
+            for(const auto& write:record.at("writes")) flags[write.at("id")]=write.at("duplicate").get<bool>();
+        }
         json localWrites=json::array();
         const auto& requests=mine.at("order_certificate").at("proposal").at("body").at("value").at("requests");
-        size_t index=0;
         for(const auto& request:requests) for(const auto& tx:request.at("body").at("txs")) {
-            bool duplicate=mine.at("writes")[index++].at("duplicate");if(duplicate) continue;
-            auto a=accessFor(tx,shard),b=accessFor(tx,otherLeaf(shard));
-            std::string ak=a.at("key"),bk=b.at("key");
-            json oldA=working.at(shard).at(ak),oldB=working.at(otherLeaf(shard)).at(bk);
-            uint64_t fib=expectedFib;
-            uint64_t newA=a.at("value").get<uint64_t>()+oldB.at("value").get<uint64_t>()+fib;
-            uint64_t newB=b.at("value").get<uint64_t>()+oldA.at("value").get<uint64_t>()+fib;
-            json nextA={{"version",oldA.at("version").get<uint64_t>()+1},{"value",newA},{"fib",fib},
-                {"digest",hash(oldA.dump()+oldB.dump()+tx.dump()+std::to_string(shard))}};
-            json nextB={{"version",oldB.at("version").get<uint64_t>()+1},{"value",newB},{"fib",fib},
-                {"digest",hash(oldB.dump()+oldA.dump()+tx.dump()+std::to_string(otherLeaf(shard)))}};
-            working[shard][ak]=nextA;working[otherLeaf(shard)][bk]=nextB;
-            localWrites.push_back({{"id",tx.at("id")},{"key",ak},{"state",nextA}});
-            state["cst_seen"][tx.at("id").get<std::string>()]={{"tx_digest",hash(tx.dump())},
-                {"coordinator_batch",key},{"committed",true}};
+            if(flags.at(tx.at("id").get<std::string>())) continue;
+            std::map<int,json> old,next;
+            for(auto participant:tx.at("participants")) {
+                int owner=participant;auto access=accessFor(tx,owner);
+                old[owner]=working.at(owner).at(access.at("key").get<std::string>());
+            }
+            for(const auto& [owner,previous]:old) {
+                auto access=accessFor(tx,owner);uint64_t result=access.at("value").get<uint64_t>()+expectedFib;
+                std::string dependency=previous.dump();
+                for(const auto& [remote,account]:old) if(remote!=owner) {result+=account.at("value").get<uint64_t>();dependency+=account.dump();}
+                next[owner]={{"version",previous.at("version").get<uint64_t>()+1},{"value",result},{"fib",expectedFib},
+                    {"digest",hash(dependency+tx.dump()+std::to_string(owner))}};
+            }
+            for(const auto& [owner,account]:next) working[owner][accessFor(tx,owner).at("key").get<std::string>()]=account;
+            if(!touches(tx,shard)) continue;
+            auto access=accessFor(tx,shard);
+            localWrites.push_back({{"id",tx.at("id")},{"key",access.at("key")},{"state",next.at(shard)}});
+            state["cst_seen"][tx.at("id").get<std::string>()]={{"tx_digest",hash(tx.dump())},{"coordinator_batch",key},{"committed",true}};
             stateDigest.markEntry("cst_seen",tx.at("id").get<std::string>());
             state["executed"]=state["executed"].get<uint64_t>()+1;
             state["leaf_ordered_cst"]=state["leaf_ordered_cst"].get<uint64_t>()+1;
@@ -927,8 +1105,7 @@ class Replica {
         for(auto it=working.at(shard).begin();it!=working.at(shard).end();++it) {
             state["kv"][it.key()]=it.value();stateDigest.markEntry("kv",it.key());kvDirty=true;
         }
-        state["cst_finalized"][key]={{"order_digest",mine.at("order_digest")},
-            {"execution_digest",executionDigest(witness)},{"result_digest",hash(localWrites.dump())}};
+        state["cst_finalized"][key]={{"order_digest",mine.at("order_digest")},{"execution_digest",executionDigest(witness)},{"result_digest",hash(localWrites.dump())}};
         stateDigest.markEntry("cst_finalized",key);
         executionWitnesses[key]=witness;stagedRecords.erase(key);preparedProofs.erase(key);
         if(!ackProofs.count(key) || !ackProofs.at(key).count(shard)) pendingLocalAckQcs.insert(key);
@@ -938,7 +1115,7 @@ class Replica {
     void sendAck(const std::string& key) {
         if(!state["cst_finalized"].contains(key)) return;
         const auto& done=state["cst_finalized"].at(key);
-        auto ack=make("CST_ACK",{{"batch_key",key},{"target",coordinator()},
+        auto ack=make("CST_ACK",{{"batch_key",key},{"target",batchOrigin(key)},
             {"order_digest",done.at("order_digest")},{"execution_digest",done.at("execution_digest")},
             {"result_digest",done.at("result_digest")}});
         sendTo(shard,view%4,ack);
@@ -950,7 +1127,7 @@ class Replica {
             for(const auto& vote:proof) {
                 const auto& b=vote.at("body");
                 if(!members.replicaMessage(vote) || b.at("type")!="CST_ACK" || b.at("shard")!=origin ||
-                   b.at("target")!=coordinator() || b.at("batch_key")!=key || b.at("order_digest")!=order ||
+                   b.at("target")!=batchOrigin(key) || b.at("batch_key")!=key || b.at("order_digest")!=order ||
                    !b.at("execution_digest").is_string() || !b.at("result_digest").is_string() ||
                    order.size()!=64 || b.at("execution_digest").get<std::string>().size()!=64 ||
                    b.at("result_digest").get<std::string>().size()!=64 || !signers.insert(b.at("from").get<int>()).second) return false;
@@ -966,12 +1143,12 @@ class Replica {
         if(!retry && !forwardedAcks.insert(token).second) return;
         auto proof=ackProofs.at(key).at(shard);
         broadcast(make("CST_ACK_QC",{{"target",shard},{"proof",proof}}));
-        sendShard(coordinator(),make("CST_ACK_QC",{{"target",coordinator()},{"proof",proof}}));
+        sendShard(batchOrigin(key),make("CST_ACK_QC",{{"target",batchOrigin(key)},{"proof",proof}}));
         completionResendNeeded.erase(key);pendingLocalAckQcs.erase(key);
         log("cst_ack_forwarded",{{"batch_key",key},{"forward",me},{"signers",proof.size()}});
     }
     void requestResultProofs() {
-        if(shard!=coordinator() || !members.twoLayer() || completedCstBatches.size()==state["cst_orders"].size()) return;
+        if(!isCoordinator() || completedCstBatches.size()==state["cst_orders"].size()) return;
         // Restore original results before any later batch that references
         // them as duplicates. JSON object keys are not numeric sequence order.
         std::map<int,std::string> missing;
@@ -985,7 +1162,7 @@ class Replica {
         if(!state["cst_orders"].contains(key) || completedCstBatches.count(key)) return;
         const auto& order=state["cst_orders"].at(key);
         std::map<int,std::string> digests;std::string execution;
-        for(int leaf:members.leaves) {
+        for(int leaf:participants(order.at("requests"))) {
             if(!ackProofs.count(key) || !ackProofs.at(key).count(leaf)) return;
             const auto& proof=ackProofs.at(key).at(leaf);
             if(!validAckProof(proof,leaf,key,order.at("order_digest"))) return;
@@ -993,6 +1170,7 @@ class Replica {
             if(execution.empty()) execution=d;else if(execution!=d) {rejected++;return;}
             digests[leaf]=proof[0].at("body").at("result_digest");
         }
+        std::string resultDigests;for(const auto& [leaf,digest]:digests) {(void)leaf;resultDigests+=digest;}
         size_t checkIndex=0;
         for(const auto& request:order.at("requests")) for(const auto& tx:request.at("body").at("txs"))
             if(order.at("duplicates")[checkIndex++].get<bool>() && !completedTxResults.count(tx.at("id").get<std::string>())) return;
@@ -1005,7 +1183,7 @@ class Replica {
                 bool duplicate=order.at("duplicates")[index++];
                 json result={{"id",tx.at("id")},{"kind",duplicate?"duplicate":"executed"},
                     {"digest",hash(tx.at("id").get<std::string>()+order.at("order_digest").get<std::string>()+
-                        execution+digests.begin()->second+digests.rbegin()->second)}};
+                        execution+resultDigests)}};
                 if(duplicate) {result=completedTxResults.at(tx.at("id").get<std::string>());result["kind"]="duplicate";}
                 else completedTxResults.emplace(tx.at("id"),result);
                 changedTx.insert(tx.at("id").get<std::string>());
@@ -1046,7 +1224,7 @@ class Replica {
                 json results=json::array();
                 if(state["requests"].contains(rid) && state["requests"][rid]["txs_hash"]!=requestHash) {
                     for(const auto& tx:rb.at("txs")) results.push_back({{"id",tx.at("id")},{"error","request_id_conflict"}});
-                    if(members.leaves.count(shard) || !members.twoLayer()) reply(req,results);
+                    if(members.leaves.count(shard)) reply(req,results);
                     erasePending(rid); continue;
                 }
                 for(const auto& tx:rb.at("txs")) {
@@ -1075,20 +1253,33 @@ class Replica {
                 state["requests"][rid]={{"txs_hash",requestHash},{"results",results}};
                 stateDigest.markEntry("requests",rid);
                 erasePending(rid);
-                if(members.leaves.count(shard) || !members.twoLayer()) reply(req,results);
+                if(members.leaves.count(shard)) reply(req,results);
             }
             if(value.contains("cst_order_index")) state["cst_order_index"]=value.at("cst_order_index");
+            if(value.contains("cst_watermarks")) {
+                state["participant_indices"]=value.at("cst_watermarks");stateDigest.markField("participant_indices");
+                if(value.contains("cst_round")) {
+                    state["cst_round"]=value.at("cst_round");
+                    state["cst_rounds"][std::to_string(value.at("cst_round").get<int>())]={{"seq",n},{"digest",cert.at("proposal").at("body").at("digest")},{"value",value}};
+                    stateDigest.markEntry("cst_rounds",std::to_string(value.at("cst_round").get<int>()));
+                }
+            }
             if(value.contains("cst_orders")) {
                 const auto& root=value.at("cst_orders")[0];auto key=cstKey(root);
                 finalizeCst(witness);
                 state["cst_batches"][key]=root.at("proposal").at("body").at("digest");
                 stateDigest.markEntry("cst_batches",key);
+                int origin=root.at("proposal").at("body").at("shard");
+                state["cst_indices"][std::to_string(origin)]=projection(root.at("proposal").at("body").at("value"),shard);
+                stateDigest.markEntry("cst_indices",std::to_string(origin));
                 state["last_cst_seq"]=root.at("proposal").at("body").at("value").at("cst_order_index");
+                if(members.multiLayer()) state["cst_round"]=root.at("proposal").at("body").at("value").at("cst_round");
                 pendingCst.erase(key);slotWitnesses[n]=witness;
                 log("cst_ordered_at_leaf",{{"coordinator_batch",key},{"digest",state["cst_batches"].at(key)}});
             }
             state["chain"]=hash(state["chain"].get<std::string>()+std::to_string(n)+value.dump());
             applied=n; state["seq"]=n;
+            cstSelectionDirty=true;
             refreshDigests();
             executionNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-before).count();
             json entry={{"seq",n},{"value_digest",hash(value.dump())},{"state_digest",cachedStateDigest},{"certificate",cert}};
@@ -1119,9 +1310,11 @@ class Replica {
         if(slots.count(applied+1) && !slots.at(applied+1).proposal.is_null()) return;
         if(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-batchStart).count()<members.config.at("consensus").at("batch_wait_ms").get<int>()) return;
         if(!stagedRecords.empty() || certificates.count(applied+1)) return;
-        if(shard==coordinator() && members.twoLayer() && outstandingOrders.size()>=8) return;
-        if(pending.empty() && pendingCst.empty()) return;
-        bool crossShardOrder=shard==coordinator() && members.twoLayer() && !pending.empty();
+        bool flowControlled=isCoordinator() && outstandingOrders.size()>=8;
+        bool closeRound=isCoordinator() && members.multiLayer() && desiredRound>state.at("cst_round").get<int>();
+        if(flowControlled && !closeRound) return;
+        if(pending.empty() && pendingCst.empty() && !closeRound) return;
+        bool crossShardOrder=isCoordinator() && !pending.empty() && !flowControlled;
         int proposalLimit=crossShardOrder?crossShardBatchSize:batchSize;
         if(crossShardOrder && std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-batchStart).count()<crossShardBatchWaitMs) {
             int available=0;
@@ -1154,10 +1347,10 @@ class Replica {
         json reqs=json::array(); int count=0;
         std::string group;
         std::map<std::string,std::string> selectedIds;
-        for(auto it=pending.begin();it!=pending.end();) {
+        for(auto it=pending.begin();it!=pending.end() && !flowControlled;) {
             if(state["requests"].contains(it->first)) {
                 if(completedCstResults.count(it->first)) reply(it->second,completedCstResults.at(it->first));
-                else if(members.leaves.count(shard) || !members.twoLayer()) reply(it->second,state["requests"][it->first]["results"]);
+                else if(members.leaves.count(shard)) reply(it->second,state["requests"][it->first]["results"]);
                 auto rid=it->first;++it;erasePending(rid);continue;
             }
             int size=it->second.at("body").at("txs").size();
@@ -1185,26 +1378,30 @@ class Replica {
             reqs.push_back(it->second); count+=size; ++it;
         }
         json value={{"requests",reqs}};
-        if(!reqs.empty() && shard==coordinator() && members.twoLayer())
+        if(!reqs.empty() && isCoordinator())
             value["cst_order_index"]=state.at("cst_order_index").get<int>()+1;
+        if(isCoordinator() && (!reqs.empty() || closeRound)) {
+            auto ps=participants(reqs);json watermark=json::object();
+            for(int leaf:members.descendants(shard)) watermark[std::to_string(leaf)]=state.at("participant_indices").value(std::to_string(leaf),0)+(ps.count(leaf)?1:0);
+            value["cst_watermarks"]=watermark;
+            if(members.multiLayer()) value["cst_round"]=state.at("cst_round").get<int>()+1;
+        }
         if(reqs.empty() && !pendingCst.empty()) {
-            int expected=state.at("last_cst_seq").get<int>()+1;
-            for(const auto& [key,message]:pendingCst) {
-                (void)key;
-                const auto& cert=message.at("body").at("certificate");
-                if(cert.at("proposal").at("body").at("value").at("cst_order_index")==expected) {
-                    value["cst_orders"]=json::array({cert});break;
-                }
+            const auto& next=nextCstOrder();
+            if(!next.is_null()) {
+                value["cst_orders"]=json::array({next.at("certificate")});
+                if(members.multiLayer()) value["cst_frontier"]=next.at("frontier");
             }
         }
-        if(reqs.empty() && !value.contains("cst_orders")) return;
+        if(reqs.empty() && !value.contains("cst_orders") && !value.contains("cst_watermarks")) return;
+        if(isCoordinator() && value.contains("cst_round")) requestRound(value.at("cst_round"));
         broadcast(make("PREPREPARE",{{"seq",applied+1},{"digest",hash(value.dump())},{"value",value}}));
         batchStart=Clock::now();
     }
     void handle(const json& e) {
         const auto& b=e.at("body"); std::string type=b.at("type");
         if(type=="CLIENT") {
-            if(shard==coordinator() && members.twoLayer() &&
+            if(isCoordinator() &&
                b.at("target")==shard && b.at("txs").is_array() && int(b.at("txs").size())>crossShardBatchSize &&
                int(b.at("txs").size())<=batchSize) {
                 if(!members.clientMessage(e)) {rejected++;return;}
@@ -1224,7 +1421,7 @@ class Replica {
             if(state["requests"].contains(id)) {
                 if(state["requests"][id]["txs_hash"]==hash(b.at("txs").dump())) {
                     if(completedCstResults.count(id)) reply(e,completedCstResults.at(id));
-                    else if(members.leaves.count(shard) || !members.twoLayer()) reply(e,state["requests"][id]["results"]);
+                    else if(members.leaves.count(shard)) reply(e,state["requests"][id]["results"]);
                 }
                 else {replyConflict(e,"request_id_conflict");rejected++;}
                 duplicates++; return;
@@ -1243,7 +1440,7 @@ class Replica {
             if(pending.size()+deferredRequests.size()>=10000) {rejected++;return;}
             for(const auto& tx:b.at("txs")) {
                 auto tid=tx.at("id").get<std::string>();
-                if(pendingTx.count(tid) || (shard==coordinator() && members.twoLayer() &&
+                if(pendingTx.count(tid) || (isCoordinator() &&
                    state["seen"].contains(tid) && !completedTxResults.count(tid))) {
                     deferRequest(e);
                     if(me!=view%4) sendTo(shard,view%4,e);
@@ -1283,9 +1480,65 @@ class Replica {
         }
         // Reject messages from the removed protocol before they reach PBFT.
         if(type.rfind("PIPE_",0)==0) {rejected++;return;}
+        if(type=="CST_ROUND_REQUEST") {
+            if(!members.multiLayer() || !isCoordinator() || !members.coordinators().count(source) || b.at("target")!=shard ||
+               !b.at("round").is_number_integer()) {rejected++;return;}
+            int round=b.at("round");
+            if(round<=0) {rejected++;return;}
+            round=std::min(round,state.at("cst_round").get<int>()+64);
+            if(round>desiredRound) {desiredRound=round;lastProgress=Clock::now();}
+            return;
+        }
+        if(type=="CST_ROUND_CLOSE") {
+            if(!members.multiLayer() || !members.leaves.count(shard) || b.at("target")!=shard ||
+               source!=b.at("certificate").at("proposal").at("body").at("shard") || !rememberRound(b.at("certificate"))) {rejected++;return;}
+            auto key=cstKey(b.at("certificate"));
+            if(pendingCst.count(key)) {pendingCst[key]=e;cstSelectionDirty=true;}
+            if(state["cst_batches"].contains(key)) {completionResendNeeded.insert(key);sendAck(key);forwardAck(key,true);}
+            return;
+        }
+        if(type=="CST_ROUND_QUERY") {
+            if(!members.multiLayer() || !isCoordinator() || b.at("target")!=shard || !b.at("rounds").is_array() || b.at("rounds").size()>32) {rejected++;return;}
+            int leaf=b.at("leaf"),after=b.at("after_index");
+            bool local=source==shard;
+            if(!local && (!isForward() || leaf!=source || !members.descendants(shard).count(leaf) || after<0)) return;
+            std::set<int> wanted;
+            for(auto r:b.at("rounds")) {int round=r;if(round<=0) {rejected++;return;}wanted.insert(round);}
+            if(!local && !wanted.empty()) desiredRound=std::max(desiredRound,std::min(*wanted.rbegin(),state.at("cst_round").get<int>()+64));
+            if(!local) {
+                // Include the first missing projected orders, even if their round
+                // predates every currently buffered ORDER at the requesting leaf.
+                for(const auto& [round,closes]:roundCertificates) {
+                    if(closes.count(shard) && orderParticipants(closes.at(shard)).count(leaf) &&
+                       projection(closes.at(shard).at("proposal").at("body").at("value"),leaf)>after) wanted.insert(round);
+                    if(wanted.size()>=32) break;
+                }
+            }
+            json proofs=json::array(),missing=json::array();
+            for(int round:wanted) {
+                if(roundCertificates.count(round) && roundCertificates.at(round).count(shard)) proofs.push_back(roundCertificates.at(round).at(shard));
+                else if(state["cst_rounds"].contains(std::to_string(round))) missing.push_back(round);
+                if(proofs.size()+missing.size()>=32) break;
+            }
+            if(!proofs.empty() && (source!=shard || sender!=me)) {
+                sendTo(source,sender,make("CST_ROUND_PROOFS",{{"target",source},{"certificates",proofs}}));
+                log("round_proofs_sent",{{"destination",source},{"batches",proofs.size()}});
+            }
+            if(!local && !missing.empty()) broadcast(make("CST_ROUND_QUERY",{{"target",shard},{"rounds",missing},{"leaf",-1},{"after_index",-1}}));
+            return;
+        }
+        if(type=="CST_ROUND_PROOFS") {
+            if(!members.multiLayer() || b.at("target")!=shard || !b.at("certificates").is_array() || b.at("certificates").size()>32) {rejected++;return;}
+            for(const auto& cert:b.at("certificates")) {
+                if(cert.at("proposal").at("body").at("shard")!=source || !rememberRound(cert)) {rejected++;continue;}
+                if(isCoordinator() && source==shard && isForward()) forwardCstOrder(cert,cert.at("proposal").at("body").at("value"),true);
+            }
+            return;
+        }
         if(type=="CST_ORDER") {
-            if(!members.leaves.count(shard) || !members.twoLayer() || b.at("target")!=shard ||
-               source!=members.parent.at(shard) || !validCoordinatorCertificate(b.at("certificate"))) {rejected++;return;}
+            if(!members.leaves.count(shard) || b.at("target")!=shard ||
+               source!=b.at("certificate").at("proposal").at("body").at("shard") ||
+               !members.ancestors(shard).count(source) || !orderParticipants(b.at("certificate")).count(shard) || !validCoordinatorCertificate(b.at("certificate"))) {rejected++;return;}
             const auto& cert=b.at("certificate");std::string key=cstKey(cert);
             std::string digest=cert.at("proposal").at("body").at("digest");
             if(state["cst_batches"].contains(key)) {
@@ -1296,6 +1549,7 @@ class Replica {
             if(pendingCst.size()>=10000) {rejected++;return;}
             if(pending.empty() && pendingCst.empty()) {lastProgress=Clock::now();batchStart=Clock::now();}
             auto [it,inserted]=pendingCst.emplace(key,e);
+            if(inserted) cstSelectionDirty=true;
             if(!inserted && it->second.at("body").at("certificate").at("proposal").at("body").at("digest")!=digest)
                 rejected++;
             else if(!inserted) duplicates++;
@@ -1303,7 +1557,7 @@ class Replica {
             return;
         }
         if(type=="CST_PREPARED") {
-            if(!members.twoLayer() || !members.leaves.count(shard) || source!=shard || !isForward() ||
+            if(!members.leaves.count(shard) || source!=shard || !isForward() ||
                !validPreparedVote(e)) {rejected++;return;}
             const auto& record=e.at("record");auto key=record.at("batch_key").get<std::string>();
             if(state["cst_finalized"].contains(key)) return;
@@ -1327,8 +1581,9 @@ class Replica {
             applyReady();return;
         }
         if(type=="CST_PREPARED_QC") {
-            if(!members.twoLayer() || !members.leaves.count(shard) || !members.leaves.count(source) ||
-               b.at("target")!=shard || !validPreparedProof(b.at("proof"),source)) {rejected++;return;}
+            if(!members.leaves.count(shard) || !members.leaves.count(source) ||
+               b.at("target")!=shard || !validPreparedProof(b.at("proof"),source) ||
+               !orderParticipants(b.at("proof").at("record").at("order_certificate")).count(shard)) {rejected++;return;}
             const auto& proof=b.at("proof");auto key=proof.at("record").at("batch_key").get<std::string>();
             auto existing=dependencyProof(key,source);
             if(!existing.is_null() && recordPayload(existing.at("record"))!=recordPayload(proof.at("record"))) {rejected++;return;}
@@ -1338,7 +1593,7 @@ class Replica {
             applyReady();return;
         }
         if(type=="CST_DEPENDENCY_QUERY") {
-            if(!members.twoLayer() || !members.leaves.count(shard) || !members.leaves.count(source) ||
+            if(!members.leaves.count(shard) || !members.leaves.count(source) ||
                b.at("target")!=shard || !b.at("batch_keys").is_array() || b.at("batch_keys").size()>32) {rejected++;return;}
             // Cross-shard replies use the forward; local replicas may supply
             // an archive lost by a forward that restored a checkpoint.
@@ -1346,10 +1601,16 @@ class Replica {
             json witnesses=json::array();
             for(const auto& item:b.at("batch_keys")) {
                 auto key=item.get<std::string>();auto witness=availableWitness(key);
-                if(!witness.is_null() && validExecutionWitness(witness)) witnesses.push_back(witness);
+                if(!witness.is_null() && validExecutionWitness(witness)) {
+                    if(source!=shard && !orderParticipants(witness.at("proofs")[0].at("record").at("order_certificate")).count(source)) {rejected++;continue;}
+                    witnesses.push_back(witness);
+                }
                 else {
                     auto proof=dependencyProof(key,shard);
-                    if(!proof.is_null()) sendTo(source,sender,make("CST_PREPARED_QC",{{"target",source},{"proof",proof}}));
+                    if(!proof.is_null()) {
+                        if(source!=shard && !orderParticipants(proof.at("record").at("order_certificate")).count(source)) {rejected++;continue;}
+                        sendTo(source,sender,make("CST_PREPARED_QC",{{"target",source},{"proof",proof}}));
+                    }
                     else if(source!=shard) broadcast(make("CST_DEPENDENCY_QUERY",{{"target",shard},{"batch_keys",json::array({key})}}));
                 }
             }
@@ -1360,11 +1621,12 @@ class Replica {
             return;
         }
         if(type=="CST_DEPENDENCY_PROOFS") {
-            if(!members.twoLayer() || !members.leaves.count(shard) || !members.leaves.count(source) ||
+            if(!members.leaves.count(shard) || !members.leaves.count(source) ||
                b.at("target")!=shard || !b.at("witnesses").is_array() || b.at("witnesses").size()>32) {rejected++;return;}
             size_t accepted=0;
             for(const auto& witness:b.at("witnesses")) {
-                if(importWitness(witness)) {
+                if(validExecutionWitness(witness) && (source==shard ||
+                   orderParticipants(witness.at("proofs")[0].at("record").at("order_certificate")).count(source)) && importWitness(witness)) {
                     accepted++;
                     if(source==shard && isForward()) forwardPrepared(witness.at("batch_key"),true);
                 } else rejected++;
@@ -1373,8 +1635,8 @@ class Replica {
             applyReady();return;
         }
         if(type=="CST_ACK") {
-            if(!members.twoLayer() || !members.leaves.count(shard) || source!=shard || !isForward() ||
-               b.at("target")!=coordinator() || !b.at("batch_key").is_string() ||
+            if(!members.leaves.count(shard) || source!=shard || !isForward() ||
+               !b.at("batch_key").is_string() || b.at("target")!=batchOrigin(b.at("batch_key").get<std::string>()) ||
                !b.at("order_digest").is_string() || !b.at("execution_digest").is_string() ||
                !b.at("result_digest").is_string()) {rejected++;return;}
             auto key=b.at("batch_key").get<std::string>();
@@ -1402,18 +1664,18 @@ class Replica {
             return;
         }
         if(type=="CST_ACK_QC") {
-            if(!members.twoLayer() || !members.leaves.count(source) || b.at("target")!=shard ||
-               (shard!=coordinator() && shard!=source) || !b.at("proof").is_array() || b.at("proof").size()!=3) {rejected++;return;}
+            if(!members.leaves.count(source) || b.at("target")!=shard ||
+               (!isCoordinator() && shard!=source) || !b.at("proof").is_array() || b.at("proof").size()!=3) {rejected++;return;}
             const auto& proof=b.at("proof");const auto& vote=proof[0].at("body");
             auto key=vote.at("batch_key").get<std::string>();std::string digest=vote.at("order_digest");
-            if(!validAckProof(proof,source,key,digest) ||
+            if((isCoordinator() && batchOrigin(key)!=shard) || !validAckProof(proof,source,key,digest) ||
                (state["cst_orders"].contains(key) && digest!=state["cst_orders"].at(key).at("order_digest"))) {rejected++;return;}
             if(state["cst_finalized"].contains(key)) {
                 const auto& done=state["cst_finalized"].at(key);
                 if(done.at("order_digest")!=digest || done.at("execution_digest")!=vote.at("execution_digest") ||
                    done.at("result_digest")!=vote.at("result_digest")) {rejected++;return;}
             }
-            if(shard==coordinator() && !completedCstBatches.count(key)) {
+            if(isCoordinator() && !completedCstBatches.count(key)) {
                 if(!activeAckBatches.count(key) && activeAckBatches.size()>=10000) {rejected++;return;}
                 activeAckBatches.insert(key);
             }
@@ -1426,18 +1688,18 @@ class Replica {
                 pendingLocalAckQcs.erase(key);
                 if(sender==view%4) completionResendNeeded.erase(key);
             }
-            if(shard==coordinator()) maybeCompleteBatch(key);
+            if(isCoordinator()) maybeCompleteBatch(key);
             return;
         }
         if(source!=shard) {rejected++;return;}
         if(type=="CST_RESULT_QUERY") {
-            if(shard!=coordinator() || !members.twoLayer() || !b.at("batch_keys").is_array() ||
+            if(!isCoordinator() || !b.at("batch_keys").is_array() ||
                b.at("batch_keys").size()>32) {rejected++;return;}
             json proofs=json::array();
             for(const auto& item:b.at("batch_keys")) {
                 auto key=item.get<std::string>();if(!state["cst_orders"].contains(key)) continue;
                 json leaves=json::array();
-                for(int leaf:members.leaves) if(ackProofs.count(key) && ackProofs.at(key).count(leaf))
+                for(int leaf:participants(state["cst_orders"].at(key).at("requests"))) if(ackProofs.count(key) && ackProofs.at(key).count(leaf))
                     leaves.push_back({{"shard",leaf},{"votes",ackProofs.at(key).at(leaf)}});
                 json proof={{"batch_key",key},{"leaves",leaves}};
                 if(orderCertificates.count(key)) proof["order_certificate"]=orderCertificates.at(key);
@@ -1447,17 +1709,17 @@ class Replica {
             return;
         }
         if(type=="CST_RESULT_PROOFS") {
-            if(shard!=coordinator() || !members.twoLayer() || !b.at("proofs").is_array() ||
+            if(!isCoordinator() || !b.at("proofs").is_array() ||
                b.at("proofs").size()>32) {rejected++;return;}
             for(const auto& item:b.at("proofs")) {
                 auto key=item.at("batch_key").get<std::string>();
                 if(completedCstBatches.count(key) || !state["cst_orders"].contains(key)) continue;
                 const auto& order=state["cst_orders"].at(key);
-                if(!item.at("leaves").is_array() || item.at("leaves").size()>2) {rejected++;continue;}
+                if(!item.at("leaves").is_array() || item.at("leaves").size()>participants(order.at("requests")).size()) {rejected++;continue;}
                 std::map<int,json> recovered;bool valid=true;
                 for(const auto& proof:item.at("leaves")) {
                     int leaf=proof.at("shard");
-                    if(!validAckProof(proof.at("votes"),leaf,key,order.at("order_digest")) ||
+                    if(!participants(order.at("requests")).count(leaf) || !validAckProof(proof.at("votes"),leaf,key,order.at("order_digest")) ||
                        !recovered.emplace(leaf,proof.at("votes")).second) {valid=false;break;}
                 }
                 if(item.contains("order_certificate")) {
@@ -1470,6 +1732,7 @@ class Replica {
                 for(const auto& [leaf,proof]:recovered) ackProofs[key].emplace(leaf,proof);
                 if(item.contains("order_certificate")) {
                     orderCertificates[key]=item.at("order_certificate");
+                    if(members.multiLayer()) rememberRound(item.at("order_certificate"));
                     outstandingOrders[order.at("order_index").get<int>()]=item.at("order_certificate");
                 }
                 maybeCompleteBatch(key,false);
@@ -1497,6 +1760,7 @@ class Replica {
         if(type=="NEW_VIEW") {acceptNewView(e);return;}
         if(type=="CHECKPOINT") {
             int n=b.at("seq"); if(n<=stableSeq || n>stableSeq+window) return;
+            if(n>applied) catchupTarget=std::max(catchupTarget,n);
             checkpointVotes[n].emplace(sender,e);checkStable(n);return;
         }
         if(type=="SYNC_REQUEST") {
@@ -1566,10 +1830,12 @@ class Replica {
             {"changing_view",changing},{"target_view",targetView},{"applied_batches",applied},{"stable_seq",stableSeq},
             {"executed_transactions",state["executed"]},{"ordered_cst_transactions",state["ordered_cst"]},
             {"leaf_ordered_cst_transactions",state["leaf_ordered_cst"]},{"last_cst_seq",state["last_cst_seq"]},
-            {"cst_order_index",state["cst_order_index"]},
+            {"cst_order_index",state["cst_order_index"]},{"cst_round",state["cst_round"]},{"cst_indices",state["cst_indices"]},
+            {"catchup_target",catchupTarget},{"rounds_requested",desiredRound},{"round_certificate_count",roundCertificates.size()},
             {"avg_cst_batch_size",state["cst_order_index"].get<int>()>0 ?
                 state["ordered_cst"].get<double>()/state["cst_order_index"].get<int>() : 0.0},
             {"pending_cst_batches",pendingCst.size()},{"staged_cst_batches",stagedRecords.size()},
+            {"cst_selection_lookups",cstSelectionLookups},{"cst_selection_rebuilds",cstSelectionRebuilds},
             {"finalized_cst_batches",state["cst_finalized"].size()},
             {"decided_cst_batches",0},{"completed_cst_transactions",completedCstTransactions},
             {"kv_entries",state["kv"].size()},{"kv_digest",cachedKvDigest},
@@ -1624,17 +1890,12 @@ public:
             }
             int backoff=std::min(16,1<<std::min(4,std::max(0,targetView-view)));
             bool staged=!stagedRecords.empty();
-            bool flowControlled=shard==coordinator() && members.twoLayer() && outstandingOrders.size()>=8;
-            bool orderAvailable=false;
-            if(members.leaves.count(shard) && !staged) {
-                int expected=state.at("last_cst_seq").get<int>()+1;
-                for(const auto& [key,message]:pendingCst) {
-                    (void)key;
-                    if(message.at("body").at("certificate").at("proposal").at("body")
-                          .at("value").at("cst_order_index")==expected) {orderAvailable=true;break;}
-                }
-            }
-            bool waiting=!staged && ((!flowControlled && !pending.empty()) || orderAvailable);
+            bool flowControlled=isCoordinator() && outstandingOrders.size()>=8;
+            if(isCoordinator() && members.multiLayer() && !pending.empty() && !flowControlled)
+                desiredRound=std::max(desiredRound,state.at("cst_round").get<int>()+1);
+            bool orderAvailable=members.leaves.count(shard) && !staged && !nextCstOrder().is_null();
+            bool waiting=!staged && ((!flowControlled && !pending.empty()) || orderAvailable ||
+                (isCoordinator() && desiredRound>state.at("cst_round").get<int>()));
             bool crossWork=staged || !outstandingOrders.empty() || !pendingLocalAckQcs.empty() || !completionResendNeeded.empty();
             if(crossWork && std::chrono::duration_cast<std::chrono::milliseconds>(now-lastForwardHeartbeat).count()>timeoutMs)
                 waiting=true;
@@ -1645,6 +1906,7 @@ public:
             if(std::chrono::duration_cast<std::chrono::milliseconds>(now-lastRetry).count()>250) {
                 if(isForward()) {
                     broadcast(make("FORWARD_HEARTBEAT"));
+                    if(isCoordinator() && members.multiLayer() && desiredRound>state.at("cst_round").get<int>()) requestRound(desiredRound);
                 }
                 if(changing && !myViewChange.is_null()) broadcast(myViewChange);
                 if(!lastNewView.is_null() && lastNewView.at("body").at("view")==view && me==view%4) broadcast(lastNewView);
@@ -1656,7 +1918,7 @@ public:
                     }
                 }
                 if(!changing && !pending.empty() && me!=view%4) sendTo(shard,view%4,pending.begin()->second);
-                if(!changing && !pendingCst.empty() && me!=view%4) sendTo(shard,view%4,pendingCst.begin()->second);
+                if(!changing && !pendingCst.empty() && me!=view%4 && pendingCst.begin()->second.contains("signature")) sendTo(shard,view%4,pendingCst.begin()->second);
                 if(std::chrono::duration_cast<std::chrono::milliseconds>(now-lastCstRetry).count()>2000) {
                     if(members.leaves.count(shard)) {
                         for(const auto& [key,record]:stagedRecords) {
@@ -1674,17 +1936,19 @@ public:
                             forwardCstOrder(cert,cert.at("proposal").at("body").at("value"),true);
                         }
                     }
+                    queryRounds();
                     lastCstRetry=now;
                 }
                 if(applied>stableSeq && snapshots.count(applied)) broadcast(make("CHECKPOINT",{{"seq",applied},{"digest",snapshotDigests.at(applied)}}));
                 // Sync is a recovery path, not periodic traffic on a healthy
                 // replica. Replies carry a checkpoint snapshot and can grow
                 // large as cross-shard order metadata accumulates.
-                if((waiting || changing) &&
+                if((waiting || changing || catchupTarget>applied) &&
                    std::chrono::duration_cast<std::chrono::milliseconds>(now-lastProgress).count()>
                        std::max(1000,timeoutMs/2) &&
                    std::chrono::duration_cast<std::chrono::milliseconds>(now-lastSync).count()>2000) {
                     broadcast(make("SYNC_REQUEST",{{"after",applied},{"stable_seq",stableSeq}}));
+                    log("sync_requested",{{"after",applied},{"target",catchupTarget}});
                     lastSync=now;
                 }
                 lastRetry=now;
