@@ -47,6 +47,7 @@ def validate_selection(cfg, mode, shard, participants):
 
 
 def settlement_errors(case, cfg, rows):
+    method = case.get("method", cfg.get("method", "arbor"))
     parent, leaves = c.topology(cfg)
     expected = {(sid, r) for sid in parent for r in range(4)}
     actual = {(r.get("shard"), r.get("replica")) for r in rows}
@@ -74,13 +75,19 @@ def settlement_errors(case, cfg, rows):
         # Demand-driven empty closes consume real coordinator PBFT slots.
         # Client completion is insufficient if another coordinator still owes
         # a requested round, even when its business queues are already empty.
-        if sid not in leaves and any(
+        if method == "arbor" and sid not in leaves and any(
                 r.get("rounds_requested", 0) > r.get("cst_round", 0) for r in peers):
             problems.append(f"协调片 {sid} 仍有未封闭轮次")
         if any(r.get(field, 0) for r in peers for field in (
                 "pending_requests", "pending_cst_batches", "staged_cst_batches", "dedup_waiting_requests",
                 "network_queue", "network_buffered_bytes")):
             problems.append(f"分片 {sid} 尚有待处理交易")
+        if method == "saguaro":
+            fields = ("sag_active_batches", "sag_pending_prepares", "sag_pending_decisions", "sag_held_locks", "sag_pending_completions")
+            if any(field not in row for row in peers for field in fields):
+                problems.append(f"分片 {sid} 缺少 2PC 状态统计")
+            elif any(row[field] for row in peers for field in fields):
+                problems.append(f"分片 {sid} 仍有未结束的 2PC 或未释放的锁")
     return problems
 
 
@@ -126,7 +133,7 @@ def summarize_case(case, cfg, client_rc, result, before, after, drained):
 
 
 def comparison_key(row):
-    return (row["mode"], row["count"], row["rate"], row["batch"], row["seed"], row.get("shard"),
+    return (row.get("method", "arbor"), row["mode"], row["count"], row["rate"], row["batch"], row["seed"], row.get("shard"),
             tuple(row.get("participants", [])), row["config_fingerprint"])
 
 
@@ -148,7 +155,7 @@ def validate_report(report):
             if row["status"] == "PASS" and (not finite_number(row.get("completed_tps"), True) or
                                               not finite_number(row.get("p95_s"))):
                 raise ValueError("baseline 成功用例缺少有效 TPS/p95 指标")
-        except (KeyError, TypeError) as error:
+        except (KeyError, TypeError, AttributeError) as error:
             raise ValueError("baseline 用例缺少必要的参数字段") from error
 
 
@@ -160,6 +167,7 @@ def compare_reports(current, baseline):
     for key, new in group_rows(current["cases"]).items():
         old = old_groups.get(key, [])
         item = {k: new[0][k] for k in ("mode", "count", "rate", "batch")}
+        item["method"] = new[0].get("method", "arbor")
         item["comparable"] = False
         if not old:
             item["reason"] = "基线没有相同配置和负载参数的用例"
@@ -209,26 +217,68 @@ def wait_settled(case, cfg, run, seconds):
     return False, rows
 
 
-def run_case(case, source, folder, timeout, drain_timeout):
+def workload_fingerprint(workload):
+    return hashlib.sha256((json.dumps(workload, ensure_ascii=False, indent=2) + "\n").encode()).hexdigest()
+
+
+def validate_workload(case, cfg, workload, timeout):
+    """An externally supplied workload must match every reported case parameter."""
+    if not isinstance(workload, dict) or workload.get("rate") != case["rate"] or workload.get("seed") != case["seed"]:
+        raise ValueError("复用负载的 rate/seed 与测试参数不一致")
+    if workload.get("timeout_s") != timeout:
+        raise ValueError("复用负载的 timeout_s 与本轮超时不一致")
+    requests = workload.get("requests")
+    if not isinstance(requests, list) or not requests:
+        raise ValueError("复用负载必须包含非空 requests")
+    target = c.lca(cfg, case["participants"]) if case["mode"] == "cross" else case["shard"]
+    participants = sorted(case["participants"]) if case["mode"] == "cross" else [case["shard"]]
+    seen_requests, seen_txs = set(), set()
+    for i, req in enumerate(requests):
+        if not isinstance(req, dict) or req.get("target") != target or not isinstance(req.get("id"), str):
+            raise ValueError("复用负载的请求 ID/目标不符合用例")
+        if req["id"] in seen_requests:
+            raise ValueError("复用负载出现重复请求 ID")
+        seen_requests.add(req["id"])
+        txs = req.get("txs")
+        wanted = min(case["batch"], case["count"] - len(seen_txs))
+        if not isinstance(txs, list) or wanted <= 0 or len(txs) != wanted:
+            raise ValueError("复用负载的请求大小与 batch/count 不一致")
+        for tx in txs:
+            if not isinstance(tx, dict) or not isinstance(tx.get("id"), str) or tx.get("participants") != participants:
+                raise ValueError("复用负载的交易 ID/参与分片不符合用例")
+            if tx["id"] in seen_txs:
+                raise ValueError("复用负载出现重复交易 ID")
+            seen_txs.add(tx["id"])
+    if len(seen_txs) != case["count"]:
+        raise ValueError("复用负载的交易总数与 count 不一致")
+
+
+def run_case(case, source, folder, timeout, drain_timeout, method="arbor", workload=None):
+    c.binary_for_method(method)
+    case = dict(case, method=method)
     raw = copy.deepcopy(source)
     raw["base_port"] = free_ports(raw.get("host", "127.0.0.1"), 4 * len(raw["shards"]))
     folder.mkdir(parents=True)
     config_path, run = folder / "source-config.json", None
     c.write(config_path, raw)
     try:
-        run = c.start(config_path, folder / "run")
+        run = c.start(config_path, folder / "run", method=method)
         cfg = c.read(run / "config.json")
         # One client: capture output without adding an extra statistics polling
         # process during the timed load. End-of-run status is checked separately.
         before = c.statuses(run)
-        workload = c.prepare_workload(cfg, case["count"], case["rate"], case["seed"], "benchmark",
-            shard=case["shard"], participants=case["participants"] or None,
-            batch=case["batch"], timeout=timeout)
+        if workload is None:
+            workload = c.prepare_workload(cfg, case["count"], case["rate"], case["seed"], "benchmark",
+                shard=case["shard"], participants=case["participants"] or None,
+                batch=case["batch"], timeout=timeout)
+        else:
+            workload = copy.deepcopy(workload)
+        validate_workload(case, cfg, workload, timeout)
         job, output = folder / "workload.json", folder / "client.json"
         c.write(job, workload)
         started = time.monotonic()
         with (folder / "client.log").open("w") as log:
-            proc = subprocess.Popen([str(c.BIN), "client", str(run / "config.json"), str(job), str(output)],
+            proc = subprocess.Popen([str(c.run_binary(run)), "client", str(run / "config.json"), str(job), str(output)],
                                     stdout=log, stderr=subprocess.STDOUT)
             try:
                 client_rc = proc.wait(timeout=timeout + 15)
@@ -253,6 +303,7 @@ def run_case(case, source, folder, timeout, drain_timeout):
         c.write(folder / "status-after.json", after)
         row = summarize_case(case, cfg, client_rc, result, before, after, drained)
         row.update(run_dir=str(run), client_result=str(output), client_log=str(folder / "client.log"),
+                   workload_path=str(job), workload_sha256=workload_fingerprint(workload),
                    case_wall_s=time.monotonic() - started, timeout_s=timeout,
                    minimum_send_s=(case["count"] - len(workload["requests"][-1]["txs"])) / case["rate"])
         return row
@@ -265,15 +316,16 @@ def save_report(folder, report):
     report["aggregates"] = []
     for rows in group_rows(report["cases"]).values():
         item = {field: rows[0][field] for field in ("mode", "count", "rate", "batch")}
+        item["method"] = rows[0].get("method", "arbor")
         item.update(runs=len(rows), status="PASS" if all(r["status"] == "PASS" for r in rows) else "FAIL")
         for field in METRICS:
             item["median_" + field] = statistics.median(r[field] for r in rows) if item["status"] == "PASS" else None
         report["aggregates"].append(item)
     c.write(folder / "summary.json", report)
-    columns = ("mode", "repeat", "count", "rate", "batch", "status", "executed_transactions",
+    columns = ("method", "mode", "repeat", "count", "rate", "batch", "status", "executed_transactions",
                "elapsed_s", "completed_tps", "avg_latency_s", "p50_s", "p95_s", "p99_s",
                "sent_bytes_per_tx", "messages_sent", "bytes_sent", "network_connect_attempts",
-               "network_connections_reused", "network_failures", "view_changes", "failure_reasons", "run_dir")
+               "network_connections_reused", "network_failures", "view_changes", "failure_reasons", "workload_sha256", "run_dir")
     with (folder / "summary.csv").open("w", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=columns)
         writer.writeheader()
@@ -296,6 +348,7 @@ def parse_rates(value):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="一键片内/跨片性能测试；独立集群，输出 CSV/JSON")
     parser.add_argument("--config", type=Path, default=c.ROOT / "config/two_layer.json")
+    parser.add_argument("--method", choices=c.METHODS, default="arbor")
     parser.add_argument("--mode", choices=("intra", "cross", "all"), default="all")
     parser.add_argument("--shard", type=int, default=1)
     parser.add_argument("--participants", default="1,2")
@@ -341,7 +394,8 @@ def main(argv=None):
         validate_report(baseline)
     if not args.skip_build:
         subprocess.run(["make"], cwd=c.ROOT, check=True)
-    if not c.BIN.is_file():
+    binary = c.binary_for_method(args.method)
+    if not binary.is_file():
         raise ValueError("找不到节点二进制，请先 make")
     folder = (args.output_dir or c.ROOT / "test-results" / (
         "benchmark-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8])).resolve()
@@ -351,7 +405,7 @@ def main(argv=None):
     report = {"schema_version": 1, "config": cfg, "config_source": str(args.config.resolve()),
               "environment": {"host": platform.node(), "system": platform.platform(), "cpus": os.cpu_count()},
               "created_at": datetime.datetime.now().astimezone().isoformat(), "revision": revision,
-              "working_tree_dirty": bool(dirty), "binary_sha256": hashlib.sha256(c.BIN.read_bytes()).hexdigest(),
+              "working_tree_dirty": bool(dirty), "method": args.method, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "cases": [], "comparisons": []}
     c.write(folder / "config-snapshot.json", source)
     print(f"结果目录: {folder}", flush=True)
@@ -363,7 +417,7 @@ def main(argv=None):
             if math.ceil(case["count"] / case["batch"]) < 10:
                 print("请求批次数少于10，发送呈明显突发；测持续吞吐时请增加 count 或减小客户端 batch。", flush=True)
             timeout = args.timeout if args.timeout is not None else case["count"] / case["rate"] + 60
-            row = run_case(case, source, folder / f"case-{i:03d}", timeout, args.drain_timeout)
+            row = run_case(case, source, folder / f"case-{i:03d}", timeout, args.drain_timeout, method=args.method)
             report["cases"].append(row)
             save_report(folder, report)
             if row["status"] == "PASS":

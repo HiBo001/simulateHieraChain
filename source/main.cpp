@@ -116,12 +116,7 @@ class Replica {
     std::map<int,std::map<int,json>> checkpointVotes;
     std::map<int,std::map<int,json>> viewChanges;
     json stableProof=json::array(), stableState;
-    json state={{"seq",0},{"chain",hash("arbor-genesis")},{"kv",json::object()},
-                {"seen",json::object()},{"requests",json::object()},{"executed",0},{"ordered_cst",0},
-                {"cst_batches",json::object()},{"cst_seen",json::object()},{"leaf_ordered_cst",0},{"last_cst_seq",0},
-                {"cst_finalized",json::object()},{"cst_orders",json::object()},
-                {"cst_order_index",0},{"cst_round",0},{"cst_indices",json::object()},
-                {"participant_indices",json::object()},{"cst_rounds",json::object()}};
+    json state=genesis();
     std::map<std::string,json> pending;
     // CLIENT envelopes remain signed and intact. Overlapping requests wait for
     // the first owner's result rather than launching concurrent consensus.
@@ -519,6 +514,9 @@ class Replica {
         } catch(...) {return false;}
     }
     bool validValue(const json& value) const {
+#ifdef ARBOR_SAGUARO
+        return saguaroValidValue(value);
+#else
         try {
             int n=0;
             std::map<std::string,std::string> requestIds, transactionIds;
@@ -588,7 +586,9 @@ class Replica {
             return n<=(isCoordinator() && !value.at("requests").empty()
                         ?crossShardBatchSize:batchSize);
         } catch (...) { return false; }
+#endif
     }
+    // Both methods use exactly the same PBFT vote and certificate validation.
     bool validSignedProposal(const json& e) const {
         try {
             const auto& b=e.at("body"); int v=b.at("view");
@@ -644,12 +644,18 @@ class Replica {
             return voters.size()>=3;
         } catch (...) {return false;}
     }
-    static json genesis() { return {{"seq",0},{"chain",hash("arbor-genesis")},{"kv",json::object()},
+    static json genesis() { json result={{"seq",0},{"chain",hash("arbor-genesis")},{"kv",json::object()},
                 {"seen",json::object()},{"requests",json::object()},{"executed",0},{"ordered_cst",0},
                 {"cst_batches",json::object()},{"cst_seen",json::object()},{"leaf_ordered_cst",0},{"last_cst_seq",0},
                 {"cst_finalized",json::object()},{"cst_orders",json::object()},
                 {"cst_order_index",0},{"cst_round",0},{"cst_indices",json::object()},
-                {"participant_indices",json::object()},{"cst_rounds",json::object()}}; }
+                {"participant_indices",json::object()},{"cst_rounds",json::object()}};
+#ifdef ARBOR_SAGUARO
+        return saguaroGenesis(std::move(result));
+#else
+        return result;
+#endif
+    }
     bool validVC(const json& e,int v) const {
         try {
             const auto& b=e.at("body");
@@ -724,7 +730,12 @@ class Replica {
         for(auto it=snapshots.begin();it!=snapshots.end();) it=it->first<h?snapshots.erase(it):std::next(it);
         for(auto it=snapshotDigests.begin();it!=snapshotDigests.end();) it=it->first<h?snapshotDigests.erase(it):std::next(it);
         for(auto it=checkpointVotes.begin();it!=checkpointVotes.end();) it=it->first<h?checkpointVotes.erase(it):std::next(it);
-        if(restored) rebuildPendingIndex();
+        if(restored) {
+#ifdef ARBOR_SAGUARO
+            saguaroRestore();
+#endif
+            rebuildPendingIndex();
+        }
         for(auto it=pendingCst.begin();it!=pendingCst.end();)
             it=state["cst_batches"].contains(it->first)?pendingCst.erase(it):std::next(it);
         for(auto it=stagedRecords.begin();it!=stagedRecords.end();)
@@ -1197,19 +1208,64 @@ class Replica {
             it=cstKey(it->second)==key?outstandingOrders.erase(it):std::next(it);
         log("cst_complete",{{"batch_key",key}});drainDeferred();
     }
+    // Shared application execution keeps the comparison workload identical.
+    void applyClientRequests(const json& requests,int n) {
+        for(const auto& req:requests) {
+            const auto& rb=req.at("body"); std::string rid=rb.at("id");
+            auto requestHash=hash(rb.at("txs").dump());
+            json results=json::array();
+            if(state["requests"].contains(rid) && state["requests"][rid]["txs_hash"]!=requestHash) {
+                for(const auto& tx:rb.at("txs")) results.push_back({{"id",tx.at("id")},{"error","request_id_conflict"}});
+                if(members.leaves.count(shard)) reply(req,results);
+                erasePending(rid); continue;
+            }
+            for(const auto& tx:rb.at("txs")) {
+                std::string id=tx.at("id"); auto d=hash(tx.dump());
+                if(state["seen"].contains(id)) {
+                    duplicates++;
+                    if(state["seen"][id]["tx_digest"]!=d) results.push_back({{"id",id},{"error","id_conflict"}});
+                    else {auto result=state["seen"][id]["result"];result["kind"]="duplicate";results.push_back(result);}
+                    continue;
+                }
+                json result={{"id",id},{"seq",n},{"kind",members.leaves.count(shard)?"executed":"ordered_only"}};
+                if(members.leaves.count(shard)) {
+                    uint64_t a=0,b=1;
+                    int loops=members.config.at("execution").at("fib_iterations");
+                    for(int k=0;k<loops;++k) { uint64_t next=a+b; a=b; b=next; }
+                    std::string key=tx.at("key");
+                    json previous=state["kv"].contains(key)?state["kv"][key]:json{{"version",0},{"digest",hash("initial")}};
+                    auto digest=hash(previous.dump()+tx.dump()+std::to_string(a));
+                    state["kv"][key]={{"version",previous["version"].get<int>()+1},{"digest",digest},{"value",tx.at("value")},{"fib",a}};
+                    stateDigest.markEntry("kv",key);kvDirty=true;
+                    result["digest"]=digest; state["executed"]=state["executed"].get<uint64_t>()+1;
+                } else { result["digest"]=d; state["ordered_cst"]=state["ordered_cst"].get<uint64_t>()+1; }
+                state["seen"][id]={{"tx_digest",d},{"result",result}}; results.push_back(result);
+                changedTx.insert(id);stateDigest.markEntry("seen",id);
+            }
+            state["requests"][rid]={{"txs_hash",requestHash},{"results",results}};
+            stateDigest.markEntry("requests",rid);
+            erasePending(rid);
+            if(members.leaves.count(shard)) reply(req,results);
+        }
+    }
     void applyReady() {
         while(certificates.count(applied+1)) {
             int n=applied+1; const auto cert=certificates.at(n); const auto& value=cert.at("proposal").at("body").at("value");
             // The PBFT slot is committed before dependencies are exchanged.
             // Its replicated state advances only after execution has finished.
             json witness=nullptr;
+#ifndef ARBOR_SAGUARO
             if(value.contains("cst_orders")) {
                 const auto& root=value.at("cst_orders")[0];auto key=cstKey(root);
                 stageCst(root);witness=availableWitness(key);
                 if(witness.is_null() || !validExecutionWitness(witness) ||
                    recordPayload(witnessRecord(witness,shard))!=recordPayload(stagedRecords.at(key))) break;
             }
+#endif
             auto before=Clock::now();
+#ifdef ARBOR_SAGUARO
+            saguaroApply(value,cert,n);
+#else
             if(value.contains("cst_order_index")) {
                 json duplicates=json::array();
                 for(const auto& req:value.at("requests")) for(const auto& tx:req.at("body").at("txs"))
@@ -1218,43 +1274,7 @@ class Replica {
                     {"order_index",value.at("cst_order_index")},{"requests",value.at("requests")},{"duplicates",duplicates}};
                 stateDigest.markEntry("cst_orders",cstKey(cert));
             }
-            for(const auto& req:value.at("requests")) {
-                const auto& rb=req.at("body"); std::string rid=rb.at("id");
-                auto requestHash=hash(rb.at("txs").dump());
-                json results=json::array();
-                if(state["requests"].contains(rid) && state["requests"][rid]["txs_hash"]!=requestHash) {
-                    for(const auto& tx:rb.at("txs")) results.push_back({{"id",tx.at("id")},{"error","request_id_conflict"}});
-                    if(members.leaves.count(shard)) reply(req,results);
-                    erasePending(rid); continue;
-                }
-                for(const auto& tx:rb.at("txs")) {
-                    std::string id=tx.at("id"); auto d=hash(tx.dump());
-                    if(state["seen"].contains(id)) {
-                        duplicates++;
-                        if(state["seen"][id]["tx_digest"]!=d) results.push_back({{"id",id},{"error","id_conflict"}});
-                        else {auto result=state["seen"][id]["result"];result["kind"]="duplicate";results.push_back(result);}
-                        continue;
-                    }
-                    json result={{"id",id},{"seq",n},{"kind",members.leaves.count(shard)?"executed":"ordered_only"}};
-                    if(members.leaves.count(shard)) {
-                        uint64_t a=0,b=1;
-                        int loops=members.config.at("execution").at("fib_iterations");
-                        for(int k=0;k<loops;++k) { uint64_t next=a+b; a=b; b=next; }
-                        std::string key=tx.at("key");
-                        json previous=state["kv"].contains(key)?state["kv"][key]:json{{"version",0},{"digest",hash("initial")}};
-                        auto digest=hash(previous.dump()+tx.dump()+std::to_string(a));
-                        state["kv"][key]={{"version",previous["version"].get<int>()+1},{"digest",digest},{"value",tx.at("value")},{"fib",a}};
-                        stateDigest.markEntry("kv",key);kvDirty=true;
-                        result["digest"]=digest; state["executed"]=state["executed"].get<uint64_t>()+1;
-                    } else { result["digest"]=d; state["ordered_cst"]=state["ordered_cst"].get<uint64_t>()+1; }
-                    state["seen"][id]={{"tx_digest",d},{"result",result}}; results.push_back(result);
-                    changedTx.insert(id);stateDigest.markEntry("seen",id);
-                }
-                state["requests"][rid]={{"txs_hash",requestHash},{"results",results}};
-                stateDigest.markEntry("requests",rid);
-                erasePending(rid);
-                if(members.leaves.count(shard)) reply(req,results);
-            }
+            applyClientRequests(value.at("requests"),n);
             if(value.contains("cst_order_index")) state["cst_order_index"]=value.at("cst_order_index");
             if(value.contains("cst_watermarks")) {
                 state["participant_indices"]=value.at("cst_watermarks");stateDigest.markField("participant_indices");
@@ -1277,6 +1297,7 @@ class Replica {
                 pendingCst.erase(key);slotWitnesses[n]=witness;
                 log("cst_ordered_at_leaf",{{"coordinator_batch",key},{"digest",state["cst_batches"].at(key)}});
             }
+#endif
             state["chain"]=hash(state["chain"].get<std::string>()+std::to_string(n)+value.dump());
             applied=n; state["seq"]=n;
             cstSelectionDirty=true;
@@ -1285,10 +1306,14 @@ class Replica {
             json entry={{"seq",n},{"value_digest",hash(value.dump())},{"state_digest",cachedStateDigest},{"certificate",cert}};
             if(!witness.is_null()) entry["execution_witness"]=witness;
             journal<<entry.dump()<<'\n';journal.flush();
+#ifdef ARBOR_SAGUARO
+            saguaroAfterApply(value,cert,n);
+#else
             if(!members.leaves.count(shard)) {
                 forwardCstOrder(cert,value);
                 if(value.contains("cst_order_index")) maybeCompleteBatch(cstKey(cert));
             } else if(value.contains("cst_orders")) sendAck(cstKey(value.at("cst_orders")[0]));
+#endif
             lastProgress=Clock::now();
             if(n%checkpointEvery==0) {
                 snapshots[n]=state;snapshotDigests[n]=cachedStateDigest;
@@ -1305,6 +1330,9 @@ class Replica {
         if(proof.size()>=3) installStable({{"seq",n},{"state",snapshots[n]},{"proof",proof}});
     }
     void propose() {
+#ifdef ARBOR_SAGUARO
+        saguaroPropose();
+#else
         if(changing || me!=view%4 || applied+1>stableSeq+window) return;
         // One fresh batch in flight. Recovery slots may coexist after a view change.
         if(slots.count(applied+1) && !slots.at(applied+1).proposal.is_null()) return;
@@ -1397,10 +1425,14 @@ class Replica {
         if(isCoordinator() && value.contains("cst_round")) requestRound(value.at("cst_round"));
         broadcast(make("PREPREPARE",{{"seq",applied+1},{"digest",hash(value.dump())},{"value",value}}));
         batchStart=Clock::now();
+#endif
     }
     void handle(const json& e) {
         const auto& b=e.at("body"); std::string type=b.at("type");
         if(type=="CLIENT") {
+#ifdef ARBOR_SAGUARO
+            saguaroClient(e);
+#else
             if(isCoordinator() &&
                b.at("target")==shard && b.at("txs").is_array() && int(b.at("txs").size())>crossShardBatchSize &&
                int(b.at("txs").size())<=batchSize) {
@@ -1454,6 +1486,7 @@ class Replica {
                 if(!state["seen"].contains(tx.at("id").get<std::string>()))
                     pendingTx.emplace(tx.at("id"),std::make_pair(hash(tx.dump()),id));
             if(inserted && me!=view%4) sendTo(shard,view%4,e);
+#endif
             return;
         }
         if(type=="PROBE") {
@@ -1466,6 +1499,12 @@ class Replica {
         }
         if(!members.replicaMessage(e)) {rejected++;return;}
         int source=b.at("shard"),sender=b.at("from");
+#ifdef ARBOR_SAGUARO
+        if(saguaroHandle(e)) return;
+        if(type.rfind("CST_",0)==0) {rejected++;return;}
+#else
+        if(type.rfind("SAG_",0)==0) {rejected++;return;}
+#endif
         if(type=="PING") {
             if(b.at("dst_shard")!=shard || b.at("dst_replica")!=me) return;
             sendTo(source,sender,make("PONG",{{"id",b.at("id")}})); return;
@@ -1856,8 +1895,16 @@ class Replica {
             {"network_connect_attempts",net.connect_attempts.load()},{"network_connections_reused",net.connections_reused.load()},
             {"inbox_dropped",inboxDropped.load()},
             {"bytes_received",net.bytes_received.load()},{"network_queue",net.queued()},{"probes",probes}};
+#ifdef ARBOR_SAGUARO
+        saguaroStatus(s);
+#else
+        s["method"]="arbor";
+#endif
         writeJson(dir+"/status.json",s);
     }
+#ifdef ARBOR_SAGUARO
+#include "../baseline/saguaro/protocol.inc"
+#endif
 public:
     Replica(const json& cfg,int sid,int rid,const std::string& d):members(cfg),shard(sid),me(rid),dir(d) {
         if(!members.endpoints.count(identity(sid,rid))) throw std::runtime_error("unknown replica");
@@ -1865,7 +1912,11 @@ public:
         timeoutMs=cfg.at("consensus").at("view_timeout_ms"); batchSize=cfg.at("consensus").at("batch_size");
         crossShardBatchSize=cfg.at("consensus").at("cross_shard_batch_size");
         crossShardBatchWaitMs=cfg.at("consensus").at("cross_shard_batch_wait_ms");
-        checkpointEvery=cfg.at("consensus").at("checkpoint_batches"); stableState=state;
+        checkpointEvery=cfg.at("consensus").at("checkpoint_batches");
+#ifdef ARBOR_SAGUARO
+        saguaroInitialize();
+#endif
+        stableState=state;
         expectedFib=fibonacci();
         refreshDigests(true);
         if(std::filesystem::exists(dir+"/commits.jsonl")) throw std::runtime_error("replica restart within a run is not supported; start a fresh run to prevent double voting");
@@ -1889,6 +1940,9 @@ public:
                 } else ++it;
             }
             int backoff=std::min(16,1<<std::min(4,std::max(0,targetView-view)));
+#ifdef ARBOR_SAGUARO
+            bool waiting=saguaroWaiting(now);
+#else
             bool staged=!stagedRecords.empty();
             bool flowControlled=isCoordinator() && outstandingOrders.size()>=8;
             if(isCoordinator() && members.multiLayer() && !pending.empty() && !flowControlled)
@@ -1899,6 +1953,7 @@ public:
             bool crossWork=staged || !outstandingOrders.empty() || !pendingLocalAckQcs.empty() || !completionResendNeeded.empty();
             if(crossWork && std::chrono::duration_cast<std::chrono::milliseconds>(now-lastForwardHeartbeat).count()>timeoutMs)
                 waiting=true;
+#endif
             for(const auto& [n,slot]:slots) if(n>applied && !slot.proposal.is_null() && !certificates.count(n)) waiting=true;
             if((waiting || changing) && std::chrono::duration_cast<std::chrono::milliseconds>(now-lastProgress).count()>timeoutMs*(changing?backoff:1)) {
                 if(!changing || viewChanges[targetView].size()>=3) startViewChange(std::max(view,targetView)+1);
@@ -1906,7 +1961,9 @@ public:
             if(std::chrono::duration_cast<std::chrono::milliseconds>(now-lastRetry).count()>250) {
                 if(isForward()) {
                     broadcast(make("FORWARD_HEARTBEAT"));
+#ifndef ARBOR_SAGUARO
                     if(isCoordinator() && members.multiLayer() && desiredRound>state.at("cst_round").get<int>()) requestRound(desiredRound);
+#endif
                 }
                 if(changing && !myViewChange.is_null()) broadcast(myViewChange);
                 if(!lastNewView.is_null() && lastNewView.at("body").at("view")==view && me==view%4) broadcast(lastNewView);
@@ -1918,6 +1975,9 @@ public:
                     }
                 }
                 if(!changing && !pending.empty() && me!=view%4) sendTo(shard,view%4,pending.begin()->second);
+#ifdef ARBOR_SAGUARO
+                saguaroTick(now);
+#else
                 if(!changing && !pendingCst.empty() && me!=view%4 && pendingCst.begin()->second.contains("signature")) sendTo(shard,view%4,pendingCst.begin()->second);
                 if(std::chrono::duration_cast<std::chrono::milliseconds>(now-lastCstRetry).count()>2000) {
                     if(members.leaves.count(shard)) {
@@ -1939,6 +1999,7 @@ public:
                     queryRounds();
                     lastCstRetry=now;
                 }
+#endif
                 if(applied>stableSeq && snapshots.count(applied)) broadcast(make("CHECKPOINT",{{"seq",applied},{"digest",snapshotDigests.at(applied)}}));
                 // Sync is a recovery path, not periodic traffic on a healthy
                 // replica. Replies carry a checkpoint snapshot and can grow

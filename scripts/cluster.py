@@ -23,6 +23,28 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "build/bin/arbor_node"
 RUN_PROCESSES = {}
+METHODS = ("arbor", "saguaro")
+
+
+def binary_for_method(method="arbor"):
+    if method not in METHODS:
+        raise ValueError(f"未知方法 {method!r}，可用方法为 {METHODS}")
+    return BIN if method == "arbor" else ROOT / "build/bin/saguaro_node"
+
+
+def run_method(run):
+    manifest = Path(run) / "manifest.json"
+    metadata = read(manifest) if manifest.is_file() else read(Path(run) / "config.json")
+    method = metadata.get("method", "arbor")
+    binary_for_method(method)
+    return method
+
+
+def run_binary(run, method=None):
+    actual = run_method(run)
+    if method is not None and method != actual:
+        raise ValueError(f"运行中的方法是 {actual}，不能用 {method} 客户端向它发负载")
+    return binary_for_method(actual)
 
 
 def read(path):
@@ -202,7 +224,10 @@ def is_our_process(n):
         return False
     r = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
     command = r.stdout.strip()
-    return r.returncode == 0 and str(BIN) in command and n["directory"] in command and " node " in command
+    binary = n.get("binary", str(BIN))
+    allowed = {str(binary_for_method(method)) for method in METHODS}
+    return (binary in allowed and r.returncode == 0 and command.startswith(binary + " node ")
+            and command.endswith(" " + n["directory"]))
 
 
 def stop_run(run):
@@ -246,11 +271,12 @@ def statuses(run):
     return result
 
 
-def start(config, run=None):
+def start(config, run=None, method="arbor"):
+    binary = binary_for_method(method)
     explicit_run = run is not None
     c = validate(read(config))
-    if not BIN.exists():
-        raise ValueError("请先运行 make")
+    if not binary.exists():
+        raise ValueError(f"找不到 {binary}，请先运行 make")
     root_runtime = ROOT / "runtime"
     root_runtime.mkdir(exist_ok=True)
     # Prevent concurrent start commands from racing on the same ports/latest link.
@@ -273,6 +299,7 @@ def start(config, run=None):
         run.mkdir(parents=True)
         keys = run / "keys"
         keys.mkdir(mode=0o700)
+        c["method"] = method
         c["run_id"] = uuid.uuid4().hex
         c["client_private_key"], c["client_public_key"] = keypair(keys, "client")
         c["nodes"] = []
@@ -284,16 +311,17 @@ def start(config, run=None):
                 directory.mkdir(parents=True)
                 c["nodes"].append({"shard": sid, "replica": r, "host": c["host"], "port": c["base_port"] + len(c["nodes"]), "private_key": secret, "public_key": public, "directory": str(directory)})
         write(run / "config.json", c)
-        manifest = {"run_id": c["run_id"], "config_source": str(Path(config).resolve()), "nodes": []}
+        manifest = {"run_id": c["run_id"], "method": method, "binary": str(binary),
+                    "config_source": str(Path(config).resolve()), "nodes": []}
         write(run / "manifest.json", manifest)
         processes = []
         RUN_PROCESSES[str(run)] = processes
         try:
             for n in c["nodes"]:
                 with (Path(n["directory"]) / "node.log").open("w") as log:
-                    p = subprocess.Popen([str(BIN), "node", str(run / "config.json"), str(n["shard"]), str(n["replica"]), n["directory"]], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                    p = subprocess.Popen([str(binary), "node", str(run / "config.json"), str(n["shard"]), str(n["replica"]), n["directory"]], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 processes.append(p)
-                manifest["nodes"].append(dict(n, pid=p.pid))
+                manifest["nodes"].append(dict(n, pid=p.pid, binary=str(binary)))
                 write(run / "manifest.json", manifest)
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
@@ -311,7 +339,7 @@ def start(config, run=None):
                     raise ValueError("runtime/latest 已存在且不是符号链接")
                 latest.symlink_to(run, target_is_directory=True)
             parent, leaves = topology(c)
-            print(f"已启动 {len(c['shards'])} 个分片、{len(c['nodes'])} 个节点；根 {next(s for s,p in parent.items() if p is None)}；叶子 {leaves}")
+            print(f"已启动 {method}：{len(c['shards'])} 个分片、{len(c['nodes'])} 个节点；根 {next(s for s,p in parent.items() if p is None)}；叶子 {leaves}")
             print(format_topology(c))
             print(f"RUN_DIR={run}")
             return run
@@ -358,15 +386,16 @@ def prepare_workload(c, count, rate, seed, prefix, shard=None, participants=None
     return {"rate": rate, "timeout_s": timeout, "seed": seed, "requests": requests}
 
 
-def load(run, count=100, rate=100, seed=1, prefix=None, shard=None, participants=None, batch=None, timeout=30, output=None):
+def load(run, count=100, rate=100, seed=1, prefix=None, shard=None, participants=None, batch=None, timeout=30, output=None, method=None):
     run = Path(run).resolve()
+    binary = run_binary(run, method)
     c = read(run / "config.json")
     prefix = prefix or uuid.uuid4().hex
     workload = prepare_workload(c, count, rate, seed, prefix, shard, participants, batch, timeout)
     output = Path(output).resolve() if output else run / ("client-" + uuid.uuid4().hex[:8] + ".json")
     workload_path = output.with_suffix(".workload.json")
     write(workload_path, workload)
-    rc = subprocess.run([str(BIN), "client", str(run / "config.json"), str(workload_path), str(output)]).returncode
+    rc = subprocess.run([str(binary), "client", str(run / "config.json"), str(workload_path), str(output)]).returncode
     print(f"客户端结果: {output}")
     return rc, read(output)
 
@@ -382,7 +411,7 @@ def signed(body, key, run):
     input_path, output_path = Path(run) / (name + ".input.json"), Path(run) / (name + ".signed.json")
     try:
         write(input_path, body)
-        subprocess.run([str(BIN), "sign", str(input_path), str(key), str(output_path)], check=True)
+        subprocess.run([str(run_binary(run)), "sign", str(input_path), str(key), str(output_path)], check=True)
         return read(output_path)
     finally:
         input_path.unlink(missing_ok=True)
@@ -433,11 +462,12 @@ class SingleUse(argparse.Action):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ["validate", "start"]:
+    for name in ["validate", "start", "restart"]:
         p = commands.add_parser(name)
         p.add_argument("--config", default=str(ROOT / "config/two_layer.json"))
-        if name == "start":
+        if name in ("start", "restart"):
             p.add_argument("--run-dir")
+            p.add_argument("--method", choices=METHODS, default="arbor")
     p = commands.add_parser("topology", help="打印最近一次运行或指定配置的分片拓扑")
     source = p.add_mutually_exclusive_group()
     source.add_argument("--run-dir", help="运行目录；默认 runtime/latest")
@@ -457,6 +487,7 @@ def main():
             p.add_argument("--batch", type=int)
             p.add_argument("--timeout", type=float, default=30)
             p.add_argument("--output")
+            p.add_argument("--method", choices=METHODS, help="默认从运行记录识别；必须与集群方法一致")
         if name == "probe":
             p.add_argument("--source", required=True)
             p.add_argument("--to", required=True)
@@ -469,8 +500,12 @@ def main():
         c = validate(read(a.config))
         parent, leaves = topology(c)
         print(json.dumps({"shard_count": len(parent), "node_count": 4 * len(parent), "root": next(s for s,p in parent.items() if p is None), "leaves": leaves, "parents": parent, "network": c["network"]}, ensure_ascii=False, indent=2))
-    elif a.command == "start":
-        start(a.config, a.run_dir)
+    elif a.command in ("start", "restart"):
+        if a.command == "restart":
+            latest = ROOT / "runtime/latest"
+            if (latest / "manifest.json").is_file():
+                stop_run(latest)
+        start(a.config, a.run_dir, method=a.method)
     elif a.command == "topology":
         if a.config:
             c = validate(read(a.config))
@@ -493,7 +528,7 @@ def main():
         if a.participants and a.shard is not None:
             raise ValueError("--shard 和 --participants 不能同时指定")
         participants = [int(s) for s in a.participants.split(",")] if a.participants else None
-        rc, _ = load(a.run_dir, a.count, a.rate, a.seed, a.id_prefix, a.shard, participants, a.batch, a.timeout, a.output)
+        rc, _ = load(a.run_dir, a.count, a.rate, a.seed, a.id_prefix, a.shard, participants, a.batch, a.timeout, a.output, method=a.method)
         return rc
     elif a.command == "probe":
         integer(a.samples, "samples", 1, 100)

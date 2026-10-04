@@ -58,6 +58,18 @@ make test
 
 一键性能测试使用 `python3 scripts/benchmark.py`（或 `make benchmark`）：自动编译，逐轮启动独立集群，运行片内/跨片负载，停止节点，保存 TPS、秒延时及网络指标。默认每类各测试 4000 笔、速率 1000 和 4000；详见 [docs/BENCHMARK.md](docs/BENCHMARK.md)。
 
+## Saguaro 2PC 对比方法
+
+`baseline/saguaro/` 提供由参与分片最近公共祖先协调的传统 2PC。它复用 Arbor 的四节点 PBFT、网络、执行与客户端；通过 `start --method saguaro` 选择，默认启动方式仍为 Arbor。
+
+```bash
+python3 baseline/compare.py --config config/two_layer.json \
+  --participants 1,2 --count 4000 --rate 1000 --batch 10 \
+  --repeat 3 --seed 42 --timeout 120 --drain-timeout 60
+```
+
+对比工具把同一份负载分别交给两个方法，自动启动和停止集群，保存完成 TPS、秒制延时与副本收敛检查。使用和测试见 [baseline/README.md](baseline/README.md)，协议设计见 [baseline/saguaro/DESIGN.md](baseline/saguaro/DESIGN.md)。
+
 ## 配置分片与拓扑
 
 当前系统的配置统一存放在 `config/`：JSON 文件供当前启动器使用；`accessControlList`、`networkConfig`、`shardsTopology`、`workloadProfile` 和 `topShardId` 是旧格式参考文件，不能直接传给新启动器。当前可运行的配置采用 JSON。分片数量由 `shards` 数组长度决定，不重复配置数量。每个分片有唯一的正整数 `id` 和一个 `parent`；根的 `parent` 为 `null`。

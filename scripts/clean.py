@@ -49,18 +49,28 @@ def assert_no_writers(root, processes):
     for pid, command in processes.items():
         if pid == os.getpid():
             continue
-        binary = str(root / "build/bin/arbor_node")
-        if command.startswith(binary + " client ") and any(
+        binaries = [str(root / "build/bin" / (method + "_node")) for method in c.METHODS]
+        if any(command.startswith(binary + " client ") for binary in binaries) and any(
                 str(root / name) + os.sep in command for name in ("runtime", "test-results")):
             raise ValueError(f"客户端仍在运行（PID {pid}），请先结束负载，再执行 make clean")
         executable = Path(command.split(None, 1)[0]).name.lower()
         if not executable.startswith("python"):
             continue
-        match = re.search(r"(?:^|\s)(\S*(?:scripts/(?:benchmark|cluster)\.py|tests/test_[^/\s]+\.py))(?:\s|$)", command)
+        # Absolute project paths may contain spaces. Match those before the
+        # token-based fallback for commands started from a relative path.
+        project_script = next((str(root / relative) for relative in (
+            "scripts/benchmark.py", "scripts/cluster.py", "baseline/compare.py")
+            if str(root / relative) in command), None)
+        if project_script:
+            suffix = command.split(project_script, 1)[1]
+            if project_script.endswith("cluster.py") and not re.search(r"\b(start|restart|load|probe)\b", suffix):
+                continue
+            raise ValueError(f"实验脚本仍在运行（PID {pid}），请先结束负载/benchmark/测试，再执行 make clean")
+        match = re.search(r"(?:^|\s)(\S*(?:scripts/(?:benchmark|cluster)\.py|baseline/compare\.py|tests/test_[^/\s]+\.py))(?:\s|$)", command)
         if not match:
             continue
         script = match.group(1)
-        if script.endswith("cluster.py") and not re.search(r"\b(start|load|probe)\b", command[match.end():]):
+        if script.endswith("cluster.py") and not re.search(r"\b(start|restart|load|probe)\b", command[match.end():]):
             continue
         # Absolute commands and relative commands from this checkout are both common.
         belongs_here = str(root) + os.sep in script
@@ -85,10 +95,10 @@ def manifests(directory):
 def stop_managed_runs(root):
     processes = process_commands()
     assert_no_writers(root, processes)
-    binary = str(root / "build/bin/arbor_node")
+    binaries = [str(root / "build/bin" / (method + "_node")) for method in c.METHODS]
     directories = [root / "runtime", root / "test-results"]
     active = {pid for pid, command in processes.items()
-              if command.startswith(binary + " node ") and any(
+              if any(command.startswith(binary + " node ") for binary in binaries) and any(
                   str(directory) + os.sep in command for directory in directories)}
     if not active:
         return
@@ -118,7 +128,7 @@ def stop_managed_runs(root):
     deadline = time.monotonic() + 3
     while active:
         remaining = process_commands()
-        active = {pid for pid in active if remaining.get(pid, "").startswith(binary + " node ")}
+        active = {pid for pid in active if any(remaining.get(pid, "").startswith(binary + " node ") for binary in binaries)}
         if not active:
             break
         if time.monotonic() >= deadline:
@@ -170,7 +180,7 @@ def clean():
                     remove(path)
         for name in ("build", "test-results", "__pycache__"):
             remove(root / name)
-        for name in ("scripts", "tests"):
+        for name in ("scripts", "tests", "baseline"):
             remove_caches(root / name)
         for pattern in ("*.pyc", "*.pyo"):
             for path in root.glob(pattern):
