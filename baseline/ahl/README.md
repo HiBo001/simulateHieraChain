@@ -46,17 +46,18 @@ python3 -B baseline/compare.py --baseline ahl \
   --timeout 120 --drain-timeout 60
 ```
 
-10000 笔全跨片交易，其中 90% 跨两个叶子、10% 跨三个叶子：
+带访问局部性的 10000 笔全跨片交易，其中 90% 跨两个叶子、10% 跨三个叶子，只有 5% 跨 cluster：
 
 ```bash
 python3 -B baseline/compare_mixed.py --baseline ahl \
-  --config config/three_layer_cross100.json \
-  --baseline-config config/ahl_two_layer.json \
+  --config config/three_layer_locality.json \
+  --baseline-config config/ahl_two_layer_locality.json \
   --count 10000 --rate 5000 --batch 10 --repeat 3 --seed 42 \
+  --cross-cluster-ratio 0.05 --three-shard-ratio 0.10 \
   --timeout 180 --drain-timeout 60
 ```
 
-默认混合生成器选择 Arbor 配置中最小的三个叶子。此例的 `[1,2]`、`[1,3]`、`[2,3]` 各有 3000 笔，`[1,2,3]` 有 1000 笔，客户端请求顺序按种子打散。
+新参考树包含 `{1,2,8}`、`{3,4,9}` 两个 cluster，它们分别由直接父分片 5、6 定义。AHL 把六个叶子全部接到唯一上层 7，但负载的 cluster 标签仍来自 Arbor 参考树。不能按照 AHL 拓扑重新把六个叶子看成一个 cluster。此例同 cluster 两方/跨 cluster 两方/同 cluster 三方/跨 cluster 三方分别为 8550/450/950/50 笔，参与叶子和业务输入均与 Arbor 相同。
 
 两个对比入口自动构建、依次启动两个独立集群、发送同一份负载、等待副本收敛，然后停止集群，不需要提前手动 `start`。重复轮次交替先后顺序。`--config` 指定 Arbor 拓扑，`--baseline-config` 指定 AHL 拓扑；不会自动压平 Arbor 的配置。省略 `--baseline-config` 会让双方使用同一份配置，多层配置因此不能用于启动 AHL。
 
@@ -70,9 +71,11 @@ python3 -B baseline/compare_mixed.py --baseline ahl \
   --repeat 3 --timeout 180 --drain-timeout 60
 ```
 
-`--workload` 与 `--count/--rate/--batch/--seed` 互斥。文件中跨片请求的 `target` 保留 Arbor 原始 NCA；AHL 客户端在签名前改成自己的唯一上层分片。交易 ID、请求 ID、参与叶子、key、value、请求分组、发送速率和顺序不改变，原始文件不被改写。这个路由目标变化是双拓扑比较的必要差异，会在比较报告中说明。
+`--workload` 与生成参数互斥。文件中跨片请求的 `target` 保留 Arbor 原始 NCA；AHL 客户端在签名前改成自己的唯一上层分片。交易 ID、请求 ID、参与叶子、key、value、请求分组、发送速率和顺序不改变，原始文件不被改写。这个路由目标变化是双拓扑比较的必要差异，会在比较报告中说明。
 
-结果保存到 `test-results/compare-*`，包含同一份 workload、两份配置快照及其差异、各轮客户端结果、全部节点状态，以及 `summary.json`、`summary.csv`、`summary.md`。入口要求双方叶子 ID、四副本配置、host、完整共识参数、执行参数、片内延时和 trace 设置一致；共同分片间的有效单向延时也必须相同。父关系、中间分片数量和端口可以不同。拓扑、协调者分布和进程数量是本次架构比较的变量：示例 Arbor 有 7 个分片、28 个节点进程，AHL 有 5 个分片、20 个节点进程。
+结果保存到 `test-results/compare-*`，包含同一份 workload、两份配置快照及其差异、各轮客户端结果、全部节点状态，以及 `summary.json`、`summary.csv`、`summary.md`。入口要求双方叶子 ID、四副本配置、host、完整共识参数、执行参数、片内延时和 trace 设置一致；共同分片间的有效单向延时也必须相同。父关系、中间分片数量和端口可以不同。拓扑、协调者分布和进程数量是本次架构比较的变量：新局部性配置中 Arbor 有 9 个分片、36 个节点进程，AHL 有 7 个分片、28 个节点进程；原四叶示例仍为 7 片/28 节点与 5 片/20 节点。
+
+同时比较 Arbor、Saguaro、SharPer、AHL 可用 `baseline/compare_all.py --config config/three_layer_locality.json --ahl-config config/ahl_two_layer_locality.json`。它一次生成共享负载，按参考树分类并重放到四种方法，不需要为 AHL 单独生成负载。完整参数、比例和生成命令见 [../../docs/WORKLOAD_LOCALITY.md](../../docs/WORKLOAD_LOCALITY.md)。
 
 只有双方全部交易完整完成、执行计数正确、四副本状态收敛且队列和锁排空的轮次才计算 TPS 比值；任何失败轮次都会让该组比值留空。TPS 以客户端确认的唯一交易计数，平均及 p50/p95/p99 延时单位均为秒。一次短测只用于验证接口与完整性，正式实验请保留三轮以上重复和机器信息。
 

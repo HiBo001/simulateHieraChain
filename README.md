@@ -86,18 +86,38 @@ python3 -B baseline/compare.py --baseline sharper --config config/two_layer.json
   --repeat 3 --seed 42 --timeout 120 --drain-timeout 60
 ```
 
-自动生成同一份 90% 双片 / 10% 三片负载并比较：
+自动生成带访问局部性的同一份混合负载并比较：90% 双片 / 10% 三片，全部跨片交易中仅 5% 跨 cluster：
 
 ```bash
 python3 -B baseline/compare_mixed.py --baseline sharper \
-  --config config/three_layer_cross100.json \
+  --config config/three_layer_locality.json \
   --count 10000 --rate 5000 --batch 10 --repeat 3 --seed 42 \
+  --cross-cluster-ratio 0.05 --three-shard-ratio 0.10 \
   --timeout 180 --drain-timeout 60
 ```
 
-已有混合 JSON 用 `--workload 路径` 替代生成参数 `--count/--rate/--batch/--seed`。两种方法使用同一实际负载和配置，顺序启动独立集群，重复轮次交替顺序，完整通过客户端完成、全部副本收敛与队列排空检查后才提供 TPS 比值。`--baseline saguaro` 也可使用混合对比入口。
+已有混合 JSON 用 `--workload 路径` 替代生成参数。两种方法使用同一实际负载和配置，顺序启动独立集群，重复轮次交替顺序，完整通过客户端完成、全部副本收敛与队列排空检查后才提供 TPS 比值。`--baseline saguaro` 也可使用混合对比入口。
 
 单独构建用 `make sharper`，单独启动用 `python3 -B scripts/cluster.py start --method sharper`，验证用 `make test-sharper`。协议、统计字段及实现范围见 [baseline/sharper/README.md](baseline/sharper/README.md)。
+
+## 带访问局部性的四方法测试
+
+cluster 由 Arbor 参考树中叶子的直接父分片定义。新配置 `three_layer_locality.json` 的两个 cluster 是 `{1,2,8}` 和 `{3,4,9}`，每组至少三个叶子，因而可以同时保持 90% 两方 / 10% 三方，以及只有 5% 跨 cluster。10000 笔全跨片负载中，同 cluster 两方 8550 笔、跨 cluster 两方 450 笔、同 cluster 三方 950 笔、跨 cluster 三方 50 笔。5% 的分母是所有跨片交易。
+
+一条命令比较 Arbor、Saguaro、SharPer、AHL，不需要事先启动集群：
+
+```bash
+python3 -B baseline/compare_all.py \
+  --config config/three_layer_locality.json \
+  --ahl-config config/ahl_two_layer_locality.json \
+  --count 10000 --rate 5000 --batch 10 --seed 42 \
+  --cross-cluster-ratio 0.05 --three-shard-ratio 0.10 \
+  --repeat 3 --timeout 180 --drain-timeout 60
+```
+
+四种方法顺序运行同一份未签名 workload，交易 ID、参与叶子、读写输入、请求分组、顺序及发送速率相同。SharPer 的 cluster 只是负载分类；AHL 展平为两层后仍使用 Arbor 的原 cluster 标签，不能重新把六个叶子归成一个 cluster。Arbor/Saguaro/SharPer 使用 9 片/36 个副本进程，AHL 使用 7 片/28 个；此比较包含架构和进程数量差异。
+
+单独生成可重放的负载，以及参数和分类口径，见 [docs/WORKLOAD_LOCALITY.md](docs/WORKLOAD_LOCALITY.md)。旧配置和已存在的 workload 保留，可继续用 `--workload` 重放。
 
 ## 配置分片与拓扑
 
@@ -314,10 +334,11 @@ Arbor 保留多层、AHL 使用两层时，明确提供两份配置；相同叶�
 
 ```bash
 python3 -B baseline/compare_mixed.py --baseline ahl \
-  --config config/three_layer_cross100.json \
-  --baseline-config config/ahl_two_layer.json \
+  --config config/three_layer_locality.json \
+  --baseline-config config/ahl_two_layer_locality.json \
   --count 10000 --rate 5000 --batch 10 --repeat 3 --seed 42 \
+  --cross-cluster-ratio 0.05 --three-shard-ratio 0.10 \
   --timeout 180 --drain-timeout 60
 ```
 
-此比较包含拓扑和节点数差异：示例中 Arbor 为 7 片/28 节点，AHL 为 5 片/20 节点。结果保存两份配置、共同负载 SHA256、完成 TPS 与秒制延时，失败轮次不算成功比值。固定参与分片也可用 `baseline/compare.py --baseline ahl --baseline-config ...`。具体流程与测试说明见 [baseline/ahl/README.md](baseline/ahl/README.md)、[baseline/ahl/DESIGN.md](baseline/ahl/DESIGN.md)；执行 `make test-ahl` 运行 AHL 回归。
+此局部性比较中 Arbor 为 9 片/36 节点，AHL 为 7 片/28 节点。结果保存两份配置、共同负载 SHA256、完成 TPS 与秒制延时，失败轮次不算成功比值。固定参与分片也可用 `baseline/compare.py --baseline ahl --baseline-config ...`。具体流程与测试说明见 [baseline/ahl/README.md](baseline/ahl/README.md)、[baseline/ahl/DESIGN.md](baseline/ahl/DESIGN.md)；执行 `make test-ahl` 运行 AHL 回归。

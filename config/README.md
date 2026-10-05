@@ -27,3 +27,27 @@
 `--method ahl` 强制所有非根分片为根的直接子片、至少两个叶子。需要其他数量或 ID 时可编辑或新增该目录内的 JSON；`two_layer.json` 也能用于两叶子的 AHL。原 Arbor/Saguaro/SharPer 拓扑校验规则保持原样。
 
 与 Arbor 多层比较时使用 `--config config/three_layer_cross100.json --baseline-config config/ahl_two_layer.json --baseline ahl`，不会静默把 Arbor 的拓扑压平；每轮运行目录仍归入 runtime/test-results，不放入 config。
+
+## 访问局部性测试配置
+
+`three_layer_locality.json` 保留原三层树的父关系，增加叶子 8、9，使两个 cluster 都包含三个叶子：
+
+```text
+7
+├── 5
+│   ├── 1
+│   ├── 2
+│   └── 8
+└── 6
+    ├── 3
+    ├── 4
+    └── 9
+```
+
+cluster 按叶子的直接父节点定义，故为 `{1,2,8}` 与 `{3,4,9}`。根 7 协调跨 cluster 交易；各 cluster 内的跨片交易分别由 5、6 协调。新拓扑共有 9 个分片、36 个 PBFT 副本进程，与 Euro-Par 论文实验中的两个三叶 cluster 结构一致。
+
+`ahl_two_layer_locality.json` 保留相同六个叶子，将它们全部直接接到唯一上层 7，删除中间片 5、6；共有 7 个分片、28 个副本进程。AHL 的负载仍由上述 Arbor 参考树生成，不能根据展平后的拓扑重新分类 cluster。SharPer 使用相同的参考配置来启动节点和配置网络，但祖先片不参与跨片共识。
+
+两份新配置均保留旧 `three_layer_cross100.json` 的完整共识、执行及既有分片对延时：片内 1 ms，默认片间 20 ms，1↔2/3↔4 为 10 ms，1↔3 为 50 ms。新增同 cluster 的 1↔8、2↔8、3↔9、4↔9 为 10 ms，叶子 8↔5、9↔6 为 5 ms。AHL 删除与 5、6 相关的链路，共同保留分片之间的实际延时仍一致。base_port 分别为 19800、20000；比较脚本启动独立运行目录并管理测试端口。
+
+默认混合负载为 100% 跨片、90% 两方/10% 三方，其中只有 5% 跨 cluster。负载生成和四方法对比说明见 [../docs/WORKLOAD_LOCALITY.md](../docs/WORKLOAD_LOCALITY.md)。旧四叶配置保留供固定参与方测试和既有 workload 重放；在旧配置自动生成前三叶均匀 90/10 模式时应加 `--uniform`。

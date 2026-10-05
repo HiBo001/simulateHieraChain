@@ -153,7 +153,7 @@ class ExactWorkload(unittest.TestCase):
 
     def test_partial_comparison_report_cannot_claim_pass(self):
         arbor, saguaro = result("arbor"), result("saguaro")
-        report = dict(expected_pairs=1, cases=[arbor], method_comparisons=[])
+        report = dict(expected_pairs=1, cases=[arbor], method_comparisons=[], aggregates=[])
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(b, "save_report"):
             comparison.save(Path(folder), report)
             self.assertEqual(report["status"], "INCOMPLETE")
@@ -187,6 +187,67 @@ class ExactWorkload(unittest.TestCase):
         # Arbor round-close counters do not impose extra baseline work.
         rows[-1].update(rounds_requested=9, cst_round=0)
         self.assertTrue(b.settled(case_saguaro, self.cfg, rows))
+
+
+class InterruptedComparisonReports(unittest.TestCase):
+    def make_report(self, repeats, expected_pairs):
+        rows, pairs = [], []
+        for repeat in range(1, repeats + 1):
+            current = []
+            for method in ("arbor", "saguaro"):
+                row = dict(result(method), repeat=repeat, node_metrics={}, failure_reasons=[])
+                rows.append(row)
+                current.append(row)
+            pairs.append(comparison.paired_comparison(*current))
+        return dict(baseline="saguaro", expected_pairs=expected_pairs, cases=rows,
+                    method_comparisons=pairs, comparisons=[])
+
+    def test_interrupted_repeat_set_has_no_aggregate_or_paired_medians(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            report = self.make_report(1, 3)
+            comparison.save(folder, report)
+            saved = c.read(folder / "summary.json")
+            self.assertEqual(saved["status"], "INCOMPLETE")
+            self.assertEqual([row["status"] for row in saved["cases"]], ["PASS", "PASS"])
+            for aggregate in saved["aggregates"]:
+                self.assertEqual(aggregate["status"], "INCOMPLETE")
+                for metric in b.METRICS:
+                    self.assertIsNone(aggregate["median_" + metric])
+            for pair in saved["paired_aggregates"]:
+                self.assertFalse(pair["comparable"])
+                self.assertFalse(any(key.startswith(("median_", "arbor_over_")) for key in pair))
+            self.assertIn("INCOMPLETE", (folder / "summary.md").read_text())
+            self.assertNotIn("100.00", (folder / "summary.md").read_text())
+
+    def test_completed_repeat_set_preserves_final_pass_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            report = self.make_report(2, 2)
+            comparison.save(folder, report)
+            saved = c.read(folder / "summary.json")
+            self.assertEqual(saved["status"], "PASS")
+            self.assertEqual(saved["paired_aggregates"][0]["arbor_over_saguaro_tps"], 2)
+            metrics = {row["method"]: row for row in saved["aggregates"]}
+            self.assertEqual(metrics["arbor"]["median_completed_tps"], 100)
+            self.assertEqual(metrics["saguaro"]["median_completed_tps"], 50)
+
+    def test_failed_completed_repeat_set_keeps_failure_and_blank_ratio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            report = self.make_report(2, 2)
+            failed = report["cases"][-1]
+            failed.update(status="FAIL", failure_reasons=["waiting locks"])
+            failed.update({metric: None for metric in b.METRICS})
+            report["method_comparisons"][-1] = comparison.paired_comparison(report["cases"][-2], failed)
+            comparison.save(folder, report)
+            saved = c.read(folder / "summary.json")
+            self.assertEqual(saved["status"], "FAIL")
+            aggregate = next(row for row in saved["aggregates"] if row["method"] == "saguaro")
+            self.assertEqual(aggregate["status"], "FAIL")
+            self.assertIsNone(aggregate["median_completed_tps"])
+            self.assertFalse(saved["paired_aggregates"][0]["comparable"])
+            self.assertNotIn("arbor_over_saguaro_tps", saved["paired_aggregates"][0])
 
 
 if __name__ == "__main__":

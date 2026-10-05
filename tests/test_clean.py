@@ -295,6 +295,31 @@ class CleanTests(unittest.TestCase):
                 self.assertTrue(self.binary.exists())
         self.stop.assert_not_called()
 
+    def test_locality_generator_and_four_method_benchmark_block_cleanup(self):
+        self.make_outputs()
+        self.cwd.return_value = self.root
+        for script in ("baseline/compare_all.py", "scripts/generate_mixed_workload.py"):
+            for invocation in (str(self.root / script), script):
+                with self.subTest(script=invocation):
+                    self.processes.return_value = {910019: f"python3 {invocation} --count 10000"}
+                    with self.assertRaisesRegex(ValueError, "实验脚本"):
+                        self.run_clean()
+                    self.assertTrue(self.binary.exists())
+                    self.assertTrue((self.root / "test-results/benchmark-old/summary.json").exists())
+        self.stop.assert_not_called()
+
+    def test_new_relative_writers_from_another_checkout_do_not_block_cleanup(self):
+        self.make_outputs()
+        other = self.temp / "another-checkout"
+        other.mkdir()
+        self.cwd.return_value = other
+        self.processes.return_value = {
+            910020: "python3 baseline/compare_all.py --count 10000",
+            910021: "python3 scripts/generate_mixed_workload.py --count 10000"}
+        self.run_clean()
+        self.stop.assert_not_called()
+        self.assert_saved()
+
     def test_read_only_cluster_commands_do_not_block_cleanup(self):
         self.make_outputs()
         self.cwd.return_value = self.root

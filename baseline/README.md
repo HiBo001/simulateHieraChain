@@ -102,12 +102,13 @@ python3 -B baseline/compare.py --baseline sharper \
   --timeout 120 --drain-timeout 60
 ```
 
-生成并比较 10000 笔、90% 双片 / 10% 三片的混合负载：
+生成并比较 10000 笔带局部性的混合负载，90% 双片 / 10% 三片、只有 5% 跨 cluster：
 
 ```bash
 python3 -B baseline/compare_mixed.py --baseline sharper \
-  --config config/three_layer_cross100.json \
+  --config config/three_layer_locality.json \
   --count 10000 --rate 5000 --batch 10 --repeat 3 --seed 42 \
+  --cross-cluster-ratio 0.05 --three-shard-ratio 0.10 \
   --timeout 180 --drain-timeout 60
 ```
 
@@ -125,9 +126,10 @@ Arbor 保留多层，AHL 用同叶子的两层配置：
 
 ```bash
 python3 -B baseline/compare_mixed.py --baseline ahl \
-  --config config/three_layer_cross100.json \
-  --baseline-config config/ahl_two_layer.json \
+  --config config/three_layer_locality.json \
+  --baseline-config config/ahl_two_layer_locality.json \
   --count 10000 --rate 5000 --batch 10 --repeat 3 --seed 42 \
+  --cross-cluster-ratio 0.05 --three-shard-ratio 0.10 \
   --timeout 180 --drain-timeout 60
 ```
 
@@ -149,3 +151,20 @@ python3 -B baseline/compare.py --baseline ahl \
 make ahl
 make test-ahl
 ```
+
+## 四方法共用访问局部性负载
+
+默认混合生成器使用参考树的全部叶子，按直接父分片划分 cluster。`three_layer_locality.json` 扩展为两个三叶 cluster：5 下的 `{1,2,8}` 和 6 下的 `{3,4,9}`；AHL 的 `ahl_two_layer_locality.json` 将这六个叶子接到唯一上层 7。10000 笔中，同 cluster 两方/跨 cluster 两方/同 cluster 三方/跨 cluster 三方分别为 8550/450/950/50 笔。分母始终是业务交易数，不能用请求数替代；客户端 `--batch` 不改变这些比例。
+
+```bash
+python3 -B baseline/compare_all.py \
+  --config config/three_layer_locality.json \
+  --ahl-config config/ahl_two_layer_locality.json \
+  --count 10000 --rate 5000 --batch 10 --seed 42 \
+  --cross-cluster-ratio 0.05 --three-shard-ratio 0.10 \
+  --repeat 3 --timeout 180 --drain-timeout 60
+```
+
+此入口只生成一次共享 workload，四种方法依次运行它；每轮使用新的集群和密钥。SharPer 不增加协调者，AHL 不改变参与叶子及其访问量，两种方法都沿用 Arbor 参考树的 cluster 分类，而不是按自身拓扑重新生成业务。每种方法仍通过完整执行、所有副本收敛和协议队列排空检查后才记录成功性能；失败轮次保留诊断结果。
+
+单独生成用 `scripts/generate_mixed_workload.py`，各入口可通过 `--workload` 复用该文件。`--cross-cluster-ratio 1` 表示所有交易跨 cluster；恢复旧前三叶均匀 90/10 模式应显式选择旧配置并加 `--uniform`，该选项与 `--cross-cluster-ratio` 互斥。完整使用方法见 [../docs/WORKLOAD_LOCALITY.md](../docs/WORKLOAD_LOCALITY.md)。

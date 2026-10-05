@@ -116,6 +116,12 @@ class Replica {
 #ifdef ARBOR_SHARPER_TESTS
     friend struct SharPerProtocolTest;
 #endif
+#ifdef ARBOR_BATCHING_TESTS
+    friend struct ArborBatchingTest;
+#endif
+#ifdef ARBOR_PBFT_RECOVERY_TESTS
+    friend struct PbftRecoveryTest;
+#endif
     struct Slot {
         json proposal;
         std::map<int,json> prepares,commits;
@@ -139,6 +145,37 @@ class Replica {
     json stableProof=json::array(), stableState;
     json state=genesis();
     std::map<std::string,json> pending;
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+    struct ArborPendingMetadata {
+        std::string group;
+        std::vector<std::pair<std::string,std::string>> transactions;
+        Clock::time_point queued;
+    };
+    struct ArborBatchCandidate {
+        json requests=json::array();
+        std::map<std::string,std::string> selectedIds;
+        int count=0;
+        bool capacityBlocked=false;
+        Clock::time_point oldest=Clock::time_point::max();
+    };
+    std::map<std::string,ArborPendingMetadata> arborPendingMetadata;
+    std::map<std::string,ArborBatchCandidate> arborBatchCandidates;
+    bool arborBatchSelectionDirty=true;
+    int arborBatchSelectionApplied=-1;
+    std::string arborLastBatchGroup,arborBatchGroup;
+    json arborNoBatch=nullptr;
+    uint64_t arborBatchSelectionRebuilds=0,arborPendingDigestComputations=0;
+    struct ArborFutureProposal {
+        json envelope;
+        size_t bytes=0;
+        int lastAttemptApplied=-1;
+        Clock::time_point lastAttemptTime=Clock::time_point::min();
+    };
+    static constexpr size_t ARBOR_FUTURE_PROPOSAL_BYTE_LIMIT=detail::MAX_NETWORK_FRAME;
+    std::map<int,ArborFutureProposal> arborFutureProposals;
+    size_t arborFutureProposalBytes=0;
+    uint64_t arborFutureProposalRetries=0;
+#endif
     // CLIENT envelopes remain signed and intact. Overlapping requests wait for
     // the first owner's result rather than launching concurrent consensus.
     std::map<std::string,json> deferredRequests, completedTxResults;
@@ -181,6 +218,10 @@ class Replica {
     int timeoutMs, batchSize, crossShardBatchSize, crossShardBatchWaitMs, checkpointEvery;
     uint64_t expectedFib=0;
     json myViewChange, lastNewView;
+    mutable uint64_t pbftVcValidations=0;
+    uint64_t pbftVcExactReplays=0, pbftNewViewBuilds=0, pbftNewViewRetries=0;
+    Clock::time_point pbftLastNewViewRetry=Clock::time_point{};
+    std::map<int,std::map<int,std::string>> pbftVcFingerprints;
     int window=64;
     json make(std::string type,json fields=json::object(),int v=-1) {
         fields["type"]=type; fields["run"]=members.run; fields["shard"]=shard;
@@ -695,6 +736,7 @@ class Replica {
 #endif
     }
     bool validVC(const json& e,int v) const {
+        ++pbftVcValidations;
         try {
             const auto& b=e.at("body");
             if(!members.replicaMessage(e) || b.at("shard")!=shard || b.at("type")!="VIEW_CHANGE" || b.at("view")!=v || !validStable(b.at("stable"))) return false;
@@ -733,9 +775,16 @@ class Replica {
         for(int n=h+1;n<=high;++n) values[n]=selected.count(n)?selected.at(n).at("proposal").at("body").at("value"):json{{"requests",json::array()}};
         return {best,values};
     }
+    void prunePbftVcFingerprints() {
+        int low=std::max(view+1,targetView);
+        for(auto it=pbftVcFingerprints.begin();it!=pbftVcFingerprints.end();)
+            it=it->first<low || static_cast<int64_t>(it->first)>=static_cast<int64_t>(low)+64 ?
+                pbftVcFingerprints.erase(it):std::next(it);
+    }
     void startViewChange(int v) {
         if(v<=view || v<targetView) return;
         targetView=v; changing=true;
+        prunePbftVcFingerprints();
         json ps=json::array();
         for(const auto& [n,p]:preparedHistory) if(n>stableSeq) ps.push_back(p);
         myViewChange=make("VIEW_CHANGE",{{"stable",{{"seq",stableSeq},{"state",stableState},{"proof",stableProof}}},{"prepared",ps}},v);
@@ -748,6 +797,9 @@ class Replica {
     }
     void maybeNewView(int v) {
         if(v%4!=me || v<targetView || v<=view || viewChanges[v].size()<3) return;
+        // Freeze this target view's first canonical recovery selection. More
+        // VC arrivals cannot replace it while its local delivery is queued.
+        if(!lastNewView.is_null() && lastNewView.at("body").at("view")==v) return;
         json vcs=json::array();
         // Include this primary's own proof, as required by PBFT.
         if(!viewChanges[v].count(me)) { if(v>targetView || !changing) startViewChange(v); return; }
@@ -757,7 +809,16 @@ class Replica {
         json proposals=json::array();
         for(const auto& [n,value]:values) proposals.push_back(make("PREPREPARE",{{"seq",n},{"digest",hash(value.dump())},{"value",value}},v));
         lastNewView=make("NEW_VIEW",{{"changes",vcs},{"proposals",proposals}},v);
-        broadcast(lastNewView);
+        ++pbftNewViewBuilds;pbftLastNewViewRetry=Clock::now();broadcast(lastNewView);
+    }
+    void retryPbftNewView(Clock::time_point now) {
+        if(lastNewView.is_null()) return;
+        const auto& b=lastNewView.at("body");int v=b.at("view");
+        // The same immutable candidate is retried both before and after its
+        // local installation. Advancing the target supersedes an older one.
+        if(b.at("shard")!=shard || b.at("from")!=me || v%4!=me || v!=targetView || v<view ||
+           std::chrono::duration_cast<std::chrono::milliseconds>(now-pbftLastNewViewRetry).count()<250) return;
+        pbftLastNewViewRetry=now;++pbftNewViewRetries;broadcast(lastNewView);
     }
     void installStable(const json& s) {
         int h=s.at("seq"); if(h<stableSeq) return;
@@ -818,11 +879,19 @@ class Replica {
                     proof.at("proposal").at("body").at("digest"))) throw std::runtime_error("conflicting new-view commit evidence");
             committed.emplace(n,proof);
         }
+#ifdef ARBOR_SHARPER
+        if(!sharperSafeNewView(values,checkpoint.at("seq"))) throw std::runtime_error("new view omits SharPer local commit evidence");
+#endif
         installStable(checkpoint); slots.clear();
         for(const auto& [n,proof]:committed) if(n>applied) {certificates.emplace(n,proof);preparedHistory[n]=proof;}
         view=v; targetView=v; changing=false; viewCount++; lastProgress=Clock::now(); lastNewView=e;
+        pbftLastNewViewRetry=Clock::now();
+        prunePbftVcFingerprints();
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        pruneArborFutureProposals();
+#endif
 #ifdef ARBOR_SHARPER
-        sharperInstallRecovery(b.at("changes"));
+        sharperInstallRecovery(b.at("changes"),values);
 #endif
         lastForwardHeartbeat=Clock::now();
         for(auto i=viewChanges.begin();i!=viewChanges.end();) i=i->first<=v?viewChanges.erase(i):std::next(i);
@@ -838,6 +907,49 @@ class Replica {
             broadcast(make("SYNC",fields));
         }
     }
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+    void eraseArborFutureProposal(int n) {
+        auto it=arborFutureProposals.find(n);if(it==arborFutureProposals.end()) return;
+        arborFutureProposalBytes-=it->second.bytes;arborFutureProposals.erase(it);
+    }
+    void pruneArborFutureProposals() {
+        for(auto it=arborFutureProposals.begin();it!=arborFutureProposals.end();) {
+            int n=it->first;
+            if(n<=applied || n>stableSeq+window || it->second.envelope.at("body").at("view")!=view ||
+               (slots.count(n) && !slots.at(n).proposal.is_null())) {
+                ++it;eraseArborFutureProposal(n);
+            } else ++it;
+        }
+    }
+    // Called only after validSignedProposal has authenticated this immutable
+    // envelope. A cache entry is not a PBFT slot and never grants a vote.
+    void cacheArborFutureProposal(const json& e,bool valueAttempted) {
+        int n=e.at("body").at("seq");
+        auto existing=arborFutureProposals.find(n);
+        if(existing!=arborFutureProposals.end()) return; // Do not reset retry pacing.
+        size_t bytes=e.dump().size();
+        if(arborFutureProposals.size()>=size_t(window) ||
+           bytes>ARBOR_FUTURE_PROPOSAL_BYTE_LIMIT-arborFutureProposalBytes) {
+            ++rejected;log("future_preprepare_cache_full",{{"seq",n},{"frame_bytes",bytes}});return;
+        }
+        ArborFutureProposal cached;cached.envelope=e;cached.bytes=bytes;
+        if(valueAttempted) {cached.lastAttemptApplied=applied;cached.lastAttemptTime=Clock::now();}
+        arborFutureProposals.emplace(n,std::move(cached));arborFutureProposalBytes+=bytes;
+        log("future_preprepare_cached",{{"seq",n},{"digest",e.at("body").at("digest")},{"frame_bytes",bytes}});
+    }
+    void retryArborFutureProposals(Clock::time_point now) {
+        pruneArborFutureProposals();
+        if(changing) return;
+        auto it=arborFutureProposals.find(applied+1);if(it==arborFutureProposals.end()) return;
+        auto& cached=it->second;
+        if(cached.lastAttemptApplied==applied &&
+           std::chrono::duration_cast<std::chrono::milliseconds>(now-cached.lastAttemptTime).count()<100) return;
+        cached.lastAttemptApplied=applied;cached.lastAttemptTime=now;++arborFutureProposalRetries;
+        // Copy before acceptProposal can remove the cache or apply a complete
+        // certificate. State and authentication are checked by the normal path.
+        const auto envelope=cached.envelope;acceptProposal(envelope);
+    }
+#endif
     void acceptProposal(const json& e,bool recovered=false) {
 #ifdef ARBOR_SHARPER
         if(sharperCrossValue(e.at("body").at("value"))) {sharperAcceptAssignment(e,recovered);return;}
@@ -853,11 +965,29 @@ class Replica {
             if(existing->second.proposal.at("body").at("digest")!=b.at("digest")) rejected++;
             return;
         }
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        if(!validSignedProposal(e)) return;
+        pruneArborFutureProposals();
+        if(!recovered) {
+            auto remembered=arborFutureProposals.find(n);
+            if(remembered!=arborFutureProposals.end() &&
+               remembered->second.envelope.at("body").at("digest")!=b.at("digest")) {++rejected;return;}
+            // A future sequence is retained without PREPARE until its complete
+            // execution prefix exists. This does not enable an execution pipeline.
+            if(n>applied+1) {cacheArborFutureProposal(e,false);return;}
+            if(!validValue(b.at("value"))) {
+                cacheArborFutureProposal(e,true);
+                log("invalid_preprepare_value",{{"seq",n},{"digest",b.at("digest")}});return;
+            }
+        }
+        eraseArborFutureProposal(n);
+#else
         if(!(recovered?validSignedProposal(e):validProposal(e))) {
             if(!recovered && validSignedProposal(e))
                 log("invalid_preprepare_value",{{"seq",n},{"digest",b.at("digest")}});
             return;
         }
+#endif
         auto& s=slots[n];
         // A committed sequence may be replayed in a new view, never replaced.
         if(certificates.count(n) && certificates[n].at("proposal").at("body").at("digest")!=b.at("digest")) throw std::runtime_error("conflicting committed sequence");
@@ -880,6 +1010,7 @@ class Replica {
         auto proof=preparedProof(s); const auto& b=s.proposal.at("body");
         if(!s.prepared && proof.at("prepares").size()>=2) {
             s.prepared=true; preparedHistory[n]=proof;
+            if(!changing && b.at("view")==view && n==applied+1) lastProgress=Clock::now();
             if(!s.commitSent) { s.commitSent=true; broadcast(make("COMMIT",{{"seq",n},{"digest",b.at("digest")}})); }
             log("prepared",{{"seq",n},{"digest",b.at("digest")}});
         }
@@ -939,7 +1070,91 @@ class Replica {
             }
         }
         pending.erase(it);
+#ifdef ARBOR_SHARPER
+        shPendingRemoved(rid);
+#endif
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        arborPendingMetadata.erase(rid);arborBatchSelectionDirty=true;
+#endif
     }
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+    void arborPendingAdded(const std::string& rid,const json& request,Clock::time_point queued=Clock::now()) {
+        ArborPendingMetadata metadata;metadata.group=participantGroup(request);metadata.queued=queued;
+        for(const auto& tx:request.at("body").at("txs")) {
+            metadata.transactions.emplace_back(tx.at("id").get<std::string>(),hash(tx.dump()));
+            ++arborPendingDigestComputations;
+        }
+        arborPendingMetadata[rid]=std::move(metadata);arborBatchSelectionDirty=true;
+    }
+    void rebuildArborBatchCandidates() {
+        if(!arborBatchSelectionDirty && arborBatchSelectionApplied==applied) return;
+        ++arborBatchSelectionRebuilds;arborBatchCandidates.clear();
+        std::vector<std::pair<Clock::time_point,std::string>> arrivalOrder;
+        for(auto it=pending.begin();it!=pending.end();) {
+            const auto rid=it->first;
+            if(state.at("requests").contains(rid)) {
+                if(completedCstResults.count(rid)) reply(it->second,completedCstResults.at(rid));
+                ++it;erasePending(rid);continue;
+            }
+            if(!arborPendingMetadata.count(rid)) arborPendingAdded(rid,it->second);
+            arrivalOrder.emplace_back(arborPendingMetadata.at(rid).queued,rid);
+            ++it;
+        }
+        // A client's lexicographic ID carries no scheduling priority. Sort
+        // only when pending/state changes; equal arrival times use a stable ID.
+        std::sort(arrivalOrder.begin(),arrivalOrder.end());
+        for(const auto& [queued,rid]:arrivalOrder) {
+            (void)queued;auto it=pending.find(rid);
+            const auto& metadata=arborPendingMetadata.at(rid);
+            auto& candidate=arborBatchCandidates[metadata.group];
+            int size=it->second.at("body").at("txs").size();
+            bool conflict=false,overlap=false;
+            for(const auto& [id,digest]:metadata.transactions) {
+                if((state.at("seen").contains(id) && state.at("seen").at(id).at("tx_digest")!=digest) ||
+                   (candidate.selectedIds.count(id) && candidate.selectedIds.at(id)!=digest)) conflict=true;
+                if(candidate.selectedIds.count(id)) overlap=true;
+            }
+            if(conflict) {replyConflict(it->second);erasePending(rid);continue;}
+            if(overlap) continue;
+            // An eligible indivisible request can make the exact cap
+            // unreachable. Keep looking for smaller same-group requests,
+            // then flush the fitting requests without another timer wait.
+            if(candidate.count+size>crossShardBatchSize) {candidate.capacityBlocked=true;continue;}
+            for(const auto& [id,digest]:metadata.transactions) candidate.selectedIds[id]=digest;
+            candidate.requests.push_back(it->second);candidate.count+=size;
+            candidate.oldest=std::min(candidate.oldest,metadata.queued);
+        }
+        for(auto it=arborBatchCandidates.begin();it!=arborBatchCandidates.end();)
+            if(it->second.requests.empty()) it=arborBatchCandidates.erase(it);else ++it;
+        arborBatchSelectionApplied=applied;arborBatchSelectionDirty=false;
+    }
+    const json& selectArborClientBatch(Clock::time_point now) {
+        rebuildArborBatchCandidates();arborBatchGroup.clear();
+        if(arborBatchCandidates.empty()) return arborNoBatch;
+        auto it=arborBatchCandidates.upper_bound(arborLastBatchGroup);
+        if(it==arborBatchCandidates.end()) it=arborBatchCandidates.begin();
+        for(size_t checked=0;checked<arborBatchCandidates.size();++checked) {
+            const auto& candidate=it->second;
+            if(candidate.count==crossShardBatchSize || candidate.capacityBlocked ||
+               std::chrono::duration_cast<std::chrono::milliseconds>(now-candidate.oldest).count()>=crossShardBatchWaitMs) {
+                arborBatchGroup=it->first;return candidate.requests;
+            }
+            if(++it==arborBatchCandidates.end()) it=arborBatchCandidates.begin();
+        }
+        return arborNoBatch;
+    }
+    void maybeRequestArborRound(Clock::time_point now) {
+        // A partial local business group must not manufacture empty rounds
+        // while waiting. CST_ROUND_REQUEST raises desiredRound independently.
+        // Admission can keep changing pending while consensus is in flight;
+        // defer rebuilding candidates until another fresh proposal is possible.
+        if(changing || me!=view%4 ||
+           (slots.count(applied+1) && !slots.at(applied+1).proposal.is_null()) || certificates.count(applied+1)) return;
+        if(isCoordinator() && members.multiLayer() && !pending.empty() && outstandingOrders.size()<8 &&
+           !selectArborClientBatch(now).is_null())
+            desiredRound=std::max(desiredRound,state.at("cst_round").get<int>()+1);
+    }
+#endif
     void deferRequest(const json& request) {
         auto rid=request.at("body").at("id").get<std::string>();
         if(!deferredRequests.emplace(rid,request).second) return;
@@ -960,10 +1175,26 @@ class Replica {
         // Re-admit whole signed requests against that restored state.
         dedupIndexRebuilds++;
         std::vector<json> requests;
+#ifdef ARBOR_SHARPER
+        // Preserve local arrival positions while restored state reclassifies
+        // requests. Deferred requests become new pending work only on admission.
+        for(const auto& [position,rid]:shArrivalOrder) {
+            (void)position;auto it=pending.find(rid);
+            if(it!=pending.end()) requests.push_back(it->second);
+        }
+        for(const auto& [rid,request]:pending) if(!shArrivalIndex.count(rid)) requests.push_back(request);
+#else
         for(const auto& [rid,request]:pending) {(void)rid;requests.push_back(request);}
+#endif
         for(const auto& [rid,request]:deferredRequests) {(void)rid;requests.push_back(request);}
         pending.clear();pendingTx.clear();deferredRequests.clear();deferredByTx.clear();changedTx.clear();
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        arborPendingMetadata.clear();arborBatchCandidates.clear();arborBatchSelectionDirty=true;
+#endif
         for(const auto& request:requests) handle(request);
+#ifdef ARBOR_SHARPER
+        shPruneArrivalOrder();
+#endif
     }
     void drainDeferred() {
         // Commit/completion releases owners and wakes only requests indexed by
@@ -1416,66 +1647,32 @@ class Replica {
         if(pending.empty() && pendingCst.empty() && !closeRound) return;
         bool crossShardOrder=isCoordinator() && !pending.empty() && !flowControlled;
         int proposalLimit=crossShardOrder?crossShardBatchSize:batchSize;
-        if(crossShardOrder && std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-batchStart).count()<crossShardBatchWaitMs) {
-            int available=0;
-            std::string group;
-            std::set<std::string> selected;
-            bool blocked=false;
-            for(const auto& [id,request]:pending) {
-                if(state["requests"].contains(id)) continue;
-                bool overlap=false,conflict=false;
-                for(const auto& tx:request.at("body").at("txs")) {
-                    auto tid=tx.at("id").get<std::string>();
-                    if(selected.count(tid)) overlap=true;
-                    if(state["seen"].contains(tid) && state["seen"].at(tid).at("tx_digest")!=hash(tx.dump())) conflict=true;
-                }
-                if(overlap || conflict) continue;
-                auto candidate=participantGroup(request);
-                int size=request.at("body").at("txs").size();
-                if((!group.empty() && group!=candidate) || available+size>proposalLimit) {
-                    blocked=available>0;break;
-                }
-                if(group.empty()) group=candidate;
-                for(const auto& tx:request.at("body").at("txs")) selected.insert(tx.at("id").get<std::string>());
-                available+=size;
-                if(available==proposalLimit) break;
-            }
-            // Complete signed requests cannot be split to fill spare capacity.
-            // Flush when the next eligible request cannot fit, even below the cap.
-            if(available<proposalLimit && !blocked) return;
-        }
         json reqs=json::array(); int count=0;
-        std::string group;
-        std::map<std::string,std::string> selectedIds;
-        for(auto it=pending.begin();it!=pending.end() && !flowControlled;) {
-            if(state["requests"].contains(it->first)) {
-                if(completedCstResults.count(it->first)) reply(it->second,completedCstResults.at(it->first));
-                else if(members.leaves.count(shard)) reply(it->second,state["requests"][it->first]["results"]);
-                auto rid=it->first;++it;erasePending(rid);continue;
-            }
-            int size=it->second.at("body").at("txs").size();
-            if(crossShardOrder) {
-                bool conflict=false;
-                for(const auto& tx:it->second.at("body").at("txs")) {
-                    auto id=tx.at("id").get<std::string>(),digest=hash(tx.dump());
-                    if((state["seen"].contains(id) && state["seen"].at(id).at("tx_digest")!=digest) ||
-                       (selectedIds.count(id) && selectedIds.at(id)!=digest)) conflict=true;
+        std::string proposedGroup;
+        if(crossShardOrder) {
+            const auto& selected=selectArborClientBatch(Clock::now());
+            if(!selected.is_null()) {reqs=selected;proposedGroup=arborBatchGroup;}
+            // Unrelated participant groups never force a short business batch.
+            // An externally requested round can still close with no requests.
+            else if(!closeRound) return;
+        } else {
+            std::set<std::string> selectedIds;
+            for(auto it=pending.begin();it!=pending.end() && !flowControlled;) {
+                if(state["requests"].contains(it->first)) {
+                    if(completedCstResults.count(it->first)) reply(it->second,completedCstResults.at(it->first));
+                    else if(members.leaves.count(shard)) reply(it->second,state["requests"][it->first]["results"]);
+                    auto rid=it->first;++it;erasePending(rid);continue;
                 }
-                if(conflict) {replyConflict(it->second);auto rid=it->first;++it;erasePending(rid);continue;}
+                int size=it->second.at("body").at("txs").size();
+                bool overlap=false;
+                for(const auto& tx:it->second.at("body").at("txs"))
+                    if(selectedIds.count(tx.at("id").get<std::string>())) {overlap=true;break;}
+                if(overlap) {++it;continue;}
+                if(count+size>proposalLimit) break;
+                for(const auto& tx:it->second.at("body").at("txs"))
+                    selectedIds.insert(tx.at("id").get<std::string>());
+                reqs.push_back(it->second);count+=size;++it;
             }
-            bool overlap=false;
-            for(const auto& tx:it->second.at("body").at("txs"))
-                if(selectedIds.count(tx.at("id").get<std::string>())) {overlap=true;break;}
-            if(overlap) {++it;continue;}
-            if(count+size>proposalLimit) break;
-            if(crossShardOrder) {
-                auto candidate=participantGroup(it->second);
-                if(group.empty()) group=candidate;
-                else if(group!=candidate) break;
-            }
-            for(const auto& tx:it->second.at("body").at("txs"))
-                selectedIds[tx.at("id").get<std::string>()]=hash(tx.dump());
-            reqs.push_back(it->second); count+=size; ++it;
         }
         json value={{"requests",reqs}};
         if(!reqs.empty() && isCoordinator())
@@ -1496,11 +1693,35 @@ class Replica {
         if(reqs.empty() && !value.contains("cst_orders") && !value.contains("cst_watermarks")) return;
         if(isCoordinator() && value.contains("cst_round")) requestRound(value.at("cst_round"));
         broadcast(make("PREPREPARE",{{"seq",applied+1},{"digest",hash(value.dump())},{"value",value}}));
+        if(!proposedGroup.empty()) arborLastBatchGroup=proposedGroup;
         batchStart=Clock::now();
 #endif
     }
     void handle(const json& e) {
         const auto& b=e.at("body"); std::string type=b.at("type");
+        if((type=="VIEW_CHANGE" || type=="NEW_VIEW") && b.contains("shard") && b.at("shard")==shard &&
+           b.contains("view") && b.at("view").is_number_integer()) {
+            int v=b.at("view");
+            // Dropping an already obsolete claim needs no signature or
+            // snapshot work and cannot change consensus state or deadlines.
+            if(v<=view || (type=="NEW_VIEW" && v<targetView)) return;
+            if(type=="VIEW_CHANGE" && b.contains("from") && b.at("from").is_number_integer()) {
+                auto priorView=viewChanges.find(v);
+                if(priorView!=viewChanges.end()) {
+                    auto prior=priorView->second.find(b.at("from").get<int>());
+                    auto fingerprints=pbftVcFingerprints.find(v);
+                    if(prior!=priorView->second.end() && fingerprints!=pbftVcFingerprints.end()) {
+                        auto fingerprint=fingerprints->second.find(b.at("from").get<int>());
+                        // JSON equality coerces numeric representations. Bind
+                        // the full serialized envelope, including its signature
+                        // and unsigned extra fields, to its validated original.
+                        if(fingerprint!=fingerprints->second.end() && fingerprint->second==hash(e.dump())) {
+                            ++pbftVcExactReplays;return;
+                        }
+                    }
+                }
+            }
+        }
         if(type=="CLIENT") {
 #ifdef ARBOR_SAGUARO
             saguaroClient(e);
@@ -1556,6 +1777,7 @@ class Replica {
             if(pending.empty()) {lastProgress=Clock::now();batchStart=Clock::now();}
             auto [it,inserted]=pending.emplace(id,e);
             if(!inserted && it->second.at("body").at("txs")!=b.at("txs")) {rejected++;return;}
+            if(inserted) arborPendingAdded(id,e);
             if(inserted) for(const auto& tx:b.at("txs"))
                 if(!state["seen"].contains(tx.at("id").get<std::string>()))
                     pendingTx.emplace(tx.at("id"),std::make_pair(hash(tx.dump()),id));
@@ -1862,7 +2084,11 @@ class Replica {
         }
         if(type=="VIEW_CHANGE") {
             if(v<=view || v>std::max(view,targetView)+64 || !validVC(e,v)) return;
-            viewChanges[v].emplace(sender,e);
+            if(!viewChanges[v].emplace(sender,e).second) return;
+            prunePbftVcFingerprints();
+            int low=std::max(view+1,targetView);
+            if(v>=low && static_cast<int64_t>(v)<static_cast<int64_t>(low)+64)
+                pbftVcFingerprints[v][sender]=hash(e.dump());
             // f+1 distinct replicas requesting a higher view are needed; one
             // Byzantine replica cannot independently force a view change.
             std::set<int> higher;
@@ -1960,6 +2186,8 @@ class Replica {
             {"dedup_index_rebuilds",dedupIndexRebuilds},{"dedup_pending_checks",dedupPendingChecks},
             {"dedup_waiter_checks",dedupWaiterChecks},
             {"rejected_messages",rejected},{"duplicate_messages",duplicates},{"view_changes",viewCount},
+            {"pbft_vc_validations",pbftVcValidations},{"pbft_vc_exact_replays",pbftVcExactReplays},
+            {"pbft_new_view_builds",pbftNewViewBuilds},{"pbft_new_view_retries",pbftNewViewRetries},
             {"execution_ns",executionNs},{"messages_sent",net.sent.load()},{"messages_received",net.received.load()},
             {"network_failures",net.failed.load()},{"network_socket_errors",net.socket_errors.load()},
             {"network_connect_errors",net.connect_errors.load()},
@@ -1983,6 +2211,9 @@ class Replica {
         sharperStatus(s);
 #else
         s["method"]="arbor";
+        s["future_preprepare_cache_entries"]=arborFutureProposals.size();
+        s["future_preprepare_cache_bytes"]=arborFutureProposalBytes;
+        s["future_preprepare_retries"]=arborFutureProposalRetries;
 #endif
         writeJson(dir+"/status.json",s);
     }
@@ -2022,7 +2253,14 @@ public:
         while(!stopping) {
             std::vector<json> work;
             {std::lock_guard<std::mutex> l(inboxMutex); for(int i=0;i<256 && !inbox.empty();++i){work.push_back(std::move(inbox.front()));inbox.pop();}}
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+            for(const auto& e:work) try {
+                handle(e);
+                retryArborFutureProposals(Clock::now());
+            } catch(const std::exception& ex) {rejected++;log("rejected",{{"reason",ex.what()}});}
+#else
             for(const auto& e:work) try {handle(e);} catch(const std::exception& ex) {rejected++;log("rejected",{{"reason",ex.what()}});}
+#endif
             auto now=Clock::now();
             for(auto it=pingStarts.begin();it!=pingStarts.end();) {
                 if(std::chrono::duration_cast<std::chrono::seconds>(now-it->second).count()>130) {
@@ -2037,8 +2275,7 @@ public:
 #else
             bool staged=!stagedRecords.empty();
             bool flowControlled=isCoordinator() && outstandingOrders.size()>=8;
-            if(isCoordinator() && members.multiLayer() && !pending.empty() && !flowControlled)
-                desiredRound=std::max(desiredRound,state.at("cst_round").get<int>()+1);
+            maybeRequestArborRound(now);
             bool orderAvailable=members.leaves.count(shard) && !staged && !nextCstOrder().is_null();
             bool waiting=!staged && ((!flowControlled && !pending.empty()) || orderAvailable ||
                 (isCoordinator() && desiredRound>state.at("cst_round").get<int>()));
@@ -2063,7 +2300,7 @@ public:
 #endif
                 }
                 if(changing && !myViewChange.is_null()) broadcast(myViewChange);
-                if(!lastNewView.is_null() && lastNewView.at("body").at("view")==view && me==view%4) broadcast(lastNewView);
+                retryPbftNewView(now);
                 for(const auto& [n,s]:slots) if(n>applied && !s.proposal.is_null()) {
 #ifdef ARBOR_SHARPER
                     if(sharperCrossValue(s.proposal.at("body").at("value"))) continue;
@@ -2117,6 +2354,9 @@ public:
                 lastRetry=now;
             }
             drainDeferred();
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+            retryArborFutureProposals(Clock::now());
+#endif
             propose();
             if(std::chrono::duration_cast<std::chrono::milliseconds>(now-lastStatus).count()>100) {status();lastStatus=now;}
             std::this_thread::sleep_for(std::chrono::milliseconds(1));

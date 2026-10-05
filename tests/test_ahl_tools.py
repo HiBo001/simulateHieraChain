@@ -33,7 +33,8 @@ def configs():
 
 def fixture():
     arbor, cfg = configs()
-    workload = compare_mixed.prepare_mixed_workload(arbor, 100, 1000, 10, 42, 30)
+    workload = compare_mixed.prepare_mixed_workload(arbor, 100, 1000, 10, 42, 30,
+                                                      cross_cluster_ratio=None)
     expected = mixed.expectations(cfg, workload, "ahl")
     rows = []
     for sid in c.topology(cfg)[0]:
@@ -224,7 +225,8 @@ class AHLComparison(unittest.TestCase):
 
     def test_mixed_comparison_uses_identical_file_with_different_topologies(self):
         arbor, ahl_cfg = configs()
-        workload = compare_mixed.prepare_mixed_workload(arbor, 100, 1000, 10, 42, 30)
+        workload = compare_mixed.prepare_mixed_workload(arbor, 100, 1000, 10, 42, 30,
+                                                      cross_cluster_ratio=None)
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             binary, original_path, output = temp / "node", temp / "original.json", temp / "results"

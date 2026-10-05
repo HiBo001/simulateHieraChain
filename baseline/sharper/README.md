@@ -1,6 +1,6 @@
 # SharPer 无协调者跨片基线
 
-本目录根据项目提供的 `SharPer.pdf` 复现 SharPer 的 Byzantine flattened 跨片协议，采用高负载时由分片 primary 统一分配本地序号的 `SUPER_PROPOSE` 变体。每个分片固定四个副本，故障模型为 `f=1`。参与叶子直接交换消息，祖先分片不处理跨片交易。
+本目录根据项目提供的 `SharPer.pdf` 实现 SharPer Byzantine flattened 正常投票路径的有界基线，采用论文高负载时由分片 primary 统一分配本地序号的 `SUPER_PROPOSE` 变体。每个分片固定四个副本，故障模型为 `f=1`。参与叶子直接交换消息，祖先分片不处理跨片交易；当前实现不宣称覆盖原论文全部冲突与故障恢复场景。
 
 `main.cpp` 通过 `ARBOR_SHARPER` 接入公共运行框架，协议逻辑放在 `protocol.inc`。它与 Arbor、Saguaro 使用相同的认证 TCP、交易输入、网络延时、执行计算、状态摘要和客户端统计。片内交易继续执行本片 PBFT；跨片交易由每个参与片的至少三个 `SH_ACCEPT` 和至少三个 `SH_COMMIT` 组成提交证明，这两类消息本身就是跨片共识投票，未在外层再嵌套一次 PBFT。
 
@@ -18,6 +18,10 @@
 实现包含消息重传、分片内视图切换证据和认证检查点追赶，并沿用公共框架禁止在同一运行目录直接重启副本的限制。复现范围为上述本地四副本协议及回归用例，未宣称完成论文全部部署功能或所有故障组合的保障。
 
 历史请求、跨片批次及投票记录会随有效交易增长，目前适合有限负载实验；长期运行时需要额外评估内存、检查点和恢复消息体积。三个排空队列衡量尚未结束的业务，不表示历史记录已经回收。
+
+2026-10-06 版本已去掉扫描整条队列再按参与集合聚类、以及按请求 ID 决定新批次顺序的行为。新客户端请求按本副本首次接纳次序，只合并连续同参与集合的完整签名请求；遇不同参与集合、容量或不可执行边界即停止，不跳到后面的同组请求。已遇边界的非空前缀仍满足原普通组批等待后提议，开放且不足额的队尾保留原跨片组批等待。
+
+论文明确允许组块，并给出 `SUPER_PROPOSE` 高负载变体；这些机制和已有认证缓存、持久 TCP、去重、共享 PBFT 恢复修复均保留。当前比较结果仍对应有界工程实现，因为升序预约、最小参与片发起和单 slot 限制尚未替换为完整 Algorithm 4。2026-10-05 审查作为历史记录保留在 [DESIGN.md](DESIGN.md)；本轮说明见 [../../docs/SHARPER_PAPER_FAITHFULNESS.md](../../docs/SHARPER_PAPER_FAITHFULNESS.md)。不能把当前 TPS 直接标为完整原论文复现成绩，也不会为改变吞吐排名增加人为等待。
 
 ## 构建与单独运行
 
@@ -46,16 +50,17 @@ python3 -B baseline/compare.py --baseline sharper \
   --timeout 120 --drain-timeout 60
 ```
 
-一条命令生成并比较 10000 笔混合交易：90% 跨两个分片、10% 跨三个分片。三个双片组 `[1,2]`、`[1,3]`、`[2,3]` 各有 3000 笔，三片组 `[1,2,3]` 有 1000 笔；请求顺序按 seed 打散。
+一条命令生成并比较 10000 笔带访问局部性的混合交易：90% 跨两个分片、10% 跨三个分片，只有 5% 的跨片交易跨越 cluster。cluster 按 Arbor 参考树的叶子直接父节点划分；SharPer 协议仍不使用协调者。
 
 ```bash
 python3 -B baseline/compare_mixed.py --baseline sharper \
-  --config config/three_layer_cross100.json \
+  --config config/three_layer_locality.json \
   --count 10000 --rate 5000 --batch 10 --repeat 3 --seed 42 \
+  --cross-cluster-ratio 0.05 --three-shard-ratio 0.10 \
   --timeout 180 --drain-timeout 60
 ```
 
-生成器使用拓扑中最小的三个叶子；改变交易总量时，三片比例按交易数取最近整数，其余交易均分给三个双片组。对比会自动构建所选二进制，在独立目录顺序启动和停止两个方法，并在重复轮次交替运行顺序。
+新配置中两个 cluster 为 `{1,2,8}` 和 `{3,4,9}`。同 cluster 两方/跨 cluster 两方/同 cluster 三方/跨 cluster 三方分别为 8550/450/950/50 笔。生成器使用参考树的全部叶子，SharPer 与 Arbor 共享相同的交易参与方、读写输入、请求分组和发送顺序。对比自动构建所选二进制，在独立目录顺序启动和停止两个方法，并在重复轮次交替运行顺序。
 
 也可以直接重放原有 unsigned JSON，保持文件中的速率、请求分组、交易 ID、参与方和 key/value：
 
@@ -66,7 +71,9 @@ python3 -B baseline/compare_mixed.py --baseline sharper \
   --repeat 3 --drain-timeout 60
 ```
 
-`--workload` 与生成参数 `--count/--rate/--batch/--seed` 互斥；`--timeout` 可为两个方法同时覆盖客户端超时。此入口支持任意合法的全跨片混合负载，原文件不会被修改。将 `--baseline` 改为 `saguaro` 可以执行同样的 Arbor/Saguaro 配对比较；经典 `compare.py` 省略该参数仍选择 Saguaro。
+`--workload` 与生成参数互斥；`--timeout` 可为两个方法同时覆盖客户端超时。此入口支持任意合法的全跨片混合负载，原文件不会被修改。将 `--baseline` 改为 `saguaro` 可以执行同样的 Arbor/Saguaro 配对比较；经典 `compare.py` 省略该参数仍选择 Saguaro。
+
+同时比较四种方法可用 `baseline/compare_all.py --config config/three_layer_locality.json --ahl-config config/ahl_two_layer_locality.json`。cluster 分类只影响生成的业务分布，不会为 SharPer 增加树状共识或上层路由。旧前三叶均匀 90/10 生成模式用旧配置与 `--uniform`；该选项与 `--cross-cluster-ratio` 互斥。完整生成和重放说明见 [../../docs/WORKLOAD_LOCALITY.md](../../docs/WORKLOAD_LOCALITY.md)。
 
 结果保存到 `test-results/compare-*`，包含共享 workload、每轮客户端日志与 JSON、全部副本状态、`summary.json`、`summary.csv` 和 `summary.md`。只有双方均完整完成、配置指纹和实际负载 SHA256 相同、各副本收敛且队列排空，才计算 `arbor_over_sharper_tps`。某轮失败会使整组比值留空。TPS 为客户端确认的唯一执行交易数，平均和 p50/p95/p99 延时单位均为秒。
 

@@ -754,7 +754,9 @@ class SharPerIntegration(unittest.TestCase):
     def test_original_90_10_mixed_workload_matches_arbor_and_participant_counts(self):
         config, output = TEST_ROOT / "mixed-comparison.config.json", TEST_ROOT / "mixed-comparison"
         c.write(config, raw_config(THREE_LAYER, consensus={"view_timeout_ms": 3000}))
-        result = subprocess.run([sys.executable, str(ROOT / "baseline/compare_mixed.py"), "--baseline", "sharper",
+        # This regression intentionally replays the original three-leaf 90/10
+        # workload, independently of the new locality-aware default generator.
+        result = subprocess.run([sys.executable, str(ROOT / "baseline/compare_mixed.py"), "--baseline", "sharper", "--uniform",
                                  "--config", str(config), "--count", "30", "--rate", "1000", "--batch", "3",
                                  "--repeat", "1", "--timeout", "45", "--drain-timeout", "20",
                                  "--output-dir", str(output), "--skip-build"], timeout=150)

@@ -133,11 +133,26 @@ def save(folder, report):
     baseline = report.get("baseline", "saguaro")
     label = {"saguaro": "Saguaro", "sharper": "SharPer", "ahl": "AHL"}[baseline]
     report["paired_aggregates"] = summarize_pairs(report["method_comparisons"])
+    if len(report["method_comparisons"]) != report.get("expected_pairs", 0):
+        # A completed subset must not look like a finished repeated experiment.
+        for group in report["paired_aggregates"]:
+            for key in list(group):
+                if key.startswith("median_") or key.startswith("arbor_over_"):
+                    del group[key]
+            group.update(comparable=False, reason="轮次未完整结束，整组比值留空")
     report["status"] = ("FAIL" if any(row["status"] != "PASS" for row in report["cases"]) else
                         "PASS" if len(report["method_comparisons"]) == report.get("expected_pairs", 0)
                         and report["method_comparisons"] and all(pair["comparable"] for pair in report["method_comparisons"])
                         else "INCOMPLETE")
     b.save_report(folder, report)
+    if report["status"] == "INCOMPLETE":
+        for group in report["aggregates"]:
+            if group["status"] != "FAIL":
+                group["status"] = "INCOMPLETE"
+            for key in group:
+                if key.startswith("median_"):
+                    group[key] = None
+        c.write(folder / "summary.json", report)
     lines = [f"# Arbor / {label} 同负载比较", "", f"比较状态：{report['status']}。", "",
              "每一对运行复用同一份 unsigned workload，包括请求/交易 ID、参与分片、key 和 value。",
              "各方法顺序启动独立集群；每轮都检查客户端完整完成、全部副本状态收敛及协议队列排空。",
@@ -151,7 +166,8 @@ def save(folder, report):
                          f"{item['arbor_over_' + baseline + '_tps']:.3f} | {item['median_arbor_p95_s']:.6f} | "
                          f"{item['median_' + baseline + '_p95_s']:.6f} |")
         else:
-            lines.append(common + " | FAIL | FAIL | — | — | — |")
+            lines.append(common + (" | — | — | — | — | — |" if report["status"] == "INCOMPLETE"
+                                   else " | FAIL | FAIL | — | — | — |"))
     failures = [row for row in report["cases"] if row["status"] != "PASS"]
     if failures:
         lines += ["", "失败轮次：", ""]

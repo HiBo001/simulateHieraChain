@@ -580,11 +580,29 @@ class MultiLayerExecution(unittest.TestCase):
                 time.sleep(.25)
                 for node in paused:
                     os.kill(node["pid"], signal.SIGCONT)
-                converged(run, jobs)
+                recovered_rows = converged(run, jobs)
                 for node in paused:
-                    self.assertTrue(any(event["event"] == "state_sync" and event["seq"] >= 2
-                                        for event in events(run, node["shard"], 3)))
+                    recovery_events = events(run, node["shard"], 3)
+                    installed = any(event["event"] == "state_sync" and event["seq"] >= 2
+                                    for event in recovery_events)
+                    if node["shard"] == 5:
+                        self.assertTrue(installed, "the coordinator must exercise checkpoint state installation")
+                    elif not installed:
+                        # Retained PREPREPAREs and queued signed votes can
+                        # replay the whole leaf prefix before SYNC arrives.
+                        recovered = next(row for row in recovered_rows
+                                         if (row["shard"], row["replica"]) == (1, 3))
+                        journal = entries(run, 1, 3)
+                        self.assertEqual([entry["seq"] for entry in journal],
+                                         list(range(1, recovered["applied_batches"] + 1)))
+                        cached = {event["digest"] for event in recovery_events
+                                  if event["event"] == "future_preprepare_cached"}
+                        accepted = {event["digest"] for event in recovery_events
+                                    if event["event"] == "preprepare"}
+                        self.assertTrue(cached & accepted, "the leaf must demonstrate replay of a retained proposal")
+                        self.assertTrue(all("execution_witness" in entry for entry in journal))
                 assert_reference_state(self, run)
+                assert_certificates_and_forwarding(self, run)
                 alias = copy.deepcopy(jobs[0]["requests"][0])
                 alias["id"] += ":recovered-alias"
                 old_results = {timing["id"]: timing["result"] for timing in results[0]["timings"]}
@@ -657,15 +675,32 @@ class MultiLayerExecution(unittest.TestCase):
                                "view": 0, "seq": 2, "digest": future_digest, "value": future_value},
                               source["private_key"], run)
             c.send_frame(backup["host"], backup["port"], future)
+            rows = wait_status(run, lambda rows: any(event["event"] == "future_preprepare_cached" and
+                               event["digest"] == future_digest for event in events(run, 1, 1)), timeout=5)
+            waiting = next(r for r in rows if (r["shard"], r["replica"]) == (1, 1))
+            self.assertEqual((waiting["applied_batches"], waiting["executed_transactions"]), (0, 0))
+            self.assertFalse(any(event["event"] in ("preprepare", "prepared", "committed_local") and
+                                 event.get("digest") == future_digest for event in events(run, 1, 1)),
+                             "the future proposal cannot earn a vote before its missing head executes")
             rows = wait_status(run, lambda rows: next(r for r in rows if (r["shard"], r["replica"]) == (1, 1))
-                               ["executed_transactions"] == 2, timeout=8)
+                               ["executed_transactions"] == 2 and next(r for r in rows
+                               if (r["shard"], r["replica"]) == (1, 1))["future_preprepare_cache_entries"] == 0,
+                               timeout=8)
             recovered = next(r for r in rows if (r["shard"], r["replica"]) == (1, 1))
             honest = next(r for r in rows if (r["shard"], r["replica"]) == (1, 0))
             for field in ("state_digest", "chain_digest", "kv_digest", "applied_batches", "executed_transactions"):
                 self.assertEqual(recovered[field], honest[field])
             self.assertEqual((recovered["applied_batches"], recovered["executed_transactions"], recovered["view_changes"]), (1, 2, 0))
-            self.assertTrue(any(event["event"] == "invalid_preprepare_value" and event["digest"] == future_digest
-                                for event in events(run, 1, 1)))
+            history = events(run, 1, 1)
+            retained = next(event for event in history if event["event"] == "future_preprepare_cached" and
+                            event["digest"] == future_digest)
+            admitted = next(event for event in history if event["event"] == "preprepare" and
+                            event["digest"] == future_digest)
+            head_applied = next(event for event in history if event["event"] == "cst_ordered_at_leaf" and
+                                event["coordinator_batch"] == "7:1")
+            self.assertLess(retained["steady_ms"], head_applied["steady_ms"])
+            self.assertLess(head_applied["steady_ms"], admitted["steady_ms"],
+                            "the one transmitted future proposal must be admitted after recovering the head")
             self.assertTrue(any(event["event"] == "sync_requested" and event["after"] == 0 and event["target"] >= 1
                                 for event in events(run, 1, 1)))
             self.assertTrue(any(event["event"] == "sync_proofs_sent" and event["destination_replica"] == 1 and
@@ -765,24 +800,49 @@ class MultiLayerExecution(unittest.TestCase):
             frontiers = ([root_cert], [root_cert, root_cert], [next_round, root_cert],
                          [wrong_index, root_cert], [lower_cert, root_cert])
             destination = node_for(cfg, 1, 1)
+            def isolate_view(view):
+                if view == 0:
+                    return
+                # Every fixture has a fresh certified view, rather than
+                # equivocating with six digests for one view/sequence. No
+                # earlier fixture has obtained a PREPARE or commit proof.
+                changes = [c.signed({"type": "VIEW_CHANGE", "run": cfg["run_id"], "shard": 1,
+                                     "from": replica, "view": view,
+                                     "stable": {"seq": 0, "state": fixture_genesis(), "proof": []},
+                                     "prepared": []}, node_for(cfg, 1, replica)["private_key"], run)
+                           for replica in (0, 1, 2)]
+                new_view = c.signed({"type": "NEW_VIEW", "run": cfg["run_id"], "shard": 1,
+                                     "from": 0, "view": view, "changes": changes, "proposals": []},
+                                    node_for(cfg, 1, 0)["private_key"], run)
+                c.send_frame(destination["host"], destination["port"], new_view)
+                wait_status(run, lambda rows: any(row["shard"] == 1 and row["replica"] == 1 and
+                            row["view"] == view and not row["changing_view"] and row["applied_batches"] == 0
+                            for row in rows), timeout=5)
             for index, frontier in enumerate(frontiers):
+                view = index * 4
+                isolate_view(view)
                 value = {"requests": [], "cst_orders": [root_cert], "cst_frontier": frontier}
                 value_digest = digest(packed(value))
                 proposal = c.signed({"type": "PREPREPARE", "run": cfg["run_id"], "shard": 1,
-                                     "from": 0, "view": 0, "seq": 1, "digest": value_digest, "value": value},
+                                     "from": 0, "view": view, "seq": 1, "digest": value_digest, "value": value},
                                     node_for(cfg, 1, 0)["private_key"], run)
                 c.send_frame(destination["host"], destination["port"], proposal)
                 wait_status(run, lambda rows: any(event["event"] == "invalid_preprepare_value" and
                             event["digest"] == value_digest for event in events(run, 1, 1)), timeout=5)
                 self.assertTrue(all(row["applied_batches"] == 0 and row["executed_transactions"] == 0
                                     for row in c.statuses(run)), f"false frontier {index} changed state")
+                self.assertFalse(any(event["event"] in ("preprepare", "prepared", "committed_local") and
+                                     event.get("digest") == value_digest for event in events(run, 1, 1)),
+                                 f"false frontier {index} obtained a PBFT vote")
             # Control: identical real QC/client signatures and the complete
             # same-round frontier must pass validation. One backup's PREPARE
             # alone cannot commit a batch or create any partial writes.
             value = {"requests": [], "cst_orders": [root_cert], "cst_frontier": [empty_cert, root_cert]}
             value_digest = digest(packed(value))
+            view = len(frontiers) * 4
+            isolate_view(view)
             proposal = c.signed({"type": "PREPREPARE", "run": cfg["run_id"], "shard": 1,
-                                 "from": 0, "view": 0, "seq": 1, "digest": value_digest, "value": value},
+                                 "from": 0, "view": view, "seq": 1, "digest": value_digest, "value": value},
                                 node_for(cfg, 1, 0)["private_key"], run)
             c.send_frame(destination["host"], destination["port"], proposal)
             wait_status(run, lambda rows: any(event["event"] == "preprepare" and event["digest"] == value_digest

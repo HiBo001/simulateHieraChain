@@ -28,7 +28,8 @@ QUEUES = ("sharper_active_batches", "sharper_pending_batches", "sharper_waiting_
 
 def fixture():
     cfg = c.validate(c.read(ROOT / "config/three_layer_cross100.json"))
-    workload = compare_mixed.prepare_mixed_workload(cfg, 100, 1000, 10, 42, 30)
+    workload = compare_mixed.prepare_mixed_workload(cfg, 100, 1000, 10, 42, 30,
+                                                           cross_cluster_ratio=None)
     expected = mixed.expectations(cfg, workload, "sharper")
     rows = []
     for sid in c.topology(cfg)[0]:
@@ -162,8 +163,10 @@ class FairComparisons(unittest.TestCase):
 
     def test_generation_is_deterministic_with_90_10_and_original_nca_targets(self):
         cfg, workload, _, _ = fixture()
-        self.assertEqual(workload, compare_mixed.prepare_mixed_workload(cfg, 100, 1000, 10, 42, 30))
-        self.assertNotEqual(workload, compare_mixed.prepare_mixed_workload(cfg, 100, 1000, 10, 43, 30))
+        self.assertEqual(workload, compare_mixed.prepare_mixed_workload(cfg, 100, 1000, 10, 42, 30,
+                                                           cross_cluster_ratio=None))
+        self.assertNotEqual(workload, compare_mixed.prepare_mixed_workload(cfg, 100, 1000, 10, 43, 30,
+                                                           cross_cluster_ratio=None))
         self.assertEqual(mixed.expectations(cfg, workload)["groups"], {"1,2": 30, "1,3": 30, "2,3": 30, "1,2,3": 10})
         self.assertEqual(len({request["id"] for request in workload["requests"]}), len(workload["requests"]))
 
@@ -180,12 +183,14 @@ class FairComparisons(unittest.TestCase):
                 return dict(status="PASS", method=method, expected=expected, client=dict(
                     executed_transactions=expected["transactions"], completed_requests=expected["requests"],
                     requests=expected["requests"], elapsed_s=1), node_metrics=dict(bytes_sent=100),
-                    workload_sha256=seen[-1][2], config_fingerprint=b.config_fingerprint(cfg),
+                    workload_sha256=seen[-1][2], input_workload_sha256=seen[-1][2],
+                    config_fingerprint=b.config_fingerprint(cfg),
                     completed_tps=100 if method == "arbor" else 50,
                     avg_latency_s=.1, p50_s=.05, p95_s=.2, p99_s=.3, failure_reasons=[])
             with mock.patch.object(c, "binary_for_method", return_value=binary), \
                     mock.patch.object(mixed, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
-                rc = compare_mixed.main(["--count", "100", "--rate", "1000", "--batch", "10",
+                rc = compare_mixed.main(["--config", str(ROOT / "config/three_layer_cross100.json"),
+                                         "--uniform", "--count", "100", "--rate", "1000", "--batch", "10",
                                          "--repeat", "2", "--skip-build", "--output-dir", str(output)])
             self.assertEqual(rc, 0)
             self.assertEqual([item[0] for item in seen], ["arbor", "sharper", "sharper", "arbor"])
@@ -217,10 +222,12 @@ class FairComparisons(unittest.TestCase):
                 return dict(metrics, method=method, status="FAIL" if failed else "PASS", expected=expected,
                             client=dict(executed_transactions=100, requests=10, completed_requests=10, elapsed_s=1),
                             config_fingerprint=b.config_fingerprint(cfg), workload_sha256=seen[-1][1],
+                            input_workload_sha256=seen[-1][1],
                             node_metrics=dict(bytes_sent=100), failure_reasons=["queue did not drain"] if failed else [])
             with mock.patch.object(c, "binary_for_method", return_value=binary), \
                     mock.patch.object(mixed, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
-                rc = compare_mixed.main(["--workload", str(job), "--repeat", "2", "--skip-build",
+                rc = compare_mixed.main(["--config", str(ROOT / "config/three_layer_cross100.json"),
+                                         "--workload", str(job), "--repeat", "2", "--skip-build",
                                          "--output-dir", str(output)])
             self.assertEqual(rc, 2)
             self.assertEqual(job.read_bytes(), original)
@@ -230,6 +237,40 @@ class FairComparisons(unittest.TestCase):
             self.assertEqual(report["status"], "FAIL")
             self.assertFalse(report["paired_aggregates"][0]["comparable"])
             self.assertNotIn("arbor_over_sharper_tps", report["paired_aggregates"][0])
+
+    def test_shared_workload_change_between_repeats_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            binary = temp / "node"; binary.touch()
+            output = temp / "results"
+            calls = []
+            def run(config, shared, folder, method, **kwargs):
+                cfg, workload = c.validate(c.read(config)), c.read(shared)
+                digest = hashlib.sha256(Path(shared).read_bytes()).hexdigest()
+                calls.append(method)
+                expected = mixed.expectations(cfg, workload, method)
+                result = dict(status="PASS", method=method, expected=expected,
+                    client=dict(executed_transactions=expected["transactions"],
+                                requests=expected["requests"], completed_requests=expected["requests"], elapsed_s=1),
+                    node_metrics=dict(bytes_sent=100), config_fingerprint=b.config_fingerprint(cfg),
+                    workload_sha256=digest, input_workload_sha256=digest,
+                    completed_tps=100, avg_latency_s=.1, p50_s=.05, p95_s=.2, p99_s=.3, failure_reasons=[])
+                if len(calls) == 2:
+                    workload["requests"][0]["txs"][0]["value"] = 999
+                    c.write(shared, workload)
+                return result
+            with mock.patch.object(c, "binary_for_method", return_value=binary), \
+                    mock.patch.object(mixed, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaises(ValueError):
+                compare_mixed.main(["--config", str(ROOT / "config/three_layer_cross100.json"),
+                                    "--uniform", "--count", "100", "--repeat", "2", "--skip-build",
+                                    "--output-dir", str(output)])
+            self.assertEqual(len(calls), 2, "a changed workload must not enter another round")
+            report = c.read(output / "summary.json")
+            self.assertNotEqual(report["status"], "PASS")
+            for item in report["paired_aggregates"]:
+                self.assertFalse(item["comparable"])
+                self.assertNotIn("arbor_over_sharper_tps", item)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import time
 import uuid
 
 import cluster as c
+import workload_locality as locality
 from benchmark import config_fingerprint, free_ports, METRICS, COUNTERS
 
 
@@ -76,9 +77,12 @@ def expectations(cfg, workload, method="arbor"):
             label = ",".join(map(str, ps))
             groups[label] = groups.get(label, 0) + 1
             sizes[str(len(ps))] = sizes.get(str(len(ps)), 0) + 1
-    return {"transactions": len(seen_transactions), "requests": len(requests),
+    expected = {"transactions": len(seen_transactions), "requests": len(requests),
             "executed": executed, "ordered": ordered, "groups": groups,
             "participants_per_transaction": sizes}
+    if "locality" in workload:
+        expected["locality"] = locality.validate_locality_metadata(cfg, workload, method)
+    return expected
 
 
 def settlement_errors(cfg, expected, rows, method):

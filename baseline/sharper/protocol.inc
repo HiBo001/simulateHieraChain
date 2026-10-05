@@ -9,10 +9,56 @@
     std::map<std::string,ShBatch> shBatches;
     std::map<std::string,json> shPending;
     std::set<std::string> shSelected;
+    // Keep new, unproposed requests in local admission order. Request IDs
+    // remain the lookup/dedup keys, but never determine batching order.
+    std::map<uint64_t,std::string> shArrivalOrder;
+    std::map<std::string,uint64_t> shArrivalIndex;
+    uint64_t shNextArrival=0;
     std::string shLocal,shInitiating;
     uint64_t shAttempt=0,shCommitted=0;
     mutable std::set<std::string> shChecked;
     Clock::time_point shLastRetry=Clock::now();
+
+    void shPendingAdded(const std::string& rid) {
+        if(shArrivalIndex.count(rid)) return;
+        auto position=++shNextArrival;
+        shArrivalOrder.emplace(position,rid);shArrivalIndex.emplace(rid,position);
+    }
+    void shPendingRemoved(const std::string& rid) {
+        auto it=shArrivalIndex.find(rid);if(it==shArrivalIndex.end()) return;
+        shArrivalOrder.erase(it->second);shArrivalIndex.erase(it);
+    }
+    void shPruneArrivalOrder() {
+        for(auto it=shArrivalOrder.begin();it!=shArrivalOrder.end();) {
+            if(pending.count(it->second)) {++it;continue;}
+            shArrivalIndex.erase(it->second);it=shArrivalOrder.erase(it);
+        }
+    }
+    struct ShPendingPrefix {
+        json requests=json::array(),group;
+        int count=0;
+        bool prefixClosed=false;
+    };
+    ShPendingPrefix shSelectPendingPrefix() const {
+        ShPendingPrefix selected;
+        for(const auto& [position,rid]:shArrivalOrder) {
+            (void)position;
+            auto it=pending.find(rid);if(it==pending.end() || shSelected.count(rid)) continue;
+            const auto& request=it->second;
+            bool blocked=false;
+            for(const auto& tx:request.at("body").at("txs")) if(awaitingResult(tx.at("id"))) {blocked=true;break;}
+            if(blocked) {selected.prefixClosed=true;break;}
+            const auto& ps=request.at("body").at("txs")[0].at("participants");
+            if(selected.group.is_null()) selected.group=ps;
+            int limit=selected.group.size()>1?crossShardBatchSize:batchSize;
+            if(ps!=selected.group || selected.count+int(request.at("body").at("txs").size())>limit) {
+                selected.prefixClosed=true;break;
+            }
+            selected.requests.push_back(request);selected.count+=request.at("body").at("txs").size();
+            if(selected.count==limit) break;
+        }
+        return selected;
+    }
 
     static json sharperGenesis(json result) {
         result["sharper_batches"]=json::object();
@@ -294,9 +340,9 @@
             for(const auto& request:p.at("requests")) {
                 auto rid=request.at("body").at("id").get<std::string>();shSelected.insert(rid);
                 if(!pending.count(rid) && !state.at("requests").contains(rid)) {
-                    pending[rid]=request;
+                    pending[rid]=request;shPendingAdded(rid);
                     for(const auto& tx:request.at("body").at("txs")) if(!state.at("seen").contains(tx.at("id").get<std::string>()))
-                        pendingTx.emplace(tx.at("id"),std::make_pair(hash(tx.dump()),rid));
+                    pendingTx.emplace(tx.at("id"),std::make_pair(hash(tx.dump()),rid));
                 }
             }
             if(inserted && idle) {lastProgress=Clock::now();batchStart=lastProgress;}
@@ -482,11 +528,20 @@
             std::string id=tx.at("id");
             if(pendingTx.count(id) || awaitingResult(id)) {deferRequest(request);if(!isForward()) sendTo(shard,view%4,request);return;}
         }
-        bool idle=pending.empty() && shLocal.empty();pending[rid]=request;
+        bool idle=pending.empty() && shLocal.empty();pending[rid]=request;shPendingAdded(rid);
         for(const auto& tx:b.at("txs")) if(!state.at("seen").contains(tx.at("id").get<std::string>()))
             pendingTx.emplace(tx.at("id"),std::make_pair(hash(tx.dump()),rid));
         if(idle) {batchStart=Clock::now();lastProgress=batchStart;}
         if(!isForward()) sendTo(shard,view%4,request);
+    }
+    void shAssignLocal(const json& p) {
+        const auto key=shKey(p);
+        json claim=make("SH_LOCAL_CLAIM",{{"seq",applied+1},{"ballot",++shAttempt},{"batch",key},
+            {"request_digest",p.at("body").at("request_digest")},{"origin_seq",p.at("body").at("origin_seq")},{"proposal_digest",hash(shHeader(p).dump())}});
+        json value={{"requests",p.at("requests")},{"sharper_propose",shHeader(p)},{"sharper_claim",claim}};
+        auto pp=make("PREPREPARE",{{"seq",applied+1},{"digest",hash(value.dump())},{"value",value}});
+        pp["sharper_prefix"]=shPrefixVotes(shBatches.at(key),shard);
+        sharperAcceptAssignment(pp);broadcast(pp);
     }
     void sharperPropose() {
         if(!isForward() || !members.leaves.count(shard) || applied+1>stableSeq+window || certificates.count(applied+1)) return;
@@ -496,33 +551,24 @@
             if(!shPrefixReady(shBatches.at(key),shard)) continue;
             if(slots.count(applied+1) && !slots.at(applied+1).proposal.is_null()) continue;
             if(p.at("body").at("shard")==shard && p.at("body").at("origin_seq")!=applied+1) continue;
-            json claim=make("SH_LOCAL_CLAIM",{{"seq",applied+1},{"ballot",++shAttempt},{"batch",key},
-                {"request_digest",p.at("body").at("request_digest")},{"origin_seq",p.at("body").at("origin_seq")},{"proposal_digest",hash(shHeader(p).dump())}});
-            json value={{"requests",p.at("requests")},{"sharper_propose",shHeader(p)},{"sharper_claim",claim}};
-            auto pp=make("PREPREPARE",{{"seq",applied+1},{"digest",hash(value.dump())},{"value",value}});
-            pp["sharper_prefix"]=shPrefixVotes(shBatches.at(key),shard);
-            sharperAcceptAssignment(pp);broadcast(pp);return;
+            shAssignLocal(p);return;
         }
         if(!shLocal.empty() || (slots.count(applied+1) && !slots.at(applied+1).proposal.is_null()) || !shInitiating.empty()) return;
         int waited=std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-batchStart).count();
         if(waited<members.config.at("consensus").at("batch_wait_ms").get<int>()) return;
-        json requests=json::array(),group;int count=0;
-        for(const auto& [rid,request]:pending) {
-            if(shSelected.count(rid)) continue;
-            bool blocked=false;for(const auto& tx:request.at("body").at("txs")) if(awaitingResult(tx.at("id"))) blocked=true;
-            if(blocked) continue;
-            auto ps=request.at("body").at("txs")[0].at("participants");int limit=ps.size()>1?crossShardBatchSize:batchSize;
-            if(group.is_null()) group=ps;if(ps!=group) continue;
-            if(count+int(request.at("body").at("txs").size())>limit) continue;
-            requests.push_back(request);count+=request.at("body").at("txs").size();
-        }
+        auto selected=shSelectPendingPrefix();
+        const auto& requests=selected.requests;const auto& group=selected.group;
         if(requests.empty()) return;
         if(group.size()>1) {
-            if(waited<crossShardBatchWaitMs && count<crossShardBatchSize) return;
+            // A closed FIFO prefix cannot grow without skipping an earlier
+            // request. Only an open, underfilled tail uses the batching wait.
+            if(!selected.prefixClosed && waited<crossShardBatchWaitMs && selected.count<crossShardBatchSize) return;
             auto requestDigest=hash(requests.dump());
             auto key=hash(std::to_string(shard)+":"+std::to_string(applied+1)+":"+std::to_string(view)+":"+std::to_string(++shAttempt)+":"+requestDigest);
             auto p=make("SH_SUPER_PROPOSE",{{"batch",key},{"origin_seq",applied+1},{"participants",group},{"request_digest",requestDigest}});p["requests"]=requests;
-            shRemember(p);shSend(p,p);lastProgress=Clock::now();
+            shRemember(p);shSend(p,p);
+            // Reserve origin_seq before yielding to foreign proposals.
+            shAssignLocal(p);lastProgress=Clock::now();
         } else {
             json value={{"requests",requests}};
             broadcast(make("PREPREPARE",{{"seq",applied+1},{"digest",hash(value.dump())},{"value",value}}));
@@ -631,7 +677,30 @@
             for(const auto& [digest,pp]:groups) if(supporters.at(seq).at(digest).size()>=2) {selected[seq]={{"proposal",pp}};break;}
         }
     }
-    void sharperInstallRecovery(const json& vcs) {
+    bool sharperSafeNewView(const std::map<int,json>& values,int checkpoint) const {
+        for(const auto& [key,batch]:shBatches) {
+            if(batch.applied || batch.commit.is_null()) continue;
+            try {
+                const auto& vote=batch.commit.at("body");
+                if(vote.at("shard")!=shard || vote.at("from")!=me) continue;
+                int seq=vote.at("seqs").at(std::to_string(shard));
+                if(seq<=checkpoint) continue;
+                auto prepared=preparedHistory.find(seq);
+                if(prepared==preparedHistory.end() || !validPrepared(prepared->second) || !sharperCrossProof(prepared->second)) continue;
+                const auto& value=prepared->second.at("proposal").at("body").at("value");
+                json seqs,claims;
+                if(shKey(value.at("sharper_propose"))!=key ||
+                   !shAcceptVector(value.at("sharper_propose"),prepared->second.at("prepares"),seqs,claims) ||
+                   !shValidCommit(batch.commit,value.at("sharper_propose"),value.at("requests"),seqs,claims)) continue;
+                // A bare COMMIT is not recovery evidence. Only a locally cast
+                // vote backed by the full global ACCEPT proof fixes this value.
+                auto selected=values.find(seq);
+                if(selected==values.end() || selected->second!=value) return false;
+            } catch(...) {continue;}
+        }
+        return true;
+    }
+    void sharperInstallRecovery(const json& vcs,const std::map<int,json>& values) {
         for(const auto& vc:vcs) {
             const auto& evidence=vc.at("body").at("sharper_recovery");
             for(const auto& p:evidence.at("initiations")) shRemember(p);
@@ -644,6 +713,47 @@
                 it->second.commits[shard][commit.at("body").at("from").get<int>()]=commit;
                 if(commit.at("body").at("from")==me) it->second.commit=commit;
             }
+        }
+        // A NEW_VIEW may omit a lone unprepared reservation. Release only
+        // this shard's obsolete claim, retaining the same signed cross-shard
+        // batch so other participants can continue waiting for its retry.
+        for(auto& [key,batch]:shBatches) {
+            if(batch.applied || batch.assignment.is_null() || !batch.commit.is_null()) continue;
+            int seq=batch.assignment.at("body").at("seq");
+            auto selected=values.find(seq);
+            if(selected!=values.end() && selected->second==batch.assignment.at("body").at("value")) continue;
+            batch.assignment=nullptr;batch.accept=nullptr;batch.accepts.erase(shard);
+            if(shLocal==key) shLocal.clear();
+            shPending[key]=batch.proposal;
+        }
+        // A cold participant needs the entire selected ACCEPT vector, not
+        // only its local reservations, to validate earlier participants'
+        // claims and resume the same globally prepared batch.
+        for(const auto& vc:vcs) for(const auto& proof:vc.at("body").at("prepared")) {
+            if(!sharperCrossProof(proof) || !validPrepared(proof)) continue;
+            const auto& b=proof.at("proposal").at("body");int seq=b.at("seq");
+            auto selected=values.find(seq);
+            if(selected==values.end() || selected->second!=b.at("value")) continue;
+            const auto& value=b.at("value");json seqs,claims;
+            if(!shAcceptVector(value.at("sharper_propose"),proof.at("prepares"),seqs,claims)) continue;
+            auto p=shRequestProposal(value);shRemember(p);auto& batch=shBatches.at(shKey(p));
+            // A matching local claim alone does not bind the remote claims.
+            // Never replace the vector supporting this replica's cast COMMIT.
+            if(!batch.commit.is_null() && !shValidCommit(batch.commit,p,p.at("requests"),seqs,claims)) continue;
+            for(const auto& accept:proof.at("prepares"))
+                batch.accepts[accept.at("body").at("shard").get<int>()][accept.at("body").at("from").get<int>()]=accept;
+        }
+        // Recover an existing origin binding before processing another inbox
+        // message. Its signed origin_seq cannot be reassigned to a foreign
+        // batch merely because the old, unprepared local claim was released.
+        if(isForward() && shLocal.empty() && applied+1<=stableSeq+window && !certificates.count(applied+1) &&
+           !values.count(applied+1) && !shInitiating.empty()) {
+            auto it=shBatches.find(shInitiating);
+            if(it!=shBatches.end() && !it->second.applied && it->second.commit.is_null() &&
+               it->second.assignment.is_null() && shPending.count(it->first) &&
+               it->second.proposal.at("body").at("shard")==shard &&
+               it->second.proposal.at("body").at("origin_seq")==applied+1 &&
+               shPrefixReady(it->second,shard)) shAssignLocal(it->second.proposal);
         }
     }
     void sharperRestore() {

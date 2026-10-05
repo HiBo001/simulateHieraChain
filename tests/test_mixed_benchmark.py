@@ -12,8 +12,10 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "baseline"))
 import cluster as c
 import benchmark_mixed as b
+import compare_mixed
 
 
 def fixture():
@@ -172,6 +174,49 @@ class MixedAccounting(unittest.TestCase):
                 b.run(source, workload, output, "saguaro")
             self.assertTrue((output / "summary.json").is_file())
             self.assertNotIn("resolved_links", c.read(source)["network"], "input config must remain unchanged")
+
+
+class LocalityAccounting(unittest.TestCase):
+    def setUp(self):
+        self.arbor = c.validate(c.read(ROOT / "config/three_layer_locality.json"))
+        self.ahl = c.validate(c.read(ROOT / "config/ahl_two_layer_locality.json"))
+        self.workload = compare_mixed.prepare_mixed_workload(self.arbor, 200, 1000, 10, 42, 30)
+
+    def test_all_methods_report_actual_same_locality_using_reference_clusters(self):
+        for method in ("arbor", "saguaro", "sharper", "ahl"):
+            with self.subTest(method=method):
+                cfg = self.ahl if method == "ahl" else self.arbor
+                expected = b.expectations(cfg, self.workload, method)
+                self.assertEqual(expected["participants_per_transaction"], {"2": 180, "3": 20})
+                locality = expected["locality"]
+                self.assertEqual(locality["clusters"], {"5": [1, 2, 8], "6": [3, 4, 9]})
+                self.assertEqual(locality["cross_cluster_transactions"], 10)
+                self.assertEqual(locality["intra_cluster_transactions"], 190)
+                self.assertEqual(locality["cross_cluster_ratio"], .05)
+                self.assertEqual(sum(expected["executed"].values()), 420)
+                if method == "ahl":
+                    self.assertEqual(expected["ordered"][7], 200)
+                elif method == "sharper":
+                    self.assertEqual(sum(expected["ordered"].values()), 0)
+                else:
+                    self.assertEqual(expected["ordered"][7], 10)
+                    self.assertEqual(expected["ordered"][5] + expected["ordered"][6], 190)
+
+    def test_metadata_cannot_hide_nonlocal_transactions_or_change_reference_parents(self):
+        for mutation in ("counter", "clusters", "parent"):
+            changed = copy.deepcopy(self.workload)
+            if mutation == "counter":
+                changed["locality"]["cross_cluster_transactions"] = 0
+            elif mutation == "clusters":
+                changed["locality"]["clusters"]["5"] = [1, 2, 3]
+            else:
+                changed["locality"]["reference_parent"]["8"] = 6
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                b.expectations(self.arbor, changed)
+
+    def test_legacy_workload_without_metadata_keeps_original_accounting(self):
+        cfg, workload, _, _ = fixture()
+        self.assertNotIn("locality", b.expectations(cfg, workload))
 
 
 class VisibleClientProgress(unittest.TestCase):
