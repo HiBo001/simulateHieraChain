@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare Arbor with SharPer/Saguaro on one shared mixed cross-shard workload."""
+"""Compare Arbor with SharPer/Saguaro/AHL on one shared mixed cross-shard workload."""
 import argparse
 import copy
 import datetime
@@ -67,7 +67,8 @@ def comparison_row(result, workload, repeat):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "config/three_layer_cross100.json")
-    parser.add_argument("--baseline", choices=("saguaro", "sharper"), default="sharper")
+    parser.add_argument("--baseline", choices=("saguaro", "sharper", "ahl"), default="sharper")
+    parser.add_argument("--baseline-config", type=Path, help="AHL 使用独立两层配置；Arbor 保留 --config 拓扑")
     parser.add_argument("--workload", type=Path, help="复用 unsigned JSON；与 count/rate/batch/seed 互斥")
     parser.add_argument("--count", type=int, help="生成的交易数，默认 10000")
     parser.add_argument("--rate", type=float, help="生成的每秒提交交易数，默认 5000")
@@ -87,6 +88,9 @@ def main(argv=None):
         raise ValueError("--workload 与 --count/--rate/--batch/--seed 互斥")
     source = c.read(args.config)
     cfg = c.validate(source)
+    baseline_source = c.read(args.baseline_config) if args.baseline_config else source
+    baseline_cfg = c.validate(baseline_source)
+    comparison_context = compare.validate_comparison_configs(cfg, baseline_cfg, args.baseline, args.baseline_config is not None)
     if args.workload:
         workload = c.read(args.workload)
         mixed.expectations(cfg, workload)
@@ -99,6 +103,7 @@ def main(argv=None):
                                          args.batch if args.batch is not None else 10,
                                          args.seed if args.seed is not None else 42, args.timeout)
     expected = mixed.expectations(cfg, workload)
+    mixed.expectations(baseline_cfg, workload, args.baseline)
     if workload["timeout_s"] <= (expected["transactions"] - len(workload["requests"][-1]["txs"])) / workload["rate"]:
         raise ValueError("timeout 太短，负载尚未发完就会结束")
     methods = ("arbor", args.baseline)
@@ -116,6 +121,8 @@ def main(argv=None):
     config_snapshot = folder / "config-snapshot.json"
     c.write(shared, workload)
     c.write(config_snapshot, source)
+    baseline_config_snapshot = folder / "baseline-config-snapshot.json"
+    c.write(baseline_config_snapshot, baseline_source)
     report = {"schema_version": 1, "kind": "arbor-" + args.baseline + "-mixed-exact-workload",
               "baseline": args.baseline, "config": cfg, "config_source": str(args.config.resolve()),
               "workload_source": str(args.workload.resolve()) if args.workload else None,
@@ -129,6 +136,16 @@ def main(argv=None):
                                                         capture_output=True, text=True).stdout.strip()),
               "binary_sha256": {method: hashlib.sha256(binary.read_bytes()).hexdigest() for method, binary in binaries.items()},
               "expected_pairs": args.repeat, "cases": [], "comparisons": [], "method_comparisons": []}
+    report["comparison_context"] = comparison_context
+    report["method_configs"] = {
+        "arbor": {"config": cfg, "source": str(args.config.resolve()),
+                  "input_sha256": hashlib.sha256(args.config.read_bytes()).hexdigest(),
+                  "snapshot": str(config_snapshot),
+                  "snapshot_sha256": hashlib.sha256(config_snapshot.read_bytes()).hexdigest()},
+        args.baseline: {"config": baseline_cfg, "source": str((args.baseline_config or args.config).resolve()),
+                  "input_sha256": hashlib.sha256((args.baseline_config or args.config).read_bytes()).hexdigest(),
+                  "snapshot": str(baseline_config_snapshot),
+                  "snapshot_sha256": hashlib.sha256(baseline_config_snapshot.read_bytes()).hexdigest()}}
     print(f"混合负载比较结果目录: {folder}", flush=True)
     compare.save(folder, report)
     try:
@@ -137,13 +154,15 @@ def main(argv=None):
             results = {}
             for method in order:
                 print(f"[{repeat}/{args.repeat}] {method} shared_sha256={report['workload_sha256']}", flush=True)
-                result = mixed.run(config_snapshot, shared, folder / f"repeat-{repeat:03d}" / method,
+                result = mixed.run(config_snapshot if method == "arbor" else baseline_config_snapshot,
+                                   shared, folder / f"repeat-{repeat:03d}" / method,
                                    method, drain_timeout=args.drain_timeout)
                 row = comparison_row(result, workload, repeat)
+                compare.bind_comparison(row, comparison_context, shared)
                 results[method] = row
                 report["cases"].append(row)
                 compare.save(folder, report)
-            pair = compare.paired_comparison(results["arbor"], results[args.baseline], args.baseline)
+            pair = compare.paired_comparison(results["arbor"], results[args.baseline], args.baseline, comparison_context)
             report["method_comparisons"].append(pair)
             compare.save(folder, report)
             print((f"Arbor / {args.baseline} TPS={pair['arbor_over_' + args.baseline + '_tps']:.3f}"

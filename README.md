@@ -298,3 +298,26 @@ make clean
 第一阶段改造前的源码和运行入口快照保留在历史标签 `stage1-pbft` 的 `legacy/pre-stage1/` 中，当前工作区已移除该目录。旧格式配置文件现在位于 `config/`；`shard*/shardId`、`shard*/lldb_commands.txt` 位于对应分片目录，均不由新入口读取；`shard*/node.log` 是历史日志。历史 PDF 不改动。旧 `llb_start_all.sh` 仅提示使用新的启动方式。
 
 多层实现的详细设计见 [docs/MULTILAYER_DESIGN.md](docs/MULTILAYER_DESIGN.md)，本轮验收与复测记录见 [docs/MULTILAYER_VALIDATION.md](docs/MULTILAYER_VALIDATION.md)。
+
+## AHL：唯一上层的 2PC 基线
+
+`baseline/ahl/` 实现本项目定义的 AHL：所有叶子直接连接唯一上层分片，由该上层协调全部跨片 2PC。它复用 Saguaro 的真实 PBFT、锁、故障恢复、执行和去重；启动器与二进制均拒绝多层 AHL 拓扑。
+
+```bash
+make ahl
+python3 -B scripts/cluster.py start --method ahl --config config/ahl_two_layer.json
+python3 -B scripts/cluster.py load --participants 1,2,3 --count 4000 --rate 1000 --batch 10 --timeout 180
+python3 -B scripts/cluster.py stop
+```
+
+Arbor 保留多层、AHL 使用两层时，明确提供两份配置；相同叶子集合、批量、执行和共同链路延时会被核对，两种方法复用同一业务负载。
+
+```bash
+python3 -B baseline/compare_mixed.py --baseline ahl \
+  --config config/three_layer_cross100.json \
+  --baseline-config config/ahl_two_layer.json \
+  --count 10000 --rate 5000 --batch 10 --repeat 3 --seed 42 \
+  --timeout 180 --drain-timeout 60
+```
+
+此比较包含拓扑和节点数差异：示例中 Arbor 为 7 片/28 节点，AHL 为 5 片/20 节点。结果保存两份配置、共同负载 SHA256、完成 TPS 与秒制延时，失败轮次不算成功比值。固定参与分片也可用 `baseline/compare.py --baseline ahl --baseline-config ...`。具体流程与测试说明见 [baseline/ahl/README.md](baseline/ahl/README.md)、[baseline/ahl/DESIGN.md](baseline/ahl/DESIGN.md)；执行 `make test-ahl` 运行 AHL 回归。

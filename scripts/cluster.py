@@ -23,7 +23,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "build/bin/arbor_node"
 RUN_PROCESSES = {}
-METHODS = ("arbor", "saguaro", "sharper")
+METHODS = ("arbor", "saguaro", "sharper", "ahl")
 
 
 def binary_for_method(method="arbor"):
@@ -160,6 +160,18 @@ def topology(c):
     return parent, leaves
 
 
+def validate_method_config(c, method="arbor"):
+    """Method-specific constraints, checked before keys, ports or processes."""
+    binary_for_method(method)
+    if method == "ahl":
+        parent, leaves = topology(c)
+        roots = [sid for sid, ancestor in parent.items() if ancestor is None]
+        if (len(roots) != 1 or len(leaves) < 2 or len(parent) != len(leaves) + 1
+                or any(ancestor != roots[0] for sid, ancestor in parent.items() if sid != roots[0])):
+            raise ValueError("AHL 必须恰有一个上层根分片和至少两个叶子，所有叶子直接连接根；不能使用多层拓扑")
+    return c
+
+
 def format_topology(c):
     parent, _ = topology(c)
     root = next(sid for sid, ancestor in parent.items() if ancestor is None)
@@ -274,7 +286,7 @@ def statuses(run):
 def start(config, run=None, method="arbor"):
     binary = binary_for_method(method)
     explicit_run = run is not None
-    c = validate(read(config))
+    c = validate_method_config(validate(read(config)), method)
     if not binary.exists():
         raise ValueError(f"找不到 {binary}，请先运行 make")
     root_runtime = ROOT / "runtime"
@@ -465,9 +477,9 @@ def main():
     for name in ["validate", "start", "restart"]:
         p = commands.add_parser(name)
         p.add_argument("--config", default=str(ROOT / "config/two_layer.json"))
+        p.add_argument("--method", choices=METHODS, default="arbor")
         if name in ("start", "restart"):
             p.add_argument("--run-dir")
-            p.add_argument("--method", choices=METHODS, default="arbor")
     p = commands.add_parser("topology", help="打印最近一次运行或指定配置的分片拓扑")
     source = p.add_mutually_exclusive_group()
     source.add_argument("--run-dir", help="运行目录；默认 runtime/latest")
@@ -497,10 +509,12 @@ def main():
             p.add_argument("--replica", type=int, required=True)
     a = parser.parse_args()
     if a.command == "validate":
-        c = validate(read(a.config))
+        c = validate_method_config(validate(read(a.config)), a.method)
         parent, leaves = topology(c)
         print(json.dumps({"shard_count": len(parent), "node_count": 4 * len(parent), "root": next(s for s,p in parent.items() if p is None), "leaves": leaves, "parents": parent, "network": c["network"]}, ensure_ascii=False, indent=2))
     elif a.command in ("start", "restart"):
+        # An invalid destination must not stop an existing cluster on restart.
+        validate_method_config(validate(read(a.config)), a.method)
         if a.command == "restart":
             latest = ROOT / "runtime/latest"
             if (latest / "manifest.json").is_file():

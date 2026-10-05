@@ -11,3 +11,19 @@
 流水线协议已移除，`consensus.pipeline_window` 不再是有效配置项。迁移之前的配置时请删除该字段，即使其值为 `0` 也需要删除；启动器会明确报错，不会静默忽略该字段。已有运行目录包含旧配置时，请停止旧节点并用新的配置重新启动。
 
 完整跨片执行支持多层树和至少两个不重复的参与叶子。`three_layer.json` 包含 7 个分片（28 节点）；`four_layer.json` 是非均匀深度的四层树，包含 9 个分片（36 节点），叶子为 1、2、3、4、8：`1,2` 的 NCA 为 5，`1,3` 的 NCA 为 7，`1,8` 的 NCA 为 9。多协调者通过认证轮次封闭确定跨层顺序；这些控制槽不算业务交易。所有例子仍使用 JSON 定义拓扑，分片运行目录不放在 `config/` 内。
+
+## AHL 两层配置
+
+`ahl_two_layer.json` 用于 AHL：叶子 1、2、3、4 都直接接到唯一上层 7。它对应 `three_layer_cross100.json` 的同一批叶子，共识、执行、片内延时和保留下来的链路延时相同；中间分片 5、6 及相关链路被移除。1↔7=10 ms，3↔7=30 ms；2↔7、4↔7 使用两份配置相同的默认值 20 ms。
+
+```text
+7
+├── 1
+├── 2
+├── 3
+└── 4
+```
+
+`--method ahl` 强制所有非根分片为根的直接子片、至少两个叶子。需要其他数量或 ID 时可编辑或新增该目录内的 JSON；`two_layer.json` 也能用于两叶子的 AHL。原 Arbor/Saguaro/SharPer 拓扑校验规则保持原样。
+
+与 Arbor 多层比较时使用 `--config config/three_layer_cross100.json --baseline-config config/ahl_two_layer.json --baseline ahl`，不会静默把 Arbor 的拓扑压平；每轮运行目录仍归入 runtime/test-results，不放入 config。

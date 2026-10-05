@@ -17,6 +17,7 @@ from benchmark import config_fingerprint, free_ports, METRICS, COUNTERS
 
 def expectations(cfg, workload, method="arbor"):
     """Derive every leaf and coordinator's exact count, including mixed LCAs."""
+    c.validate_method_config(cfg, method)
     parent, leaves = c.topology(cfg)
     if not isinstance(workload, dict):
         raise ValueError("负载必须为 JSON 对象")
@@ -54,7 +55,13 @@ def expectations(cfg, workload, method="arbor"):
             if group is not None and tuple(ps) != group:
                 raise ValueError("同一请求内的交易必须具有相同的参与分片")
             group = tuple(ps)
-            if request.get("target") != c.lca(cfg, ps):
+            target = c.lca(cfg, ps)
+            if method == "ahl":
+                # The shared file may carry an Arbor intermediate-LCA hint.
+                # The AHL client reroutes this hint before signing the request.
+                if type(request.get("target")) is not int or request["target"] < 1:
+                    raise ValueError("请求 target 路由提示必须为正整数")
+            elif request.get("target") != target:
                 raise ValueError("请求 target 必须是参与分片的最近公共祖先")
             accesses = tx.get("accesses")
             if (not isinstance(accesses, list) or any(not isinstance(a, dict) for a in accesses)
@@ -65,7 +72,7 @@ def expectations(cfg, workload, method="arbor"):
             for sid in ps:
                 executed[sid] += 1
             if method != "sharper":
-                ordered[request["target"]] += 1
+                ordered[target] += 1
             label = ",".join(map(str, ps))
             groups[label] = groups.get(label, 0) + 1
             sizes[str(len(ps))] = sizes.get(str(len(ps)), 0) + 1
@@ -86,7 +93,7 @@ def settlement_errors(cfg, expected, rows, method):
     required_counts = ("applied_batches", "executed_transactions", "ordered_cst_transactions",
                        "completed_cst_transactions", "pending_requests", "pending_cst_batches",
                        "staged_cst_batches", "dedup_waiting_requests", "network_queue", "network_buffered_bytes")
-    if method == "saguaro":
+    if method in ("saguaro", "ahl"):
         required_counts += ("sag_active_batches", "sag_pending_prepares", "sag_pending_decisions",
                             "sag_pending_completions", "sag_held_locks")
     elif method == "arbor":
@@ -127,7 +134,7 @@ def settlement_errors(cfg, expected, rows, method):
                         "dedup_waiting_requests", "network_queue", "network_buffered_bytes")
         if any(r.get(field, 0) for r in peers for field in queue_fields):
             problems.append(f"分片 {sid} 尚有待处理交易或网络消息")
-        if method == "saguaro":
+        if method in ("saguaro", "ahl"):
             fields = ("sag_active_batches", "sag_pending_prepares", "sag_pending_decisions",
                       "sag_pending_completions", "sag_held_locks")
             if any(field not in r or r[field] for r in peers for field in fields):
@@ -180,7 +187,7 @@ def wait_client(proc, log_path, timeout):
 
 def run(config_path, workload_path, output_dir, method, timeout=None, drain_timeout=30):
     raw, workload = c.read(config_path), c.read(workload_path)
-    validated = c.validate(raw)
+    validated = c.validate_method_config(c.validate(raw), method)
     expected = expectations(validated, workload, method)
     workload = copy.deepcopy(workload)
     if timeout is not None:

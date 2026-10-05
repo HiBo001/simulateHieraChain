@@ -20,6 +20,9 @@ struct Membership {
     std::map<std::string,Key> publicKeys;
     std::map<int,int> parent;
     std::set<int> leaves;
+#ifdef ARBOR_AHL
+    int ahlRoot=-1;
+#endif
     Key clientKey;
     explicit Membership(const json& c): config(c), run(c.at("run_id")) {
         if(c.at("consensus").contains("pipeline_window"))
@@ -30,6 +33,18 @@ struct Membership {
             leaves.insert(id);
         }
         for (const auto& [id,p]:parent) { (void)id; leaves.erase(p); }
+#ifdef ARBOR_AHL
+        // Enforce the AHL topology in the binary as well as in the launcher.
+        // This also protects clients and direct node invocations with raw configs.
+        std::vector<int> roots;
+        for(const auto& [id,p]:parent) if(p==-1) roots.push_back(id);
+        if(roots.size()!=1 || leaves.size()<2 || parent.size()!=leaves.size()+1 ||
+           parent.size()!=c.at("shards").size() || leaves.count(roots.front()))
+            throw std::runtime_error("AHL requires one upper shard and at least two direct leaf shards");
+        for(const auto& [id,p]:parent) if(id!=roots.front() && p!=roots.front())
+            throw std::runtime_error("AHL requires every leaf to be a direct child of its sole upper shard");
+        ahlRoot=roots.front();
+#endif
         for (const auto& n:c.at("nodes")) {
             auto id=identity(n.at("shard"),n.at("replica"));
             endpoints[id]={n.at("host"),n.at("port")};
@@ -57,6 +72,9 @@ struct Membership {
         return result;
     }
     bool multiLayer() const { return coordinators().size()>1; }
+#ifdef ARBOR_AHL
+    int ahlCoordinator() const { return ahlRoot; }
+#endif
     std::set<int> ancestors(int leaf) const {
         std::set<int> result;
         for(int id=parent.at(leaf);id!=-1;id=parent.at(id)) result.insert(id);
@@ -1956,6 +1974,11 @@ class Replica {
             {"bytes_received",net.bytes_received.load()},{"network_queue",net.queued()},{"probes",probes}};
 #ifdef ARBOR_SAGUARO
         saguaroStatus(s);
+#ifdef ARBOR_AHL
+        s["method"]="ahl";
+        s["ahl_coordinator"]=members.ahlCoordinator();
+        s["ahl_topology"]="two-layer";
+#endif
 #elif defined(ARBOR_SHARPER)
         sharperStatus(s);
 #else
@@ -1964,7 +1987,11 @@ class Replica {
         writeJson(dir+"/status.json",s);
     }
 #ifdef ARBOR_SAGUARO
+#ifdef ARBOR_AHL
+#include "../baseline/ahl/protocol.inc"
+#else
 #include "../baseline/saguaro/protocol.inc"
+#endif
 #elif defined(ARBOR_SHARPER)
 #include "../baseline/sharper/protocol.inc"
 #endif
@@ -2114,6 +2141,13 @@ static int client(const json& cfg,const json& workload,const std::string& output
         auto now=Clock::now();double elapsed=std::chrono::duration<double>(now-begin).count();
         while(next<jobs.size() && elapsed>=nextDue) {
             auto body=jobs[next++];int shard=body.at("target");std::string id=body.at("id");
+#ifdef ARBOR_AHL
+            // A shared Arbor workload may name an intermediate NCA. Route its
+            // unchanged business transactions to AHL's single upper shard.
+            if(!body.at("txs").empty() && body.at("txs")[0].at("participants").size()>1) {
+                shard=members.ahlCoordinator();body["target"]=shard;
+            }
+#endif
 #ifdef ARBOR_SHARPER
             if(!body.at("txs").empty() && body.at("txs")[0].at("participants").size()>1) {
                 const auto ps=body.at("txs")[0].at("participants").get<std::vector<int>>();

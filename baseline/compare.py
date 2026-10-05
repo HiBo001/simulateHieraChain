@@ -3,6 +3,7 @@
 import argparse
 import datetime
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -19,15 +20,78 @@ import cluster as c
 import benchmark as b
 
 
-def paired_comparison(arbor, baseline_result, baseline="saguaro"):
-    if baseline not in ("saguaro", "sharper"):
-        raise ValueError("baseline 必须为 saguaro 或 sharper")
+def validate_comparison_configs(arbor_cfg, baseline_cfg, baseline, separate_config=False):
+    """Authorize only an explicit AHL topology comparison, keeping costs equal."""
+    if baseline not in ("saguaro", "sharper", "ahl"):
+        raise ValueError("baseline 必须为 saguaro、sharper 或 ahl")
+    c.validate_method_config(arbor_cfg, "arbor")
+    c.validate_method_config(baseline_cfg, baseline)
+    if separate_config and baseline != "ahl":
+        raise ValueError("--baseline-config 仅适用于 AHL 的两层拓扑比较")
+    fingerprints = {"arbor": b.config_fingerprint(arbor_cfg), baseline: b.config_fingerprint(baseline_cfg)}
+    if fingerprints["arbor"] != fingerprints[baseline] and not (baseline == "ahl" and separate_config):
+        raise ValueError("两种方法必须使用相同配置；AHL 不同拓扑须显式指定 --baseline-config")
+    arbor_parent, arbor_leaves = c.topology(arbor_cfg)
+    baseline_parent, baseline_leaves = c.topology(baseline_cfg)
+    if arbor_leaves != baseline_leaves:
+        raise ValueError("两种方法的叶子分片 ID 集合必须完全相同")
+    for field in ("replicas_per_shard", "host", "consensus", "execution"):
+        if arbor_cfg[field] != baseline_cfg[field]:
+            raise ValueError(f"两种方法的 {field} 必须完全相同")
+    for field in ("intra_shard_delay_ms", "trace"):
+        if arbor_cfg["network"][field] != baseline_cfg["network"][field]:
+            raise ValueError(f"两种方法的 network.{field} 必须完全相同")
+    common = sorted(set(arbor_parent) & set(baseline_parent))
+    delays = {}
+    for index, a in enumerate(common):
+        for d in common[index + 1:]:
+            values = [cfg["network"]["resolved_links"].get(f"{a}:{d}",
+                      cfg["network"]["default_inter_shard_delay_ms"]) for cfg in (arbor_cfg, baseline_cfg)]
+            if values[0] != values[1]:
+                raise ValueError(f"共同分片 {a}/{d} 的实际单向延迟必须相同")
+            delays[f"{a}:{d}"] = values[0]
+    context = {"validated": True, "baseline": baseline, "separate_config": bool(separate_config),
+               "config_fingerprints": fingerprints, "leaves": arbor_leaves,
+               "common_shard_delays_ms": delays,
+               "topology_difference": {"arbor_parents": arbor_parent, "baseline_parents": baseline_parent,
+                   "arbor_only_shards": sorted(set(arbor_parent) - set(baseline_parent)),
+                   "baseline_only_shards": sorted(set(baseline_parent) - set(arbor_parent)),
+                   "different": arbor_parent != baseline_parent}}
+    context["comparison_group"] = hashlib.sha256(json.dumps(context, sort_keys=True,
+                                separators=(",", ":")).encode()).hexdigest()
+    return context
+
+
+def bind_comparison(row, context, shared):
+    """Bind the actual replay file to the prevalidated configuration pair."""
+    row["comparison_group"] = context["comparison_group"]
+    row["shared_workload_sha256"] = hashlib.sha256(Path(shared).read_bytes()).hexdigest()
+    return row
+
+
+def paired_comparison(arbor, baseline_result, baseline="saguaro", comparison_context=None):
+    if baseline not in ("saguaro", "sharper", "ahl"):
+        raise ValueError("baseline 必须为 saguaro、sharper 或 ahl")
     item = {name: arbor.get(name) for name in ("mode", "repeat", "count", "rate", "batch", "seed")}
     item.update(comparable=False, baseline=baseline, workload_sha256=arbor.get("workload_sha256"))
     fields = ("mode", "repeat", "count", "rate", "batch", "seed", "shard", "participants",
-              "config_fingerprint", "workload_sha256")
+              "workload_sha256")
+    same_config = arbor.get("config_fingerprint") == baseline_result.get("config_fingerprint")
+    context = comparison_context or {}
+    different_ahl_config = (baseline == "ahl" and context.get("validated") is True
+        and context.get("baseline") == baseline and context.get("separate_config") is True
+        and bool(context.get("comparison_group"))
+        and all(row.get("comparison_group") == context["comparison_group"]
+            and row.get("config_fingerprint") == context.get("config_fingerprints", {}).get(method)
+            for row, method in ((arbor, "arbor"), (baseline_result, baseline)))
+        and bool(arbor.get("shared_workload_sha256"))
+        and all(row.get("input_workload_sha256") == row.get("workload_sha256")
+                == row.get("shared_workload_sha256") == arbor["shared_workload_sha256"]
+                for row in (arbor, baseline_result)))
     if arbor.get("method") != "arbor" or baseline_result.get("method") != baseline:
         item["reason"] = "方法标识不匹配"
+    elif not (same_config or different_ahl_config):
+        item["reason"] = "配置不同且未通过显式 AHL 双拓扑验证，不计算比值"
     elif not arbor.get("workload_sha256") or any(arbor.get(k) != baseline_result.get(k) for k in fields):
         item["reason"] = "配置或实际负载内容不同，不计算比值"
     elif any(row.get("status") != "PASS" or not b.finite_number(row.get("completed_tps"), True)
@@ -67,7 +131,7 @@ def summarize_pairs(pairs):
 
 def save(folder, report):
     baseline = report.get("baseline", "saguaro")
-    label = {"saguaro": "Saguaro", "sharper": "SharPer"}[baseline]
+    label = {"saguaro": "Saguaro", "sharper": "SharPer", "ahl": "AHL"}[baseline]
     report["paired_aggregates"] = summarize_pairs(report["method_comparisons"])
     report["status"] = ("FAIL" if any(row["status"] != "PASS" for row in report["cases"]) else
                         "PASS" if len(report["method_comparisons"]) == report.get("expected_pairs", 0)
@@ -93,6 +157,13 @@ def save(folder, report):
         lines += ["", "失败轮次：", ""]
         lines += [f"- {row['method']} / {row['mode']} / repeat={row['repeat']}: " +
                   "; ".join(row["failure_reasons"]) for row in failures]
+    context = report.get("comparison_context", {})
+    if context.get("topology_difference", {}).get("different"):
+        lines += ["", "## 双拓扑配置", "",
+                  "Arbor 保留原层级；AHL 使用一个上层根分片。叶子 ID、PBFT/组批、执行成本、片内延迟及共同分片的实际链路延迟已验证一致。",
+                  "节点数和经过的协议路径不同，这是本次比较的一部分。两份配置与 SHA256 保存在 summary.json。", ""]
+        for method, config in report.get("method_configs", {}).items():
+            lines += [f"### {method}", "", "```text", c.format_topology(config["config"]), "```", ""]
     lines += ["", "详细指标、输入 SHA256 和每轮日志路径见 `summary.json`、`summary.csv`。", ""]
     (folder / "summary.md").write_text("\n".join(lines))
 
@@ -100,7 +171,8 @@ def save(folder, report):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "config/two_layer.json")
-    parser.add_argument("--baseline", choices=("saguaro", "sharper"), default="saguaro")
+    parser.add_argument("--baseline", choices=("saguaro", "sharper", "ahl"), default="saguaro")
+    parser.add_argument("--baseline-config", type=Path, help="AHL 使用独立两层配置；Arbor 保留 --config 拓扑")
     parser.add_argument("--mode", choices=("intra", "cross", "all"), default="cross")
     parser.add_argument("--shard", type=int, default=1)
     parser.add_argument("--participants", default="1,2")
@@ -126,8 +198,12 @@ def main(argv=None):
         raise ValueError("timeout 和 drain-timeout 必须是有限正数")
     source = c.read(args.config)
     cfg = c.validate(source)
+    baseline_source = c.read(args.baseline_config) if args.baseline_config else source
+    baseline_cfg = c.validate(baseline_source)
+    comparison_context = validate_comparison_configs(cfg, baseline_cfg, args.baseline, args.baseline_config is not None)
     participants = sorted(int(p) for p in args.participants.split(","))
     b.validate_selection(cfg, args.mode, args.shard, participants)
+    b.validate_selection(baseline_cfg, args.mode, args.shard, participants)
     cases = []
     for mode in (("intra", "cross") if args.mode == "all" else (args.mode,)):
         limit = cfg["consensus"]["batch_size" if mode == "intra" else "cross_shard_batch_size"]
@@ -159,6 +235,17 @@ def main(argv=None):
               "binary_sha256": {method: hashlib.sha256(path.read_bytes()).hexdigest() for method, path in binaries.items()},
               "expected_pairs": len(cases), "cases": [], "comparisons": [], "method_comparisons": []}
     c.write(folder / "config-snapshot.json", source)
+    c.write(folder / "baseline-config-snapshot.json", baseline_source)
+    report["comparison_context"] = comparison_context
+    report["method_configs"] = {
+        "arbor": {"config": cfg, "source": str(args.config.resolve()),
+                  "input_sha256": hashlib.sha256(args.config.read_bytes()).hexdigest(),
+                  "snapshot": str(folder / "config-snapshot.json"),
+                  "snapshot_sha256": hashlib.sha256((folder / "config-snapshot.json").read_bytes()).hexdigest()},
+        args.baseline: {"config": baseline_cfg, "source": str((args.baseline_config or args.config).resolve()),
+                  "input_sha256": hashlib.sha256((args.baseline_config or args.config).read_bytes()).hexdigest(),
+                  "snapshot": str(folder / "baseline-config-snapshot.json"),
+                  "snapshot_sha256": hashlib.sha256((folder / "baseline-config-snapshot.json").read_bytes()).hexdigest()}}
     print(f"同负载比较结果目录: {folder}", flush=True)
     try:
         for index, case in enumerate(cases, 1):
@@ -167,21 +254,23 @@ def main(argv=None):
                 shard=case["shard"], participants=case["participants"] or None, batch=case["batch"], timeout=timeout)
             case_folder = folder / f"case-{index:03d}"
             case_folder.mkdir()
-            c.write(case_folder / "shared-workload.json", shared)
+            shared_path = case_folder / "shared-workload.json"
+            c.write(shared_path, shared)
             order = ("arbor", args.baseline) if case["repeat"] % 2 else (args.baseline, "arbor")
             results = {}
             for method in order:
                 print(f"[{index}/{len(cases)}] {method} {case['mode']} count={case['count']} "
                       f"rate={case['rate']:g} batch={case['batch']} repeat={case['repeat']}", flush=True)
-                row = b.run_case(case, source, case_folder / method, timeout, args.drain_timeout,
-                                 method=method, workload=shared)
+                row = b.run_case(case, source if method == "arbor" else baseline_source,
+                                 case_folder / method, timeout, args.drain_timeout, method=method, workload=shared_path)
+                bind_comparison(row, comparison_context, shared_path)
                 results[method] = row
                 report["cases"].append(row)
                 save(folder, report)
                 print((f"PASS {method} tps={row['completed_tps']:.2f} avg_s={row['avg_latency_s']:.6f} "
                        f"p95_s={row['p95_s']:.6f}" if row["status"] == "PASS" else
                        f"FAIL {method}: " + "; ".join(row["failure_reasons"])), flush=True)
-            pair = paired_comparison(results["arbor"], results[args.baseline], args.baseline)
+            pair = paired_comparison(results["arbor"], results[args.baseline], args.baseline, comparison_context)
             report["method_comparisons"].append(pair)
             save(folder, report)
             print((f"Arbor / {args.baseline} TPS={pair['arbor_over_' + args.baseline + '_tps']:.3f}" if pair["comparable"]

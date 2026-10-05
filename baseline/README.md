@@ -116,3 +116,36 @@ python3 -B baseline/compare_mixed.py --baseline sharper \
 两个入口自动依次运行新集群，重复轮次交替顺序；核对同一配置、同一实际负载 SHA256、唯一交易完成、四副本收敛及协议队列排空后，才报告 `arbor_over_sharper_tps`。失败轮次不参与成功比值，整组比值留空。SharPer 所有节点的 NCA 排序/完成计数为零，叶子执行数按各自参与的交易计算。
 
 执行 `make sharper` 单独构建，执行 `make test-sharper` 运行其工具与集群回归。具体协议、预约调度与当前故障支持范围见 [sharper/README.md](sharper/README.md)。
+
+## AHL 与 Arbor 的同负载比较
+
+`baseline/ahl/` 复用 Saguaro 2PC，强制所有叶子只连接一个上层分片，统一由该上层协调所有跨片交易。每片仍有四个真实 PBFT 副本；协调片 INIT/DECIDE、参与片 PREPARE/FINISH 都实际共识。片内交易直接在叶子执行。实现和测试说明见 [ahl/README.md](ahl/README.md)。
+
+Arbor 保留多层，AHL 用同叶子的两层配置：
+
+```bash
+python3 -B baseline/compare_mixed.py --baseline ahl \
+  --config config/three_layer_cross100.json \
+  --baseline-config config/ahl_two_layer.json \
+  --count 10000 --rate 5000 --batch 10 --repeat 3 --seed 42 \
+  --timeout 180 --drain-timeout 60
+```
+
+固定两方参与的负载：
+
+```bash
+python3 -B baseline/compare.py --baseline ahl \
+  --config config/three_layer_cross100.json \
+  --baseline-config config/ahl_two_layer.json --participants 1,2 \
+  --count 4000 --rate 1000 --batch 10 --repeat 3 --seed 42 \
+  --timeout 180 --drain-timeout 60
+```
+
+这两个入口共享实际 unsigned 负载、交易 ID、读写集、请求分组、速率和超时。AHL 客户端签名前把跨片请求的旧 NCA 路由提示改成唯一上层；交易内容保持一致。对比报告记录各自拓扑、节点数、配置 SHA256，不将不同拓扑标成相同配置。共同叶子、共识/执行设置、片内和共同链路实际延时必须一致。完整客户端确认、全部副本状态收敛、2PC 和锁排空后才计算 `arbor_over_ahl_tps`。
+
+省略 `--baseline-config` 可以在同一两层拓扑比较两种方法。Arbor/Saguaro/SharPer 的原有同配置严格配对规则不变；AHL 的不同配置必须明确指定。已有混合 JSON 用 `--workload 路径` 替代生成参数。
+
+```bash
+make ahl
+make test-ahl
+```

@@ -54,6 +54,8 @@ def settlement_errors(case, cfg, rows):
     problems = []
     if actual != expected or len(rows) != len(expected):
         return ["节点状态不完整"]
+    if any("method" in row and row["method"] != method for row in rows):
+        problems.append("节点运行方法与测试方法不符")
     coordinator = c.lca(cfg, case["participants"]) if case["mode"] == "cross" else None
     for sid in parent:
         peers = [r for r in rows if r["shard"] == sid]
@@ -82,10 +84,10 @@ def settlement_errors(case, cfg, rows):
                 "pending_requests", "pending_cst_batches", "staged_cst_batches", "dedup_waiting_requests",
                 "network_queue", "network_buffered_bytes")):
             problems.append(f"分片 {sid} 尚有待处理交易")
-        if method == "saguaro":
+        if method in ("saguaro", "ahl"):
             fields = ("sag_active_batches", "sag_pending_prepares", "sag_pending_decisions", "sag_held_locks", "sag_pending_completions")
-            if any(field not in row for row in peers for field in fields):
-                problems.append(f"分片 {sid} 缺少 2PC 状态统计")
+            if any(type(row.get(field)) is not int or row[field] < 0 for row in peers for field in fields):
+                problems.append(f"分片 {sid} 缺少或具有无效的 2PC 状态统计")
             elif any(row[field] for row in peers for field in fields):
                 problems.append(f"分片 {sid} 仍有未结束的 2PC 或未释放的锁")
         elif method == "sharper":
@@ -237,10 +239,13 @@ def validate_workload(case, cfg, workload, timeout):
     if not isinstance(requests, list) or not requests:
         raise ValueError("复用负载必须包含非空 requests")
     target = c.lca(cfg, case["participants"]) if case["mode"] == "cross" else case["shard"]
+    routed_by_ahl = case.get("method") == "ahl" and case["mode"] == "cross"
     participants = sorted(case["participants"]) if case["mode"] == "cross" else [case["shard"]]
     seen_requests, seen_txs = set(), set()
     for i, req in enumerate(requests):
-        if not isinstance(req, dict) or req.get("target") != target or not isinstance(req.get("id"), str):
+        if (not isinstance(req, dict) or not isinstance(req.get("id"), str)
+                or (not routed_by_ahl and req.get("target") != target)
+                or (routed_by_ahl and (type(req.get("target")) is not int or req["target"] < 1))):
             raise ValueError("复用负载的请求 ID/目标不符合用例")
         if req["id"] in seen_requests:
             raise ValueError("复用负载出现重复请求 ID")
@@ -262,6 +267,10 @@ def validate_workload(case, cfg, workload, timeout):
 def run_case(case, source, folder, timeout, drain_timeout, method="arbor", workload=None):
     c.binary_for_method(method)
     case = dict(case, method=method)
+    c.validate_method_config(c.validate(source), method)
+    input_workload = Path(workload) if isinstance(workload, (str, Path)) else None
+    if input_workload is not None:
+        workload = c.read(input_workload)
     raw = copy.deepcopy(source)
     raw["base_port"] = free_ports(raw.get("host", "127.0.0.1"), 4 * len(raw["shards"]))
     folder.mkdir(parents=True)
@@ -309,7 +318,9 @@ def run_case(case, source, folder, timeout, drain_timeout, method="arbor", workl
         c.write(folder / "status-after.json", after)
         row = summarize_case(case, cfg, client_rc, result, before, after, drained)
         row.update(run_dir=str(run), client_result=str(output), client_log=str(folder / "client.log"),
-                   workload_path=str(job), workload_sha256=workload_fingerprint(workload),
+                   workload_path=str(job), workload_sha256=hashlib.sha256(job.read_bytes()).hexdigest(),
+                   input_workload_sha256=hashlib.sha256(input_workload.read_bytes()).hexdigest() if input_workload else hashlib.sha256(job.read_bytes()).hexdigest(),
+                   workload_source=str(input_workload.resolve()) if input_workload else None,
                    case_wall_s=time.monotonic() - started, timeout_s=timeout,
                    minimum_send_s=(case["count"] - len(workload["requests"][-1]["txs"])) / case["rate"])
         return row
@@ -377,7 +388,7 @@ def main(argv=None):
     if args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0):
         raise ValueError("timeout 必须是有限正数")
     source = c.read(args.config)
-    cfg = c.validate(source)
+    cfg = c.validate_method_config(c.validate(source), args.method)
     participants = sorted(int(p) for p in args.participants.split(","))
     validate_selection(cfg, args.mode, args.shard, participants)
     cases = []
