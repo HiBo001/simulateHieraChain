@@ -59,14 +59,14 @@ def assert_no_writers(root, processes):
         # Absolute project paths may contain spaces. Match those before the
         # token-based fallback for commands started from a relative path.
         project_script = next((str(root / relative) for relative in (
-            "scripts/benchmark.py", "scripts/cluster.py", "baseline/compare.py")
+            "scripts/benchmark.py", "scripts/benchmark_mixed.py", "scripts/cluster.py", "baseline/compare.py")
             if str(root / relative) in command), None)
         if project_script:
             suffix = command.split(project_script, 1)[1]
             if project_script.endswith("cluster.py") and not re.search(r"\b(start|restart|load|probe)\b", suffix):
                 continue
             raise ValueError(f"实验脚本仍在运行（PID {pid}），请先结束负载/benchmark/测试，再执行 make clean")
-        match = re.search(r"(?:^|\s)(\S*(?:scripts/(?:benchmark|cluster)\.py|baseline/compare\.py|tests/test_[^/\s]+\.py))(?:\s|$)", command)
+        match = re.search(r"(?:^|\s)(\S*(?:scripts/(?:benchmark(?:_mixed)?|cluster)\.py|baseline/compare\.py|tests/test_[^/\s]+\.py))(?:\s|$)", command)
         if not match:
             continue
         script = match.group(1)

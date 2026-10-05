@@ -283,6 +283,18 @@ class CleanTests(unittest.TestCase):
         self.stop.assert_not_called()
         self.assert_saved()
 
+    def test_mixed_benchmark_writer_blocks_cleanup(self):
+        self.make_outputs()
+        self.cwd.return_value = self.root
+        for command in ("python3 scripts/benchmark_mixed.py --method saguaro",
+                        f"python3 {self.root / 'scripts/benchmark_mixed.py'} --method arbor"):
+            with self.subTest(command=command):
+                self.processes.return_value = {910018: command}
+                with self.assertRaisesRegex(ValueError, "实验脚本"):
+                    self.run_clean()
+                self.assertTrue(self.binary.exists())
+        self.stop.assert_not_called()
+
     def test_read_only_cluster_commands_do_not_block_cleanup(self):
         self.make_outputs()
         self.cwd.return_value = self.root

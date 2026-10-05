@@ -8,15 +8,72 @@
     mutable std::set<std::string> sagCheckedProofs;
     std::set<std::string> sagActive, sagSelectedRequests, sagParticipantActive;
     std::map<std::string,std::string> sagActiveTx;
+    std::map<std::string,std::string> sagUndecidedTx;
+    using SagAccessKey=std::pair<int,std::string>;
+    mutable std::map<std::string,std::set<SagAccessKey>> sagRequestKeys;
+    std::map<SagAccessKey,std::set<std::string>> sagActiveKeys;
+    std::map<std::string,std::set<SagAccessKey>> sagBatchKeys;
+    std::map<std::string,Clock::time_point> sagRetryAfter;
     uint64_t sagAborted=0;
+    uint64_t sagWorkTimerStarts=0, sagAdmissionDeferrals=0;
     Clock::time_point sagLastRetry=Clock::now();
 
     static json saguaroGenesis(json result) {
-        for(const char* field:{"sag_coordinations","sag_preparations","sag_locks","sag_known","sag_known_requests"})
+        for(const char* field:{"sag_coordinations","sag_preparations","sag_locks","sag_known","sag_known_requests","sag_retry_counts"})
             result[field]=json::object();
         return result;
     }
     void saguaroInitialize() {}
+    bool sagUnappliedPbft() const {
+        if(certificates.upper_bound(applied)!=certificates.end()) return true;
+        for(auto it=slots.upper_bound(applied);it!=slots.end();++it)
+            if(!it->second.proposal.is_null()) return true;
+        return false;
+    }
+    void sagActivateWork(bool wasWaiting,bool inserted,const char* phase) {
+        auto now=Clock::now();
+        // A newly actionable phase gets its own deadline after idle/network
+        // waiting. Duplicate retries and a stuck PBFT slot never renew it.
+        if(inserted && !wasWaiting && !changing && !sagUnappliedPbft() && saguaroWaiting(now)) {
+            lastProgress=now;++sagWorkTimerStarts;
+            log("saguaro_work_activated",{{"phase",phase}});
+        }
+    }
+    const std::set<SagAccessKey>& sagKeys(const json& request) const {
+        std::string rid=request.at("body").at("id");
+        auto prior=sagRequestKeys.find(rid);if(prior!=sagRequestKeys.end()) return prior->second;
+        std::set<SagAccessKey> keys;
+        for(const auto& tx:request.at("body").at("txs")) for(int owner:tx.at("participants"))
+            keys.emplace(owner,accessFor(tx,owner).at("key").get<std::string>());
+        return sagRequestKeys.emplace(rid,std::move(keys)).first->second;
+    }
+    bool sagAdmissible(const std::string& rid,const json& request,Clock::time_point now) const {
+        if(sagSelectedRequests.count(rid)) return false;
+        auto retry=sagRetryAfter.find(rid);
+        if(retry!=sagRetryAfter.end() && now<retry->second) return false;
+        for(const auto& key:sagKeys(request)) if(sagActiveKeys.count(key)) return false;
+        return true;
+    }
+    void sagReserveKeys(const std::string& batch,const json& requests) {
+        auto& keys=sagBatchKeys[batch];
+        for(const auto& request:requests) for(const auto& key:sagKeys(request)) keys.insert(key);
+        // Different replicas may learn all ACKs at different times. Keep all
+        // local owners rather than overwrite a prior batch during recovery.
+        for(const auto& key:keys) sagActiveKeys[key].insert(batch);
+    }
+    void sagReleaseKeys(const std::string& batch) {
+        auto batchKeys=sagBatchKeys.find(batch);if(batchKeys==sagBatchKeys.end()) return;
+        for(const auto& key:batchKeys->second) {
+            auto owners=sagActiveKeys.find(key);if(owners==sagActiveKeys.end()) continue;
+            owners->second.erase(batch);if(owners->second.empty()) sagActiveKeys.erase(owners);
+        }
+        sagBatchKeys.erase(batchKeys);
+    }
+    int sagRetryDelay(const std::string& rid,unsigned attempt) const {
+        unsigned shift=std::min(4u,attempt?attempt-1:0u);
+        auto jitter=std::stoul(hash(rid+":"+std::to_string(attempt)).substr(0,8),nullptr,16)%50;
+        return std::min(timeoutMs/2,int((50u<<shift)+jitter));
+    }
     static std::string sagProofKey(const json& record) {
         return record.at("phase").get<std::string>()+"|"+record.at("batch").get<std::string>()+"|"+hash(record.dump());
     }
@@ -210,7 +267,9 @@
                     for(const auto& tx:request.at("body").at("txs")) {
                     std::string id=tx.at("id");if(state.at("sag_known").contains(id) && state.at("sag_known").at(id)!=hash(tx.dump())) return false;
                     if(state.at("seen").contains(id) && state.at("seen").at(id).at("tx_digest")!=hash(tx.dump())) return false;
-                    if(!state.at("seen").contains(id) && sagActiveTx.count(id)) return false;
+                    // PBFT validity depends on replicated INIT/DECIDE state,
+                    // never on asynchronously received participant ACKs.
+                    if(!state.at("seen").contains(id) && sagUndecidedTx.count(id)) return false;
                     }
                 }
                 return true;
@@ -290,10 +349,13 @@
             auto init=sagInit(batch,value.at("requests"));
             state["sag_coordinations"][batch]={{"init",init},{"seq",n}};
             stateDigest.markEntry("sag_coordinations",batch);sagActive.insert(batch);
+            sagReserveKeys(batch,init.at("requests"));
             for(const auto& request:init.at("requests")) {
                 std::string rid=request.at("body").at("id");sagSelectedRequests.insert(rid);
                 state["sag_known_requests"][rid]=hash(request.at("body").at("txs").dump());stateDigest.markEntry("sag_known_requests",rid);
-                for(const auto& tx:request.at("body").at("txs")) if(!state["seen"].contains(tx.at("id").get<std::string>())) sagActiveTx[tx.at("id").get<std::string>()]=batch;
+                for(const auto& tx:request.at("body").at("txs")) if(!state["seen"].contains(tx.at("id").get<std::string>())) {
+                    std::string id=tx.at("id");sagActiveTx[id]=batch;sagUndecidedTx[id]=batch;
+                }
             }
             for(const auto& request:init.at("requests")) for(const auto& tx:request.at("body").at("txs")) {
                 std::string id=tx.at("id");
@@ -313,6 +375,17 @@
         } else if(action=="DECIDE") {
             const auto& decision=value.at("decision");auto& coord=state["sag_coordinations"][batch];
             coord["decision"]=decision;stateDigest.markEntry("sag_coordinations",batch);
+            for(const auto& request:coord.at("init").at("requests")) {
+                std::string rid=request.at("body").at("id");
+                if(decision.at("decision")=="ABORT") {
+                    state["sag_retry_counts"][rid]=state["sag_retry_counts"].value(rid,0u)+1;
+                    stateDigest.markEntry("sag_retry_counts",rid);
+                }
+                for(const auto& tx:request.at("body").at("txs")) {
+                    auto owner=sagUndecidedTx.find(tx.at("id").get<std::string>());
+                    if(owner!=sagUndecidedTx.end() && owner->second==batch) sagUndecidedTx.erase(owner);
+                }
+            }
             if(decision.at("decision")=="COMMIT") for(const auto& request:coord.at("init").at("requests")) {
                 std::string rid=request.at("body").at("id");json results=json::array();
                 for(const auto& tx:request.at("body").at("txs")) {
@@ -388,7 +461,10 @@
             acknowledgments.push_back(record);
         }
         sagFinished.insert(batch);sagCompletionNeeded.erase(batch);
-        sagActive.erase(batch);
+        sagActive.erase(batch);sagReleaseKeys(batch);
+        // Receiving the first complete, validated ACK set is real progress.
+        // It may make key-blocked requests runnable after network waiting.
+        if(!changing && !sagUnappliedPbft()) lastProgress=Clock::now();
         for(const auto& request:coord.at("init").at("requests")) {
             sagSelectedRequests.erase(request.at("body").at("id"));
             for(const auto& tx:request.at("body").at("txs")) {
@@ -397,6 +473,15 @@
         }
         if(decision.at("decision")=="ABORT") {
             sagAborted++;log("saguaro_aborted",{{"batch",batch}});
+            auto now=Clock::now();int shortest=timeoutMs,longest=0;
+            for(const auto& request:coord.at("init").at("requests")) {
+                std::string rid=request.at("body").at("id");
+                int delay=sagRetryDelay(rid,state["sag_retry_counts"].value(rid,1u));
+                sagRetryAfter[rid]=now+std::chrono::milliseconds(delay);
+                shortest=std::min(shortest,delay);longest=std::max(longest,delay);
+            }
+            log("saguaro_retry_scheduled",{{"batch",batch},{"requests",coord.at("init").at("requests").size()},
+                {"min_delay_ms",shortest},{"max_delay_ms",longest}});
             // Original CLIENT envelopes remain pending until a successful
             // decision, preserving IDs and the entire client request batch.
             for(const auto& request:coord.at("init").at("requests")) saguaroClient(request);
@@ -404,6 +489,7 @@
         }
         const auto completionDigest=hash(acknowledgments.dump());
         for(const auto& request:coord.at("init").at("requests")) {
+            std::string rid=request.at("body").at("id");sagRetryAfter.erase(rid);sagRequestKeys.erase(rid);
             json results=json::array();
             for(const auto& tx:request.at("body").at("txs")) {
                 std::string id=tx.at("id");json result={{"id",id},{"seq",coord.at("seq")},{"kind","executed"},
@@ -443,10 +529,12 @@
         }
         if(blocked) deferRequest(request);
         else {
-            if(pending.empty()) {lastProgress=Clock::now();batchStart=Clock::now();}
+            bool wasWaiting=saguaroWaiting(Clock::now());
+            if(pending.empty()) batchStart=Clock::now();
             pending[rid]=request;
             for(const auto& tx:body.at("txs")) pendingTx[tx.at("id").get<std::string>()]={hash(tx.dump()),rid};
             if(pending.size()==1) batchStart=Clock::now();
+            sagActivateWork(wasWaiting,true,"CLIENT");
         }
         if(!isForward()) sendTo(shard,view%4,request);
     }
@@ -477,15 +565,26 @@
                     if(state["sag_preparations"].contains(batch)) {
                         if(state["sag_preparations"].at(batch).at("init")!=record) {rejected++;return true;}
                         sagAttest(state["sag_preparations"].at(batch).contains("ack")?"ACK":"VOTE",batch);
-                    } else sagPrepareQueue.emplace(batch,proof);
+                    } else {
+                        bool wasWaiting=saguaroWaiting(Clock::now());
+                        bool inserted=sagPrepareQueue.emplace(batch,proof).second;
+                        sagActivateWork(wasWaiting,inserted,"INIT");
+                    }
                 } else if(phase=="VOTE") {
                     if(record.at("coordinator")!=shard || !state["sag_coordinations"].contains(batch) || !sagValidVoteFor(record,state["sag_coordinations"].at(batch).at("init"),origin)) {rejected++;return true;}
+                    bool wasWaiting=saguaroWaiting(Clock::now());
+                    bool inserted=!sagReceivedVotes[batch].count(origin);
                     sagReceivedVotes[batch][origin]=proof;
                     if(state["sag_coordinations"].at(batch).contains("decision")) sagAttest("DECISION",batch);
+                    else sagActivateWork(wasWaiting,inserted,"VOTE");
                 } else if(phase=="DECISION") {
                     if(!members.leaves.count(shard) || !state["sag_preparations"].contains(batch) || !sagValidDecisionFor(record,state["sag_preparations"].at(batch).at("init"))) {rejected++;return true;}
                     if(state["sag_preparations"].at(batch).contains("ack")) sagAttest("ACK",batch);
-                    else sagFinishQueue.emplace(batch,proof);
+                    else {
+                        bool wasWaiting=saguaroWaiting(Clock::now());
+                        bool inserted=sagFinishQueue.emplace(batch,proof).second;
+                        sagActivateWork(wasWaiting,inserted,"DECISION");
+                    }
                 } else if(phase=="ACK") {
                     if(record.at("coordinator")!=shard || !state["sag_coordinations"].contains(batch) || record.at("init_digest")!=hash(state["sag_coordinations"].at(batch).at("init").dump())) {rejected++;return true;}
                     const auto& coord=state["sag_coordinations"].at(batch);
@@ -556,8 +655,12 @@
                 constexpr int maxInflight=8;
                 if(sagActive.size()>=size_t(maxInflight) || pending.empty()) return;
                 json requests=json::array();size_t count=0;std::string group;bool blocked=false;
+                auto now=Clock::now();
                 for(const auto& [rid,request]:pending) {
                     if(sagSelectedRequests.count(rid)) continue;
+                    if(!sagAdmissible(rid,request,now)) {
+                        ++sagAdmissionDeferrals;blocked=true;continue;
+                    }
                     auto candidate=participantGroup(request);
                     if((!group.empty() && candidate!=group) || count+request.at("body").at("txs").size()>size_t(crossShardBatchSize)) {blocked=count>0;break;}
                     requests.push_back(request);count+=request.at("body").at("txs").size();group=candidate;
@@ -572,7 +675,6 @@
         broadcast(proposal);if(!value.contains("sag_action") || value.at("sag_action")=="INIT") batchStart=Clock::now();
     }
     bool saguaroWaiting(Clock::time_point now) const {
-        (void)now;
         if((!sagActive.empty() || !sagParticipantActive.empty() || !sagCompletionNeeded.empty()) &&
            std::chrono::duration_cast<std::chrono::milliseconds>(now-lastForwardHeartbeat).count()>timeoutMs) return true;
         if(changing || certificates.count(applied+1) || (slots.count(applied+1) && !slots.at(applied+1).proposal.is_null())) return true;
@@ -587,7 +689,7 @@
                sagReceivedVotes.at(batch).size()==participants(coord.at("init").at("requests")).size()) return true;
         }
         if(sagActive.size()>=size_t(8)) return false;
-        for(const auto& [rid,request]:pending) {(void)request;if(!sagSelectedRequests.count(rid)) return true;}
+        for(const auto& [rid,request]:pending) if(sagAdmissible(rid,request,now)) return true;
         return false;
     }
     void sagQuery(const std::string& phase,const std::string& batch,int destination) {
@@ -615,11 +717,22 @@
     }
     void saguaroRestore() {
         sagPrepareQueue.clear();sagFinishQueue.clear();sagActive.clear();sagSelectedRequests.clear();sagParticipantActive.clear();sagActiveTx.clear();
+        sagUndecidedTx.clear();sagRequestKeys.clear();sagActiveKeys.clear();sagBatchKeys.clear();sagRetryAfter.clear();
+        auto now=Clock::now();
+        // Retry attempts are replicated at DECIDE, not counted again from
+        // duplicate ACK delivery. Reconstruct only scheduling deadlines here.
+        for(auto it=state["sag_retry_counts"].begin();it!=state["sag_retry_counts"].end();++it)
+            if(!state["requests"].contains(it.key()))
+                sagRetryAfter[it.key()]=now+std::chrono::milliseconds(sagRetryDelay(it.key(),it.value().get<unsigned>()));
         for(auto it=state["sag_coordinations"].begin();it!=state["sag_coordinations"].end();++it) if(!sagFinished.count(it.key())) {
             sagActive.insert(it.key());
+            sagReserveKeys(it.key(),it.value().at("init").at("requests"));
             for(const auto& request:it.value().at("init").at("requests")) {
                 sagSelectedRequests.insert(request.at("body").at("id"));
-                for(const auto& tx:request.at("body").at("txs")) if(!state["seen"].contains(tx.at("id").get<std::string>())) sagActiveTx[tx.at("id").get<std::string>()]=it.key();
+                for(const auto& tx:request.at("body").at("txs")) if(!state["seen"].contains(tx.at("id").get<std::string>())) {
+                    std::string id=tx.at("id");sagActiveTx[id]=it.key();
+                    if(!it.value().contains("decision")) sagUndecidedTx[id]=it.key();
+                }
             }
             sagAttest(it.value().contains("decision")?"DECISION":"INIT",it.key());
             sagCompletionNeeded.insert(it.key());
@@ -629,6 +742,7 @@
             sagAttest(it.value().contains("ack")?"ACK":"VOTE",it.key());
         }
         sagLastRetry=Clock::time_point{};
+        if(!changing && !sagUnappliedPbft()) lastProgress=Clock::now();
     }
     void saguaroStatus(json& status) const {
         auto coordinatorActive=sagActive;coordinatorActive.insert(sagCompletionNeeded.begin(),sagCompletionNeeded.end());
@@ -641,4 +755,10 @@
         status["sag_held_locks"]=state.at("sag_locks").size();
         status["sag_aborted_batches"]=sagAborted;
         status["sag_completed_batches"]=completedCstBatches.size();
+        status["sag_active_access_keys"]=sagActiveKeys.size();
+        status["sag_admission_deferrals"]=sagAdmissionDeferrals;
+        status["sag_work_timer_starts"]=sagWorkTimerStarts;
+        size_t waitingRetries=0;auto now=Clock::now();
+        for(const auto& [rid,deadline]:sagRetryAfter) {(void)rid;if(now<deadline) ++waitingRetries;}
+        status["sag_retry_waiting_requests"]=waitingRetries;
     }

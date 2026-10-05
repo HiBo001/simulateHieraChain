@@ -2030,7 +2030,8 @@ static int client(const json& cfg,const json& workload,const std::string& output
     struct Request {json envelope;int shard;Clock::time_point start,last;std::map<std::string,std::set<int>> votes;bool done=false;int retries=0;};
     std::map<std::string,Request> requests;
     json timings=json::array();std::map<std::string,size_t> confirmedIds;
-    size_t next=0;auto begin=Clock::now();auto lastSend=begin;
+    size_t next=0;auto begin=Clock::now();auto lastSend=begin,lastReport=begin;
+    uint64_t submittedTransactions=0,confirmedRequests=0;
     double rate=workload.at("rate");double nextDue=0;uint64_t executed=0,ordered=0,duplicates=0,errors=0;
     const auto& jobs=workload.at("requests");
     double timeout=workload.value("timeout_s",30.0);
@@ -2040,6 +2041,7 @@ static int client(const json& cfg,const json& workload,const std::string& output
             auto body=jobs[next++];int shard=body.at("target");std::string id=body.at("id");
             body["type"]="CLIENT";body["run"]=members.run;body["reply"]={{"host",workload.value("host",std::string("127.0.0.1"))},{"port",net.localPort()}};
             auto env=sign(body,key);requests.emplace(id,Request{env,shard,now,now,{},false,0});
+            submittedTransactions+=body.at("txs").size();
             // f=1: two distinct initial recipients guarantee one honest node.
             // Backups relay to the current primary; retries expand to all four.
             for(int r=0;r<2;++r) net.send(members.endpoints.at(identity(shard,r)),env,0);
@@ -2060,6 +2062,7 @@ static int client(const json& cfg,const json& workload,const std::string& output
             auto& voters=req.votes[hash(result.dump())];voters.insert(b.at("from").get<int>());
             if(voters.size()<2) continue; // f+1 authenticated matching replies.
             req.done=true;
+            confirmedRequests++;
             for(const auto& tx:result) {
                 auto tid=tx.at("id").get<std::string>();
                 auto prior=confirmedIds.find(tid);
@@ -2099,6 +2102,12 @@ static int client(const json& cfg,const json& workload,const std::string& output
             }
         }
         if(all) break;
+        if(std::chrono::duration_cast<std::chrono::seconds>(now-lastReport).count()>=5) {
+            std::cout<<"progress submitted="<<submittedTransactions<<" completed="<<executed
+                     <<" requests="<<confirmedRequests<<"/"<<jobs.size()
+                     <<" elapsed_s="<<std::chrono::duration<double>(now-begin).count()<<std::endl;
+            lastReport=now;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     (void)lastSend;net.stop();

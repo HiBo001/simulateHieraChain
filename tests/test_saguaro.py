@@ -243,6 +243,123 @@ def stop_node(run, shard, replica):
 
 
 class SaguaroIntegration(unittest.TestCase):
+    def test_first_prepare_after_idle_does_not_change_view(self):
+        with running("idle-first-prepare", consensus={"view_timeout_ms": 1500}) as run:
+            # No local PBFT work is pending while the process is idle. Starting
+            # a fresh PREPARE must start its deadline at arrival, not at launch.
+            time.sleep(3)
+            workload = job(run, "idle-first", [1, 2], count=8, batch=4, shared=True)
+            assert_complete(self, *client(run, "load", workload), 8)
+            rows = settled(run, [workload])
+            self.assertTrue(all(row["view"] == 0 and row["view_changes"] == 0 for row in rows), rows)
+            assert_real_pbft(self, run)
+
+    def test_new_decision_after_remote_wait_gets_fresh_pbft_deadline(self):
+        with running("remote-wait-decision", consensus={"view_timeout_ms": 1500}) as run:
+            paused = [node for node in c.read(run / "manifest.json")["nodes"] if node["shard"] == 2]
+            workload = job(run, "remote-wait", [1, 2], count=4, batch=4, shared=True)
+            source, output = run / "waiting.workload.json", run / "waiting.result.json"
+            process, resumed = None, False
+            try:
+                for node in paused:
+                    os.kill(node["pid"], signal.SIGSTOP)
+                c.write(source, workload)
+                process = subprocess.Popen([str(c.run_binary(run)), "client", str(run / "config.json"),
+                                            str(source), str(output)])
+                wait_status(run, lambda rows: all(row.get("sag_held_locks", 0) > 0
+                            and row["executed_transactions"] == 0 for row in rows if row["shard"] == 1), timeout=10)
+                # Leaf 1 and the coordinator are waiting for another shard,
+                # while their own four healthy replicas keep heartbeating.
+                time.sleep(3)
+                for node in paused:
+                    os.kill(node["pid"], signal.SIGCONT)
+                resumed = True
+                assert_complete(self, process.wait(timeout=60), c.read(output), 4)
+                rows = settled(run, [workload])
+                self.assertTrue(all(row["view"] == 0 and row["view_changes"] == 0 for row in rows), rows)
+                assert_real_pbft(self, run)
+            finally:
+                if not resumed:
+                    for node in paused:
+                        if c.is_our_process(node):
+                            os.kill(node["pid"], signal.SIGCONT)
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill(); process.wait(timeout=5)
+
+    def test_same_coordinator_eight_conflicting_batches_do_not_abort(self):
+        with running("same-coordinator-admission", consensus={"batch_size": 100,
+                     "cross_shard_batch_size": 100, "view_timeout_ms": 3000}) as run:
+            # Every candidate batch touches the same keys. The coordinator
+            # must admit them without sending eight mutually conflicting 2PCs.
+            workload = job(run, "self-conflict", [1, 2], count=800, batch=10, shared=True)
+            assert_complete(self, *client(run, "load", workload), 800)
+            rows = settled(run, [workload])
+            self.assertTrue(all(row.get("sag_aborted_batches", 0) == 0 for row in rows), rows)
+            self.assertTrue(all(row["view"] == 0 for row in rows), rows)
+            assert_real_pbft(self, run)
+
+    def test_duplicate_init_retries_do_not_extend_a_stalled_deadline(self):
+        with running("duplicate-init-deadline", consensus={"view_timeout_ms": 1500}) as run:
+            paused = [node for node in c.read(run / "manifest.json")["nodes"]
+                      if node["shard"] == 1 and node["replica"] == 0]
+            workload = job(run, "duplicate-deadline", [1, 2], count=4, batch=4, shared=True)
+            source, output = run / "deadline.workload.json", run / "deadline.result.json"
+            process, resumed = None, False
+            try:
+                for node in paused:
+                    os.kill(node["pid"], signal.SIGSTOP)
+                c.write(source, workload)
+                process = subprocess.Popen([str(c.run_binary(run)), "client", str(run / "config.json"),
+                                            str(source), str(output)])
+                wait_status(run, lambda rows: all(row.get("sag_pending_prepares", 0) > 0
+                            for row in rows if row["shard"] == 1 and row["replica"] in (1, 2, 3)), timeout=10)
+                live = [node for node in c.read(run / "manifest.json")["nodes"]
+                        if node["shard"] == 1 and node["replica"] in (1, 2, 3)]
+                # The coordinator retransmits INIT proofs once per second.
+                # Such duplicates must not postpone the honest backups.
+                # Only the primary is paused (within f=1); require at least
+                # f+1 independent suspicions before restoring it. One isolated
+                # timeout cannot force idle peers to change view in shared PBFT.
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    started = []
+                    for node in live:
+                        events_path = Path(node["directory"]) / "events.jsonl"
+                        events = [json.loads(line) for line in events_path.read_text().splitlines()]
+                        started.append(any(event["event"] == "view_change_started" for event in events))
+                    if sum(started) >= 2:
+                        break
+                    time.sleep(.1)
+                else:
+                    self.fail("duplicate INIT retries suppressed the stalled PBFT timeout")
+                coordinator = next(node for node in c.read(run / "manifest.json")["nodes"]
+                                   if (node["shard"], node["replica"]) == (5, 0))
+                coordinator_events = [json.loads(line) for line in
+                                      (Path(coordinator["directory"]) / "events.jsonl").read_text().splitlines()]
+                self.assertGreaterEqual(sum(event["event"] == "saguaro_forwarded"
+                                            and event.get("phase") == "INIT" for event in coordinator_events), 2,
+                                        "the timeout regression must actually include duplicate INIT forwarding")
+                for node in paused:
+                    os.kill(node["pid"], signal.SIGCONT)
+                resumed = True
+                assert_complete(self, process.wait(timeout=60), c.read(output), 4)
+                settled(run, [workload])
+            finally:
+                if not resumed:
+                    for node in paused:
+                        if c.is_our_process(node):
+                            os.kill(node["pid"], signal.SIGCONT)
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill(); process.wait(timeout=5)
+
     def test_two_layer_shared_keys_and_real_two_phase_consensus(self):
         with running("two-layer") as run:
             workload = job(run, "two-layer", [1, 2], count=24, shared=True)

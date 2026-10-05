@@ -5,7 +5,7 @@ CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -Wpedantic
 ifneq ($(strip $(OPENSSL_PREFIX)),)
 LDFLAGS += -L$(OPENSSL_PREFIX)/lib -Wl,-rpath,$(OPENSSL_PREFIX)/lib
 endif
-LDLIBS += -lcrypto -pthread
+LDLIBS += -lcrypto -lz -pthread
 BIN = build/bin/arbor_node
 SAGUARO_BIN = build/bin/saguaro_node
 NETWORK_TEST = build/bin/test_network
@@ -37,6 +37,7 @@ test: $(BIN) $(SAGUARO_BIN) $(NETWORK_TEST) $(DIGEST_TEST)
 	python3 -B tests/test_snapshot_digest.py
 	python3 -B tests/test_engineering.py
 	python3 -B tests/test_benchmark.py
+	python3 -B tests/test_mixed_benchmark.py
 	python3 -B tests/test_method_tools.py
 	python3 -B tests/test_saguaro.py
 benchmark: $(BIN)

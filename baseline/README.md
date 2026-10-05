@@ -61,6 +61,20 @@ python3 baseline/compare.py \
 
 ## 验证
 
+已有混合负载可以直接复用，例如 10000 笔、90% 跨两个分片和 10% 跨三个分片：
+
+```bash
+make
+python3 scripts/benchmark_mixed.py \
+  --config config/three_layer_cross100.json \
+  --workload test-results/mixed-90-10/shared-workload.json \
+  --method saguaro
+```
+
+此命令自动启动独立集群、重放已有文件、核对全部请求完成及各分片计数/状态/锁收敛，然后停止集群；不需要先手动 start。输出目录会保留 `client.log`、`client.json`、`status-after.json` 和 `summary.json`。使用同一条命令把 `--method` 改成 `arbor` 即可重放完全相同的业务负载。默认沿用负载文件内的速率和超时；`--timeout` 可显式覆盖超时。负载文件必须已存在，且交易请求目标为其参与方的 NCA。`make clean` 会删除 test-results 内的负载和报告，需要长期保留的文件请另行备份。
+
+客户端每 5 秒输出已提交/完成交易数、已确认请求数和运行时间；最终 TPS 仍只在完整确认后输出。修复说明见 [../docs/SAGUARO_STALL_FIX.md](../docs/SAGUARO_STALL_FIX.md)。
+
 ```bash
 python3 tests/test_saguaro.py
 ```

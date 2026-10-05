@@ -4,7 +4,7 @@
 
 叶子按批次顺序处理，等待当前批次依赖并完成执行后再处理下一批。多协调者拓扑使用按需开启的认证轮次：各协调者通过 PBFT 封闭本轮订单，叶子收齐其所有祖先的封闭证书后，按 `(round, coordinator_id)` 顺序处理适用订单，避免不同层级订单形成相互等待。当前没有逐交易推测执行、多版本历史或重做路径。详细说明见 [docs/MULTILAYER_DESIGN.md](docs/MULTILAYER_DESIGN.md) 和 [当前实现设计](docs/CURRENT_IMPLEMENTATION_DESIGN.md)。
 
-支持 macOS / Linux 本机多进程运行。构建依赖 C++17 编译器、Python 3.9+ 和 OpenSSL 3 开发库；不依赖 FISCO、Python 第三方包或额外 JSON 包安装。nlohmann/json 3.11.3 单头文件及 MIT 许可证已放入 `third_party/nlohmann/`。
+支持 macOS / Linux 本机多进程运行。构建依赖 C++17 编译器、Python 3.9+、OpenSSL 3 开发库和 zlib 开发库（macOS SDK 已提供 zlib）；不依赖 FISCO、Python 第三方包或额外 JSON 包安装。nlohmann/json 3.11.3 单头文件及 MIT 许可证已放入 `third_party/nlohmann/`。
 
 ## 快速开始
 
@@ -15,7 +15,7 @@
 brew install openssl@3
 
 # Debian / Ubuntu 缺少依赖时执行：
-# sudo apt-get install build-essential python3 libssl-dev openssl
+# sudo apt-get install build-essential python3 libssl-dev openssl zlib1g-dev
 
 make
 ./start_all.sh --config config/two_layer.json
@@ -69,6 +69,8 @@ python3 baseline/compare.py --config config/two_layer.json \
 ```
 
 对比工具把同一份负载分别交给两个方法，自动启动和停止集群，保存完成 TPS、秒制延时与副本收敛检查。使用和测试见 [baseline/README.md](baseline/README.md)，协议设计见 [baseline/saguaro/DESIGN.md](baseline/saguaro/DESIGN.md)。
+
+重放已有混合参与方负载用 `python3 scripts/benchmark_mixed.py --config config/three_layer_cross100.json --workload 负载文件.json --method saguaro`。它独立启动/停止并核对所有参与分片，换成 `--method arbor` 可复用同一负载。Saguaro 等待超时、冲突重试和大恢复消息修复见 [docs/SAGUARO_STALL_FIX.md](docs/SAGUARO_STALL_FIX.md)。
 
 ## 配置分片与拓扑
 
@@ -202,6 +204,8 @@ python3 scripts/cluster.py status
 所有请求成功确认后，终端同一行显示 `completed_tps`、`avg_latency_s`、`p50_s`、`p95_s`、`p99_s`；若超时或交易报错，则显示 `incomplete=true` 和已确认交易的延时，并返回非零退出码。结果文件 `client-*.json` 也保存这些指标、逐交易确认耗时和完整输入。交易延时统一以秒为单位，逐笔记录使用 `latency_s`，完成时刻使用相对于测试开始的 `completion_s`。延时口径为客户端发送请求到收到两个一致副本回复；平均值和分位数按已确认交易统计。跨片回复必须等到所有参与叶子最终写入并返回各自三副本 ACK，因而计入真实完成延时；多层跨片也按此标准确认完成。这里的平均 TPS 包括本次客户端的发送及排空时间，**不是饱和稳态吞吐**。批内交易共用请求发送时间，确认在整批回复时观察到。重复测试中客户端确认数表示收到的有效回复，是否发生新的执行要看节点累计执行数；不要拿重放请求测试计算业务吞吐。
 
 `--timeout` 从开始发送时计时，包含发送和排空。`--count 4000 --rate 100` 光发送至少约 40 秒，因此 `--timeout 30` 必定显示 `incomplete=true`。小批次跨片负载还需留出多轮 PBFT 和跨片证明交换时间；可先从较小 count 验证，再按实际完成速率增加超时。
+
+运行超过 5 秒时，客户端每 5 秒输出 `progress submitted=... completed=... requests=.../... elapsed_s=...`，便于观察发送及处理是否继续推进。该行是进度，最终完成后的 TPS 与秒制延时口径保持不变。
 
 例如 4000 笔跨片交易以 `--rate 100 --batch 8` 发送，即使系统处理更快，整轮平均 TPS 也不能超过约 100。要测试更高处理能力，应提高 `--rate` 并同时查看延时；发送速度超过处理速度时，排队延时会升高。
 
