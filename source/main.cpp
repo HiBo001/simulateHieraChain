@@ -95,6 +95,9 @@ struct Membership {
 // A bounded PBFT sequence window, batching, stable checkpoints and certified
 // view changes. PREPARE votes are from backups only (2f); COMMIT needs 2f+1.
 class Replica {
+#ifdef ARBOR_SHARPER_TESTS
+    friend struct SharPerProtocolTest;
+#endif
     struct Slot {
         json proposal;
         std::map<int,json> prepares,commits;
@@ -235,6 +238,9 @@ class Replica {
         } catch (...) { return false; }
     }
     bool validRequestForShard(const json& e,int target) const {
+#ifdef ARBOR_SHARPER
+        return sharperValidRequest(e,target);
+#else
         try {
             if (!members.clientMessage(e)) return false;
             const auto& b=e.at("body");
@@ -265,6 +271,7 @@ class Replica {
             }
             return true;
         } catch (...) { return false; }
+#endif
     }
     bool validRequest(const json& e) const { return validRequestForShard(e,shard); }
     bool validForeignCertificate(const json& c,int origin) const {
@@ -516,6 +523,8 @@ class Replica {
     bool validValue(const json& value) const {
 #ifdef ARBOR_SAGUARO
         return saguaroValidValue(value);
+#elif defined(ARBOR_SHARPER)
+        return sharperValidValue(value);
 #else
         try {
             int n=0;
@@ -600,6 +609,9 @@ class Replica {
         return validSignedProposal(e) && validValue(e.at("body").at("value"));
     }
     bool validPrepared(const json& p) const {
+#ifdef ARBOR_SHARPER
+        if(sharperCrossProof(p)) return sharperValidPrepared(p);
+#endif
         try {
             const auto& pp=p.at("proposal"); const auto& b=pp.at("body");
             // Prepared evidence describes an earlier state. The proposal's
@@ -615,6 +627,9 @@ class Replica {
         } catch (...) { return false; }
     }
     bool validCertificate(const json& c) const {
+#ifdef ARBOR_SHARPER
+        if(sharperCrossProof(c)) return sharperValidCertificate(c);
+#endif
         try {
             const auto& b=c.at("proposal").at("body");
             if(!validPrepared(c)) return false;
@@ -626,6 +641,9 @@ class Replica {
         } catch (...) { return false; }
     }
     json preparedProof(const Slot& s) const {
+#ifdef ARBOR_SHARPER
+        if(sharperCrossValue(s.proposal.at("body").at("value"))) return sharperPreparedProof(s.proposal);
+#endif
         json votes=json::array(); const auto& b=s.proposal.at("body");
         for(const auto& [r,p]:s.prepares) if(r!=b.at("view").get<int>()%4 && validVote(p,"PREPARE",b.at("view"),b.at("seq"),b.at("digest"))) votes.push_back(p);
         return {{"proposal",s.proposal},{"prepares",votes}};
@@ -652,6 +670,8 @@ class Replica {
                 {"participant_indices",json::object()},{"cst_rounds",json::object()}};
 #ifdef ARBOR_SAGUARO
         return saguaroGenesis(std::move(result));
+#elif defined(ARBOR_SHARPER)
+        return sharperGenesis(std::move(result));
 #else
         return result;
 #endif
@@ -660,6 +680,9 @@ class Replica {
         try {
             const auto& b=e.at("body");
             if(!members.replicaMessage(e) || b.at("shard")!=shard || b.at("type")!="VIEW_CHANGE" || b.at("view")!=v || !validStable(b.at("stable"))) return false;
+#ifdef ARBOR_SHARPER
+            if(!sharperValidRecovery(e)) return false;
+#endif
             int h=b.at("stable").at("seq"); std::set<int> sequences;
             if(b.at("prepared").size()>size_t(window)) return false;
             for(const auto& p:b.at("prepared")) {
@@ -684,6 +707,9 @@ class Replica {
             }
         }
         std::map<int,json> values;
+#ifdef ARBOR_SHARPER
+        sharperAugmentRecovery(selected,vcs,best.at("seq"));
+#endif
         int h=best.at("seq"); int high=selected.empty()?h:std::max(h,selected.rbegin()->first);
         if(high>h+window) throw std::runtime_error("view recovery outside window");
         for(int n=h+1;n<=high;++n) values[n]=selected.count(n)?selected.at(n).at("proposal").at("body").at("value"):json{{"requests",json::array()}};
@@ -695,6 +721,10 @@ class Replica {
         json ps=json::array();
         for(const auto& [n,p]:preparedHistory) if(n>stableSeq) ps.push_back(p);
         myViewChange=make("VIEW_CHANGE",{{"stable",{{"seq",stableSeq},{"state",stableState},{"proof",stableProof}}},{"prepared",ps}},v);
+#ifdef ARBOR_SHARPER
+        auto fields=myViewChange.at("body");fields["sharper_recovery"]=sharperRecoveryEvidence();
+        myViewChange=sign(fields,privateKey);
+#endif
         broadcast(myViewChange); lastProgress=Clock::now();
         log("view_change_started",{{"target_view",v}});
     }
@@ -733,6 +763,8 @@ class Replica {
         if(restored) {
 #ifdef ARBOR_SAGUARO
             saguaroRestore();
+#elif defined(ARBOR_SHARPER)
+            sharperRestore();
 #endif
             rebuildPendingIndex();
         }
@@ -771,6 +803,9 @@ class Replica {
         installStable(checkpoint); slots.clear();
         for(const auto& [n,proof]:committed) if(n>applied) {certificates.emplace(n,proof);preparedHistory[n]=proof;}
         view=v; targetView=v; changing=false; viewCount++; lastProgress=Clock::now(); lastNewView=e;
+#ifdef ARBOR_SHARPER
+        sharperInstallRecovery(b.at("changes"));
+#endif
         lastForwardHeartbeat=Clock::now();
         for(auto i=viewChanges.begin();i!=viewChanges.end();) i=i->first<=v?viewChanges.erase(i):std::next(i);
         log("new_view_installed",{{"primary",view%4}});
@@ -786,6 +821,9 @@ class Replica {
         }
     }
     void acceptProposal(const json& e,bool recovered=false) {
+#ifdef ARBOR_SHARPER
+        if(sharperCrossValue(e.at("body").at("value"))) {sharperAcceptAssignment(e,recovered);return;}
+#endif
         const auto& b=e.at("body"); int n=b.at("seq");
         if(changing || b.at("view")!=view || n<=applied || n>stableSeq+window) return;
         // A certified future slot can expose a missing prefix even when its
@@ -817,6 +855,9 @@ class Replica {
     }
     void advance(int n) {
         auto& s=slots.at(n); if(s.proposal.is_null()) return;
+#ifdef ARBOR_SHARPER
+        if(sharperCrossValue(s.proposal.at("body").at("value"))) {sharperAdvance(n);return;}
+#endif
         if(s.committed) return;
         auto proof=preparedProof(s); const auto& b=s.proposal.at("body");
         if(!s.prepared && proof.at("prepares").size()>=2) {
@@ -844,6 +885,9 @@ class Replica {
         reply(req,results);
     }
     bool replyCompletedTransactions(const json& req) {
+#ifdef ARBOR_SHARPER
+        return sharperReplyCompleted(req);
+#endif
         json results=json::array();
         for(const auto& tx:req.at("body").at("txs")) {
             auto id=tx.at("id").get<std::string>();
@@ -861,8 +905,12 @@ class Replica {
         reply(req,results); duplicates+=results.size(); return true;
     }
     bool awaitingResult(const std::string& id) const {
+#ifdef ARBOR_SHARPER
+        return state.at("seen").contains(id) && state.at("seen").at(id).contains("sharper_batch") && !completedTxResults.count(id);
+#else
         return isCoordinator() &&
             state.at("seen").contains(id) && !completedTxResults.count(id);
+#endif
     }
     void erasePending(const std::string& rid) {
         auto it=pending.find(rid);if(it==pending.end()) return;
@@ -1254,7 +1302,7 @@ class Replica {
             // The PBFT slot is committed before dependencies are exchanged.
             // Its replicated state advances only after execution has finished.
             json witness=nullptr;
-#ifndef ARBOR_SAGUARO
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
             if(value.contains("cst_orders")) {
                 const auto& root=value.at("cst_orders")[0];auto key=cstKey(root);
                 stageCst(root);witness=availableWitness(key);
@@ -1265,6 +1313,8 @@ class Replica {
             auto before=Clock::now();
 #ifdef ARBOR_SAGUARO
             saguaroApply(value,cert,n);
+#elif defined(ARBOR_SHARPER)
+            sharperApply(value,cert,n);
 #else
             if(value.contains("cst_order_index")) {
                 json duplicates=json::array();
@@ -1308,6 +1358,8 @@ class Replica {
             journal<<entry.dump()<<'\n';journal.flush();
 #ifdef ARBOR_SAGUARO
             saguaroAfterApply(value,cert,n);
+#elif defined(ARBOR_SHARPER)
+            sharperAfterApply(value,cert,n);
 #else
             if(!members.leaves.count(shard)) {
                 forwardCstOrder(cert,value);
@@ -1332,6 +1384,8 @@ class Replica {
     void propose() {
 #ifdef ARBOR_SAGUARO
         saguaroPropose();
+#elif defined(ARBOR_SHARPER)
+        sharperPropose();
 #else
         if(changing || me!=view%4 || applied+1>stableSeq+window) return;
         // One fresh batch in flight. Recovery slots may coexist after a view change.
@@ -1432,6 +1486,8 @@ class Replica {
         if(type=="CLIENT") {
 #ifdef ARBOR_SAGUARO
             saguaroClient(e);
+#elif defined(ARBOR_SHARPER)
+            sharperClient(e);
 #else
             if(isCoordinator() &&
                b.at("target")==shard && b.at("txs").is_array() && int(b.at("txs").size())>crossShardBatchSize &&
@@ -1501,9 +1557,12 @@ class Replica {
         int source=b.at("shard"),sender=b.at("from");
 #ifdef ARBOR_SAGUARO
         if(saguaroHandle(e)) return;
-        if(type.rfind("CST_",0)==0) {rejected++;return;}
+        if(type.rfind("CST_",0)==0 || type.rfind("SH_",0)==0) {rejected++;return;}
+#elif defined(ARBOR_SHARPER)
+        if(sharperHandle(e)) return;
+        if(type.rfind("CST_",0)==0 || type.rfind("SAG_",0)==0) {rejected++;return;}
 #else
-        if(type.rfind("SAG_",0)==0) {rejected++;return;}
+        if(type.rfind("SAG_",0)==0 || type.rfind("SH_",0)==0) {rejected++;return;}
 #endif
         if(type=="PING") {
             if(b.at("dst_shard")!=shard || b.at("dst_replica")!=me) return;
@@ -1897,6 +1956,8 @@ class Replica {
             {"bytes_received",net.bytes_received.load()},{"network_queue",net.queued()},{"probes",probes}};
 #ifdef ARBOR_SAGUARO
         saguaroStatus(s);
+#elif defined(ARBOR_SHARPER)
+        sharperStatus(s);
 #else
         s["method"]="arbor";
 #endif
@@ -1904,6 +1965,8 @@ class Replica {
     }
 #ifdef ARBOR_SAGUARO
 #include "../baseline/saguaro/protocol.inc"
+#elif defined(ARBOR_SHARPER)
+#include "../baseline/sharper/protocol.inc"
 #endif
 public:
     Replica(const json& cfg,int sid,int rid,const std::string& d):members(cfg),shard(sid),me(rid),dir(d) {
@@ -1942,6 +2005,8 @@ public:
             int backoff=std::min(16,1<<std::min(4,std::max(0,targetView-view)));
 #ifdef ARBOR_SAGUARO
             bool waiting=saguaroWaiting(now);
+#elif defined(ARBOR_SHARPER)
+            bool waiting=sharperWaiting(now);
 #else
             bool staged=!stagedRecords.empty();
             bool flowControlled=isCoordinator() && outstandingOrders.size()>=8;
@@ -1954,20 +2019,28 @@ public:
             if(crossWork && std::chrono::duration_cast<std::chrono::milliseconds>(now-lastForwardHeartbeat).count()>timeoutMs)
                 waiting=true;
 #endif
-            for(const auto& [n,slot]:slots) if(n>applied && !slot.proposal.is_null() && !certificates.count(n)) waiting=true;
+            for(const auto& [n,slot]:slots) if(n>applied && !slot.proposal.is_null() && !certificates.count(n)) {
+#ifdef ARBOR_SHARPER
+                if(sharperCrossValue(slot.proposal.at("body").at("value"))) continue;
+#endif
+                waiting=true;
+            }
             if((waiting || changing) && std::chrono::duration_cast<std::chrono::milliseconds>(now-lastProgress).count()>timeoutMs*(changing?backoff:1)) {
                 if(!changing || viewChanges[targetView].size()>=3) startViewChange(std::max(view,targetView)+1);
             }
             if(std::chrono::duration_cast<std::chrono::milliseconds>(now-lastRetry).count()>250) {
                 if(isForward()) {
                     broadcast(make("FORWARD_HEARTBEAT"));
-#ifndef ARBOR_SAGUARO
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
                     if(isCoordinator() && members.multiLayer() && desiredRound>state.at("cst_round").get<int>()) requestRound(desiredRound);
 #endif
                 }
                 if(changing && !myViewChange.is_null()) broadcast(myViewChange);
                 if(!lastNewView.is_null() && lastNewView.at("body").at("view")==view && me==view%4) broadcast(lastNewView);
                 for(const auto& [n,s]:slots) if(n>applied && !s.proposal.is_null()) {
+#ifdef ARBOR_SHARPER
+                    if(sharperCrossValue(s.proposal.at("body").at("value"))) continue;
+#endif
                     if(!changing && s.proposal.at("body").at("view")==view) {
                         if(me==view%4) broadcast(s.proposal);
                         if(s.prepares.count(me)) broadcast(s.prepares.at(me));
@@ -1977,6 +2050,8 @@ public:
                 if(!changing && !pending.empty() && me!=view%4) sendTo(shard,view%4,pending.begin()->second);
 #ifdef ARBOR_SAGUARO
                 saguaroTick(now);
+#elif defined(ARBOR_SHARPER)
+                sharperTick(now);
 #else
                 if(!changing && !pendingCst.empty() && me!=view%4 && pendingCst.begin()->second.contains("signature")) sendTo(shard,view%4,pendingCst.begin()->second);
                 if(std::chrono::duration_cast<std::chrono::milliseconds>(now-lastCstRetry).count()>2000) {
@@ -2039,6 +2114,12 @@ static int client(const json& cfg,const json& workload,const std::string& output
         auto now=Clock::now();double elapsed=std::chrono::duration<double>(now-begin).count();
         while(next<jobs.size() && elapsed>=nextDue) {
             auto body=jobs[next++];int shard=body.at("target");std::string id=body.at("id");
+#ifdef ARBOR_SHARPER
+            if(!body.at("txs").empty() && body.at("txs")[0].at("participants").size()>1) {
+                const auto ps=body.at("txs")[0].at("participants").get<std::vector<int>>();
+                shard=*std::min_element(ps.begin(),ps.end());body["target"]=shard;
+            }
+#endif
             body["type"]="CLIENT";body["run"]=members.run;body["reply"]={{"host",workload.value("host",std::string("127.0.0.1"))},{"port",net.localPort()}};
             auto env=sign(body,key);requests.emplace(id,Request{env,shard,now,now,{},false,0});
             submittedTransactions+=body.at("txs").size();

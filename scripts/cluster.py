@@ -23,13 +23,13 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "build/bin/arbor_node"
 RUN_PROCESSES = {}
-METHODS = ("arbor", "saguaro")
+METHODS = ("arbor", "saguaro", "sharper")
 
 
 def binary_for_method(method="arbor"):
     if method not in METHODS:
         raise ValueError(f"未知方法 {method!r}，可用方法为 {METHODS}")
-    return BIN if method == "arbor" else ROOT / "build/bin/saguaro_node"
+    return ROOT / "build/bin" / (method + "_node")
 
 
 def run_method(run):

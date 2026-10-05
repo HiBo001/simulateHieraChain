@@ -72,6 +72,33 @@ python3 baseline/compare.py --config config/two_layer.json \
 
 重放已有混合参与方负载用 `python3 scripts/benchmark_mixed.py --config config/three_layer_cross100.json --workload 负载文件.json --method saguaro`。它独立启动/停止并核对所有参与分片，换成 `--method arbor` 可复用同一负载。Saguaro 等待超时、冲突重试和大恢复消息修复见 [docs/SAGUARO_STALL_FIX.md](docs/SAGUARO_STALL_FIX.md)。
 
+## SharPer 无协调者对比方法
+
+`baseline/sharper/` 根据项目提供的 `SharPer.pdf` 实现 Byzantine flattened 跨片共识，参与叶子直接交换 ACCEPT/COMMIT，提交需要每个参与片各三个有效副本投票，祖先分片不参与跨片工作。它采用 `SUPER_PROPOSE` 的 primary 本地序号分配方式，复用项目交易、网络延时、执行计算和客户端统计。
+
+`SUPER_PROPOSE` 直接发往全部参与副本。当前按参与片 ID 升序预约单个本地跨片 slot，每片收齐较小参与片各三个匹配 ACCEPT 后才分配序号；此工程调度增加预约等待，并行度低于论文默认并行模式。提交后的执行通知需要每个参与片三个匹配回复，才向客户端确认所有参与方实际完成。当前不声称完整 Algorithm 4 或完整 Byzantine 活性保障；历史批次及投票记录随交易增长，长期实验需评估其内存和恢复体积。
+
+固定参与片的 Arbor/SharPer 对比：
+
+```bash
+python3 -B baseline/compare.py --baseline sharper --config config/two_layer.json \
+  --participants 1,2 --count 4000 --rate 1000 --batch 10 \
+  --repeat 3 --seed 42 --timeout 120 --drain-timeout 60
+```
+
+自动生成同一份 90% 双片 / 10% 三片负载并比较：
+
+```bash
+python3 -B baseline/compare_mixed.py --baseline sharper \
+  --config config/three_layer_cross100.json \
+  --count 10000 --rate 5000 --batch 10 --repeat 3 --seed 42 \
+  --timeout 180 --drain-timeout 60
+```
+
+已有混合 JSON 用 `--workload 路径` 替代生成参数 `--count/--rate/--batch/--seed`。两种方法使用同一实际负载和配置，顺序启动独立集群，重复轮次交替顺序，完整通过客户端完成、全部副本收敛与队列排空检查后才提供 TPS 比值。`--baseline saguaro` 也可使用混合对比入口。
+
+单独构建用 `make sharper`，单独启动用 `python3 -B scripts/cluster.py start --method sharper`，验证用 `make test-sharper`。协议、统计字段及实现范围见 [baseline/sharper/README.md](baseline/sharper/README.md)。
+
 ## 配置分片与拓扑
 
 当前系统的配置统一存放在 `config/`：JSON 文件供当前启动器使用；`accessControlList`、`networkConfig`、`shardsTopology`、`workloadProfile` 和 `topShardId` 是旧格式参考文件，不能直接传给新启动器。当前可运行的配置采用 JSON。分片数量由 `shards` 数组长度决定，不重复配置数量。每个分片有唯一的正整数 `id` 和一个 `parent`；根的 `parent` 为 `null`。
@@ -260,7 +287,7 @@ make clean
 
 - 包括真实 PBFT 三阶段、批处理、Ed25519 签名、检查点、带 prepared 证明的视图切换，以及滞后但未重启副本的状态追赶。
 - 包括独立分片的排序和叶子的本地执行，以及所有分片对之间的延迟探测。
-- 完整跨片执行支持多层及两个以上参与叶子。NCA 收齐实际参与叶子的完成证明后直接回复；多协调者的轮次封闭证书会增加 PBFT 控制开销，空封闭不增加业务交易数。SharPer、状态重分区和自适应扩缩容尚未实现。
+- Arbor 跨片执行支持多层及两个以上参与叶子。NCA 收齐实际参与叶子的完成证明后直接回复；多协调者的轮次封闭证书会增加 PBFT 控制开销，空封闭不增加业务交易数。SharPer 基线及其调度限制见 `baseline/sharper/DESIGN.md`；状态重分区和自适应扩缩容尚未实现。
 - 每个参与叶子的合成交易访问一个 key；尚未支持任意合约动态提取多 key 读写集。
 - 所需依赖未齐时不写入正式 KV、不推进叶子应用序号。当前没有带证书的 abort/超时回收，参与分片永久失效可能令交易等待和客户端超时；若一叶已经写入，另一叶之后不可用，不能保证两片同一物理时刻可见。
 - 叶子按批次顺序等待依赖并执行，当前批次未完成时不处理后续业务槽。协调者仍可提前排序有限数量的跨片批次；这不表示叶子并行执行。片内请求仍优先选择，持续片内负载下的跨片公平调度尚未实现。尚未实现单副本内多 CPU 线程执行。

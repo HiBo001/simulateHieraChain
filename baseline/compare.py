@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare Arbor and Saguaro using exactly the same unsigned client workload."""
+"""Compare Arbor and a baseline using exactly the same unsigned client workload."""
 import argparse
 import datetime
 import hashlib
@@ -19,41 +19,46 @@ import cluster as c
 import benchmark as b
 
 
-def paired_comparison(arbor, saguaro):
+def paired_comparison(arbor, baseline_result, baseline="saguaro"):
+    if baseline not in ("saguaro", "sharper"):
+        raise ValueError("baseline 必须为 saguaro 或 sharper")
     item = {name: arbor.get(name) for name in ("mode", "repeat", "count", "rate", "batch", "seed")}
-    item.update(comparable=False, workload_sha256=arbor.get("workload_sha256"))
+    item.update(comparable=False, baseline=baseline, workload_sha256=arbor.get("workload_sha256"))
     fields = ("mode", "repeat", "count", "rate", "batch", "seed", "shard", "participants",
               "config_fingerprint", "workload_sha256")
-    if arbor.get("method") != "arbor" or saguaro.get("method") != "saguaro":
+    if arbor.get("method") != "arbor" or baseline_result.get("method") != baseline:
         item["reason"] = "方法标识不匹配"
-    elif not arbor.get("workload_sha256") or any(arbor.get(k) != saguaro.get(k) for k in fields):
+    elif not arbor.get("workload_sha256") or any(arbor.get(k) != baseline_result.get(k) for k in fields):
         item["reason"] = "配置或实际负载内容不同，不计算比值"
     elif any(row.get("status") != "PASS" or not b.finite_number(row.get("completed_tps"), True)
              or any(not b.finite_number(row.get(field)) for field in b.METRICS[1:])
-             for row in (arbor, saguaro)):
+             for row in (arbor, baseline_result)):
         item["reason"] = "至少一种方法未完整通过，不计算比值"
     else:
-        item.update(comparable=True, arbor_tps=arbor["completed_tps"], saguaro_tps=saguaro["completed_tps"],
-                    arbor_over_saguaro_tps=arbor["completed_tps"] / saguaro["completed_tps"],
-                    arbor_avg_latency_s=arbor["avg_latency_s"], saguaro_avg_latency_s=saguaro["avg_latency_s"],
-                    arbor_p95_s=arbor["p95_s"], saguaro_p95_s=saguaro["p95_s"])
+        item.update(comparable=True, arbor_tps=arbor["completed_tps"],
+                    arbor_avg_latency_s=arbor["avg_latency_s"], arbor_p95_s=arbor["p95_s"])
+        item[baseline + "_tps"] = baseline_result["completed_tps"]
+        item["arbor_over_" + baseline + "_tps"] = arbor["completed_tps"] / baseline_result["completed_tps"]
+        item[baseline + "_avg_latency_s"] = baseline_result["avg_latency_s"]
+        item[baseline + "_p95_s"] = baseline_result["p95_s"]
     return item
 
 
 def summarize_pairs(pairs):
     groups = {}
     for pair in pairs:
-        key = (pair["mode"], pair["count"], pair["rate"], pair["batch"], pair["seed"])
+        key = (pair.get("baseline", "saguaro"), pair["mode"], pair["count"], pair["rate"], pair["batch"], pair["seed"])
         groups.setdefault(key, []).append(pair)
     result = []
     for rows in groups.values():
         item = {field: rows[0][field] for field in ("mode", "count", "rate", "batch", "seed")}
+        baseline = item["baseline"] = rows[0].get("baseline", "saguaro")
         item.update(runs=len(rows), comparable=all(row["comparable"] for row in rows))
         if item["comparable"]:
-            for field in ("arbor_tps", "saguaro_tps", "arbor_avg_latency_s", "saguaro_avg_latency_s",
-                          "arbor_p95_s", "saguaro_p95_s"):
+            for field in ("arbor_tps", baseline + "_tps", "arbor_avg_latency_s", baseline + "_avg_latency_s",
+                          "arbor_p95_s", baseline + "_p95_s"):
                 item["median_" + field] = statistics.median(row[field] for row in rows)
-            item["arbor_over_saguaro_tps"] = item["median_arbor_tps"] / item["median_saguaro_tps"]
+            item["arbor_over_" + baseline + "_tps"] = item["median_arbor_tps"] / item["median_" + baseline + "_tps"]
         else:
             item["reason"] = "包含未通过或负载不一致的轮次，整组比值留空"
         result.append(item)
@@ -61,24 +66,26 @@ def summarize_pairs(pairs):
 
 
 def save(folder, report):
+    baseline = report.get("baseline", "saguaro")
+    label = {"saguaro": "Saguaro", "sharper": "SharPer"}[baseline]
     report["paired_aggregates"] = summarize_pairs(report["method_comparisons"])
     report["status"] = ("FAIL" if any(row["status"] != "PASS" for row in report["cases"]) else
                         "PASS" if len(report["method_comparisons"]) == report.get("expected_pairs", 0)
                         and report["method_comparisons"] and all(pair["comparable"] for pair in report["method_comparisons"])
                         else "INCOMPLETE")
     b.save_report(folder, report)
-    lines = ["# Arbor / Saguaro 同负载比较", "", f"比较状态：{report['status']}。", "",
+    lines = [f"# Arbor / {label} 同负载比较", "", f"比较状态：{report['status']}。", "",
              "每一对运行复用同一份 unsigned workload，包括请求/交易 ID、参与分片、key 和 value。",
              "各方法顺序启动独立集群；每轮都检查客户端完整完成、全部副本状态收敛及协议队列排空。",
              "TPS 统计客户端确认的唯一交易，延时单位为秒。", "",
-             "| 模式 | 提交速率 | 请求大小 | 轮次 | Arbor TPS 中位数 | Saguaro TPS 中位数 | TPS 比值 | Arbor p95(s) | Saguaro p95(s) |",
+             f"| 模式 | 提交速率 | 请求大小 | 轮次 | Arbor TPS 中位数 | {label} TPS 中位数 | TPS 比值 | Arbor p95(s) | {label} p95(s) |",
              "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for item in report["paired_aggregates"]:
         common = f"| {item['mode']} | {item['rate']:g} | {item['batch']} | {item['runs']}"
         if item["comparable"]:
-            lines.append(common + f" | {item['median_arbor_tps']:.2f} | {item['median_saguaro_tps']:.2f} | "
-                         f"{item['arbor_over_saguaro_tps']:.3f} | {item['median_arbor_p95_s']:.6f} | "
-                         f"{item['median_saguaro_p95_s']:.6f} |")
+            lines.append(common + f" | {item['median_arbor_tps']:.2f} | {item['median_' + baseline + '_tps']:.2f} | "
+                         f"{item['arbor_over_' + baseline + '_tps']:.3f} | {item['median_arbor_p95_s']:.6f} | "
+                         f"{item['median_' + baseline + '_p95_s']:.6f} |")
         else:
             lines.append(common + " | FAIL | FAIL | — | — | — |")
     failures = [row for row in report["cases"] if row["status"] != "PASS"]
@@ -93,6 +100,7 @@ def save(folder, report):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "config/two_layer.json")
+    parser.add_argument("--baseline", choices=("saguaro", "sharper"), default="saguaro")
     parser.add_argument("--mode", choices=("intra", "cross", "all"), default="cross")
     parser.add_argument("--shard", type=int, default=1)
     parser.add_argument("--participants", default="1,2")
@@ -133,15 +141,15 @@ def main(argv=None):
                                   repeat=trial, seed=args.seed, shard=args.shard if mode == "intra" else None,
                                   participants=participants if mode == "cross" else []))
     if not args.skip_build:
-        subprocess.run(["make"], cwd=ROOT, check=True)
-    binaries = {method: c.binary_for_method(method) for method in c.METHODS}
+        subprocess.run(["make", "build/bin/arbor_node", "build/bin/" + args.baseline + "_node"], cwd=ROOT, check=True)
+    binaries = {method: c.binary_for_method(method) for method in ("arbor", args.baseline)}
     for path in binaries.values():
         if not path.is_file():
             raise ValueError(f"找不到 {path}，请先 make")
     folder = (args.output_dir or ROOT / "test-results" / (
         "compare-methods-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8])).resolve()
     folder.mkdir(parents=True, exist_ok=False)
-    report = {"schema_version": 1, "kind": "arbor-saguaro-exact-workload", "config": cfg,
+    report = {"schema_version": 1, "kind": "arbor-" + args.baseline + "-exact-workload", "baseline": args.baseline, "config": cfg,
               "config_source": str(args.config.resolve()),
               "environment": {"host": platform.node(), "system": platform.platform(), "cpus": os.cpu_count()},
               "created_at": datetime.datetime.now().astimezone().isoformat(),
@@ -160,7 +168,7 @@ def main(argv=None):
             case_folder = folder / f"case-{index:03d}"
             case_folder.mkdir()
             c.write(case_folder / "shared-workload.json", shared)
-            order = ("arbor", "saguaro") if case["repeat"] % 2 else ("saguaro", "arbor")
+            order = ("arbor", args.baseline) if case["repeat"] % 2 else (args.baseline, "arbor")
             results = {}
             for method in order:
                 print(f"[{index}/{len(cases)}] {method} {case['mode']} count={case['count']} "
@@ -173,10 +181,10 @@ def main(argv=None):
                 print((f"PASS {method} tps={row['completed_tps']:.2f} avg_s={row['avg_latency_s']:.6f} "
                        f"p95_s={row['p95_s']:.6f}" if row["status"] == "PASS" else
                        f"FAIL {method}: " + "; ".join(row["failure_reasons"])), flush=True)
-            pair = paired_comparison(results["arbor"], results["saguaro"])
+            pair = paired_comparison(results["arbor"], results[args.baseline], args.baseline)
             report["method_comparisons"].append(pair)
             save(folder, report)
-            print((f"Arbor / Saguaro TPS={pair['arbor_over_saguaro_tps']:.3f}" if pair["comparable"]
+            print((f"Arbor / {args.baseline} TPS={pair['arbor_over_' + args.baseline + '_tps']:.3f}" if pair["comparable"]
                    else pair["reason"]), flush=True)
     except BaseException:
         save(folder, report)

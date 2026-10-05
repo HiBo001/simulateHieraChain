@@ -1,4 +1,8 @@
-# Saguaro 2PC 对比方法
+# Arbor 的对比方法
+
+`baseline/saguaro` 提供 NCA 协调的传统 2PC；`baseline/sharper` 根据项目提供的 `SharPer.pdf` 实现参与叶子直接通信的 Byzantine flattened 跨片协议。SharPer 的实现范围、状态字段和命令见 [sharper/README.md](sharper/README.md)。
+
+## Saguaro 2PC
 
 `baseline/saguaro` 实现本项目的 Saguaro 对比方法：参与分片的最近公共祖先（NCA）担任传统两阶段提交（2PC）的协调者。它与 Arbor 使用同一套交易、四节点 PBFT、网络延时、执行计算、客户端确认和性能统计代码。
 
@@ -82,3 +86,33 @@ python3 tests/test_saguaro.py
 测试包括两层和三层 NCA 路由、两个/三个参与方、相同 key 的连续交易、片内执行、重复交易去重、并发冲突、准备阶段持锁时的协调者/参与方 forward 故障切换、检查点追赶恢复和统一负载比较。`make test` 同时保留原有 Arbor 回归测试。
 
 运行日志和测试结果会像 Arbor 一样归入 `runtime` 与 `test-results`，`make clean` 清理生成文件并停止本项目管理的运行实例；`baseline` 下的源代码和说明会保留。
+
+## SharPer 与 Arbor 的同负载比较
+
+SharPer 每片四个副本、`f=1`；`SUPER_PROPOSE` 直接发送给所有参与片的全部副本，ACCEPT/COMMIT 在参与副本间直接交换，跨片提交需要每个参与片的三票 ACCEPT 和三票 COMMIT。当前按参与片 ID 升序预约，每片见到全部较小参与片各三个匹配 ACCEPT 后才分配本地序号，每个叶子一个未执行跨片 slot。祖先片不进行排序或 2PC；发起叶子等待每个参与片三个实际执行通知后才回复客户端。
+
+升序预约是工程调度限制，会增加等待、降低相对于论文默认并行模式的并行度。当前不声称完整 Algorithm 4 或完整 Byzantine 活性保障。历史批次和投票记录会持续增长，长期实验需要评估内存及恢复消息大小。
+
+固定参与分片的经典比较入口：
+
+```bash
+python3 -B baseline/compare.py --baseline sharper \
+  --config config/two_layer.json --participants 1,2 \
+  --count 4000 --rate 1000 --batch 10 --repeat 3 --seed 42 \
+  --timeout 120 --drain-timeout 60
+```
+
+生成并比较 10000 笔、90% 双片 / 10% 三片的混合负载：
+
+```bash
+python3 -B baseline/compare_mixed.py --baseline sharper \
+  --config config/three_layer_cross100.json \
+  --count 10000 --rate 5000 --batch 10 --repeat 3 --seed 42 \
+  --timeout 180 --drain-timeout 60
+```
+
+复用已经生成的混合 JSON 用 `--workload 路径` 替代 `--count/--rate/--batch/--seed`。原始 unsigned workload 的跨片 `target` 仍为 NCA，SharPer 客户端在签名前将路由目标改为最小参与叶子，输入文件保留。将 `--baseline` 改为 `saguaro` 可执行相同的混合对比；经典入口省略该参数仍保持原有 Saguaro 行为。
+
+两个入口自动依次运行新集群，重复轮次交替顺序；核对同一配置、同一实际负载 SHA256、唯一交易完成、四副本收敛及协议队列排空后，才报告 `arbor_over_sharper_tps`。失败轮次不参与成功比值，整组比值留空。SharPer 所有节点的 NCA 排序/完成计数为零，叶子执行数按各自参与的交易计算。
+
+执行 `make sharper` 单独构建，执行 `make test-sharper` 运行其工具与集群回归。具体协议、预约调度与当前故障支持范围见 [sharper/README.md](sharper/README.md)。

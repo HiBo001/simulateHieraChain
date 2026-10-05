@@ -15,7 +15,7 @@ import cluster as c
 from benchmark import config_fingerprint, free_ports, METRICS, COUNTERS
 
 
-def expectations(cfg, workload):
+def expectations(cfg, workload, method="arbor"):
     """Derive every leaf and coordinator's exact count, including mixed LCAs."""
     parent, leaves = c.topology(cfg)
     if not isinstance(workload, dict):
@@ -64,7 +64,8 @@ def expectations(cfg, workload):
             seen_transactions.add(tid)
             for sid in ps:
                 executed[sid] += 1
-            ordered[request["target"]] += 1
+            if method != "sharper":
+                ordered[request["target"]] += 1
             label = ",".join(map(str, ps))
             groups[label] = groups.get(label, 0) + 1
             sizes[str(len(ps))] = sizes.get(str(len(ps)), 0) + 1
@@ -90,6 +91,10 @@ def settlement_errors(cfg, expected, rows, method):
                             "sag_pending_completions", "sag_held_locks")
     elif method == "arbor":
         required_counts += ("rounds_requested", "cst_round")
+    elif method == "sharper":
+        required_counts += ("sharper_active_batches", "sharper_pending_batches", "sharper_waiting_execution")
+    else:
+        return ["未知测试方法"]
     for row in rows:
         if any(type(row.get(field)) is not int or row[field] < 0 for field in required_counts):
             return ["节点计数字段缺失或无效"]
@@ -110,10 +115,11 @@ def settlement_errors(cfg, expected, rows, method):
                 problems.append(f"分片 {sid} 的 {field} 未收敛")
         if any(r.get("executed_transactions") != expected["executed"][sid] for r in peers):
             problems.append(f"分片 {sid} 执行计数不符")
-        if any(r.get("ordered_cst_transactions") != expected["ordered"][sid] for r in peers):
+        ordered = 0 if method == "sharper" else expected["ordered"][sid]
+        if any(r.get("ordered_cst_transactions") != ordered for r in peers):
             problems.append(f"分片 {sid} 跨片排序计数不符")
-        if sid not in leaves:
-            if any(r.get("completed_cst_transactions") != expected["ordered"][sid] for r in peers):
+        if sid not in leaves or method == "sharper":
+            if any(r.get("completed_cst_transactions") != ordered for r in peers):
                 problems.append(f"协调片 {sid} 完成计数不符")
             if method == "arbor" and any(r.get("rounds_requested", 0) > r.get("cst_round", 0) for r in peers):
                 problems.append(f"协调片 {sid} 仍有未封闭轮次")
@@ -126,6 +132,10 @@ def settlement_errors(cfg, expected, rows, method):
                       "sag_pending_completions", "sag_held_locks")
             if any(field not in r or r[field] for r in peers for field in fields):
                 problems.append(f"分片 {sid} 仍有未结束的 2PC 或未释放的锁")
+        elif method == "sharper":
+            fields = ("sharper_active_batches", "sharper_pending_batches", "sharper_waiting_execution")
+            if any(r[field] for r in peers for field in fields):
+                problems.append(f"分片 {sid} 仍有未结束的 SharPer 共识或依赖执行")
     return problems
 
 
@@ -171,7 +181,7 @@ def wait_client(proc, log_path, timeout):
 def run(config_path, workload_path, output_dir, method, timeout=None, drain_timeout=30):
     raw, workload = c.read(config_path), c.read(workload_path)
     validated = c.validate(raw)
-    expected = expectations(validated, workload)
+    expected = expectations(validated, workload, method)
     workload = copy.deepcopy(workload)
     if timeout is not None:
         if not math.isfinite(timeout) or timeout <= 0:

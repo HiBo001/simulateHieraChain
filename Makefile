@@ -8,10 +8,12 @@ endif
 LDLIBS += -lcrypto -lz -pthread
 BIN = build/bin/arbor_node
 SAGUARO_BIN = build/bin/saguaro_node
+SHARPER_BIN = build/bin/sharper_node
 NETWORK_TEST = build/bin/test_network
 DIGEST_TEST = build/bin/test_state_digest
+SHARPER_RECOVERY_TEST = build/bin/test_sharper_recovery
 
-all: $(BIN) $(SAGUARO_BIN)
+all: $(BIN) $(SAGUARO_BIN) $(SHARPER_BIN)
 $(BIN): source/main.cpp source/common.h source/network.h source/state_digest.h third_party/nlohmann/json.hpp
 	mkdir -p build/bin
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) source/main.cpp $(LDFLAGS) $(LDLIBS) -o $@
@@ -19,13 +21,26 @@ $(SAGUARO_BIN): baseline/saguaro/main.cpp baseline/saguaro/protocol.inc source/m
 	mkdir -p build/bin
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) baseline/saguaro/main.cpp $(LDFLAGS) $(LDLIBS) -o $@
 saguaro: $(SAGUARO_BIN)
+$(SHARPER_BIN): baseline/sharper/main.cpp baseline/sharper/protocol.inc source/main.cpp source/common.h source/network.h source/state_digest.h third_party/nlohmann/json.hpp
+	mkdir -p build/bin
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) baseline/sharper/main.cpp $(LDFLAGS) $(LDLIBS) -o $@
+sharper: $(SHARPER_BIN)
+test-sharper: $(BIN) $(SHARPER_BIN) $(SHARPER_RECOVERY_TEST)
+	python3 -B tests/test_sharper_tools.py
+	python3 -B tests/test_sharper_recovery.py
+	python3 -B tests/test_sharper.py
+$(SHARPER_RECOVERY_TEST): tests/test_sharper_recovery.cpp baseline/sharper/protocol.inc source/main.cpp source/common.h source/network.h source/state_digest.h third_party/nlohmann/json.hpp
+	mkdir -p build/bin
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) tests/test_sharper_recovery.cpp $(LDFLAGS) $(LDLIBS) -o $@
+test-sharper-recovery: $(SHARPER_RECOVERY_TEST)
+	python3 -B tests/test_sharper_recovery.py
 $(NETWORK_TEST): tests/test_network.cpp source/common.h source/network.h third_party/nlohmann/json.hpp
 	mkdir -p build/bin
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -Isource tests/test_network.cpp $(LDFLAGS) $(LDLIBS) -o $@
 $(DIGEST_TEST): tests/test_state_digest.cpp source/common.h source/state_digest.h third_party/nlohmann/json.hpp
 	mkdir -p build/bin
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -Isource tests/test_state_digest.cpp $(LDFLAGS) $(LDLIBS) -o $@
-test: $(BIN) $(SAGUARO_BIN) $(NETWORK_TEST) $(DIGEST_TEST)
+test: $(BIN) $(SAGUARO_BIN) $(SHARPER_BIN) $(NETWORK_TEST) $(DIGEST_TEST) $(SHARPER_RECOVERY_TEST)
 	$(NETWORK_TEST)
 	$(DIGEST_TEST)
 	python3 -B tests/test_clean.py
@@ -40,10 +55,13 @@ test: $(BIN) $(SAGUARO_BIN) $(NETWORK_TEST) $(DIGEST_TEST)
 	python3 -B tests/test_mixed_benchmark.py
 	python3 -B tests/test_method_tools.py
 	python3 -B tests/test_saguaro.py
+	python3 -B tests/test_sharper_tools.py
+	python3 -B tests/test_sharper_recovery.py
+	python3 -B tests/test_sharper.py
 benchmark: $(BIN)
 	python3 -B scripts/benchmark.py --skip-build
 check:
 	python3 scripts/cluster.py validate --config config/two_layer.json
 clean:
 	python3 -B scripts/clean.py
-.PHONY: all saguaro test benchmark check clean
+.PHONY: all saguaro sharper test test-sharper test-sharper-recovery benchmark check clean

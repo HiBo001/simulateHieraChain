@@ -66,10 +66,10 @@ def settlement_errors(case, cfg, rows):
             case["mode"] == "cross" and sid in case["participants"]) else 0
         if any(r.get("executed_transactions") != wanted for r in peers):
             problems.append(f"分片 {sid} 执行计数不符")
-        ordered = case["count"] if case["mode"] == "cross" and sid == coordinator else 0
+        ordered = case["count"] if method != "sharper" and case["mode"] == "cross" and sid == coordinator else 0
         if any(r.get("ordered_cst_transactions") != ordered for r in peers):
             problems.append(f"分片 {sid} 跨片排序计数不符")
-        if sid not in leaves and any(
+        if (sid not in leaves or method == "sharper") and any(
                 r.get("completed_cst_transactions") != ordered for r in peers):
             problems.append(f"协调片 {sid} 完成计数不符")
         # Demand-driven empty closes consume real coordinator PBFT slots.
@@ -88,6 +88,12 @@ def settlement_errors(case, cfg, rows):
                 problems.append(f"分片 {sid} 缺少 2PC 状态统计")
             elif any(row[field] for row in peers for field in fields):
                 problems.append(f"分片 {sid} 仍有未结束的 2PC 或未释放的锁")
+        elif method == "sharper":
+            fields = ("sharper_active_batches", "sharper_pending_batches", "sharper_waiting_execution")
+            if any(type(row.get(field)) is not int or row[field] < 0 for row in peers for field in fields):
+                problems.append(f"分片 {sid} 缺少或具有无效的 SharPer 状态统计")
+            elif any(row[field] for row in peers for field in fields):
+                problems.append(f"分片 {sid} 仍有未结束的 SharPer 共识或依赖执行")
     return problems
 
 
