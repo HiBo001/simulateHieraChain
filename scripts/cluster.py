@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "build/bin/arbor_node"
 RUN_PROCESSES = {}
 METHODS = ("arbor", "saguaro", "sharper", "ahl")
+ARBOR_WINDOW_FIELDS = ("ordering_window_blocks", "empty_block_interval_ms")
 
 
 def binary_for_method(method="arbor"):
@@ -112,7 +113,8 @@ def validate(raw):
         current = c.setdefault(group, {})
         if group == "consensus" and isinstance(current, dict) and "pipeline_window" in current:
             raise ValueError("consensus.pipeline_window 已废弃，流水线协议已移除；请删除该配置项后重新启动")
-        if not isinstance(current, dict) or set(current) - set(fields):
+        allowed_fields = set(fields) | (set(ARBOR_WINDOW_FIELDS) if group == "consensus" else set())
+        if not isinstance(current, dict) or set(current) - allowed_fields:
             raise ValueError(f"{group} 包含未知配置项")
         for name, default in fields.items():
             current.setdefault(name, default)
@@ -122,6 +124,11 @@ def validate(raw):
         c["consensus"]["cross_shard_batch_size"] = min(64, c["consensus"]["batch_size"])
     integer(c["consensus"]["cross_shard_batch_size"], "cross_shard_batch_size", 1, c["consensus"]["batch_size"])
     integer(c["consensus"]["cross_shard_batch_wait_ms"], "cross_shard_batch_wait_ms", 0, 10000)
+    # Preserve legacy config bytes/fingerprints when no Arbor window is opted in.
+    # Native Arbor supplies defaults; baseline configs never need these fields.
+    for name, low, high in (("ordering_window_blocks", 0, 32), ("empty_block_interval_ms", 1, 10000)):
+        if name in c["consensus"]:
+            integer(c["consensus"][name], name, low, high)
     integer(c["execution"]["fib_iterations"], "fib_iterations", 1, 100000000)
     n = c["network"]
     for name in ["intra_shard_delay_ms", "default_inter_shard_delay_ms"]:
@@ -163,6 +170,10 @@ def topology(c):
 def validate_method_config(c, method="arbor"):
     """Method-specific constraints, checked before keys, ports or processes."""
     binary_for_method(method)
+    if method != "arbor" and any(name in c["consensus"] for name in ARBOR_WINDOW_FIELDS):
+        c = json.loads(json.dumps(c))
+        for name in ARBOR_WINDOW_FIELDS:
+            c["consensus"].pop(name, None)
     if method == "ahl":
         parent, leaves = topology(c)
         roots = [sid for sid, ancestor in parent.items() if ancestor is None]

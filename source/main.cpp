@@ -122,6 +122,9 @@ class Replica {
 #ifdef ARBOR_PBFT_RECOVERY_TESTS
     friend struct PbftRecoveryTest;
 #endif
+#ifdef ARBOR_ORDERING_WINDOW_TESTS
+    friend struct OrderingWindowsTest;
+#endif
     struct Slot {
         json proposal;
         std::map<int,json> prepares,commits;
@@ -223,6 +226,9 @@ class Replica {
     Clock::time_point pbftLastNewViewRetry=Clock::time_point{};
     std::map<int,std::map<int,std::string>> pbftVcFingerprints;
     int window=64;
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+#include "ordering_windows.inc"
+#endif
     json make(std::string type,json fields=json::object(),int v=-1) {
         fields["type"]=type; fields["run"]=members.run; fields["shard"]=shard;
         fields["from"]=me; fields["view"]= v<0 ? view : v;
@@ -373,6 +379,9 @@ class Replica {
                 if(!value.at("cst_round").is_number_integer() || value.at("cst_round").get<int>()<=0) return false;
             } else if(value.contains("cst_round")) return false;
             size_t fields=2+(members.multiLayer()?1:0)+(requests.empty()?0:1);
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+            if(windowsEnabled() && value.at("cst_round").get<int>()%orderingWindowBlocks()==0) ++fields;
+#endif
             if(value.size()!=fields || (requests.empty() && (!members.multiLayer() || value.contains("cst_order_index")))) return false;
             if(!requests.empty() && (!value.at("cst_order_index").is_number_integer() || value.at("cst_order_index").get<int>()<=0)) return false;
             int total=0;std::string group;std::set<std::string> rids,txids;
@@ -387,6 +396,9 @@ class Replica {
             }
             for(int leaf:participants(requests)) if(projection(value,leaf)<=0) return false;
             if(total>crossShardBatchSize) return false;
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+            if(windowsEnabled() && !validWindowManifestShape(value,origin,b.at("seq"))) return false;
+#endif
             if(checkedCloses.size()<10000) checkedCloses.insert(fingerprint);return true;
         } catch(...) { return false; }
     }
@@ -400,6 +412,9 @@ class Replica {
         } catch(...) {return false;}
     }
     bool validLeafOrder(const json& cert,const json& frontier) const {
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        if(windowsEnabled()) return validWindowLeafOrder(cert,frontier);
+#endif
         try {
             if(!members.leaves.count(shard) || !validCoordinatorCertificate(cert) || !orderParticipants(cert).count(shard) ||
                state.at("cst_batches").contains(cstKey(cert))) return false;
@@ -426,6 +441,9 @@ class Replica {
         } catch(...) {return false;}
     }
     const json& nextCstOrder() const {
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        if(windowsEnabled()) return nextWindowCstOrder();
+#endif
         ++cstSelectionLookups;
         if(!cstSelectionDirty) return cstSelection;
         ++cstSelectionRebuilds;
@@ -621,7 +639,11 @@ class Replica {
                 }
             }
             for(auto it=value.begin();it!=value.end();++it)
-                if(it.key()!="requests" && it.key()!="cst_order_index" && it.key()!="cst_orders" && it.key()!="cst_watermarks" && it.key()!="cst_round" && it.key()!="cst_frontier") return false;
+                if(it.key()!="requests" && it.key()!="cst_order_index" && it.key()!="cst_orders" && it.key()!="cst_watermarks" && it.key()!="cst_round" && it.key()!="cst_frontier"
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                   && !(windowsEnabled() && isCoordinator() && it.key()=="cst_window_manifest")
+#endif
+                ) return false;
             if(value.contains("cst_order_index")) {
                 if(!isCoordinator() || value.at("requests").empty() ||
                    value.contains("cst_orders") ||
@@ -639,6 +661,9 @@ class Replica {
                     if(!members.multiLayer() && value.contains("cst_round")) return false;
                 } else if(!value.at("requests").empty() || value.contains("cst_round")) return false;
                 if(value.contains("cst_frontier") || value.contains("cst_orders")) return false;
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                if(windowsEnabled() && !validLocalWindowValue(value)) return false;
+#endif
             } else if(value.contains("cst_watermarks") || value.contains("cst_round")) return false;
             if(value.contains("cst_orders")) {
                 if(!members.leaves.count(shard) || !value.at("cst_orders").is_array() || value.at("cst_orders").size()!=1 || !value.at("requests").empty()) return false;
@@ -826,6 +851,9 @@ class Replica {
         bool restored=h>applied;
         if(restored) {
             state=s.at("state"); applied=h;
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+            if(windowsEnabled() && isCoordinator()) windowLastBlock=Clock::now();
+#endif
             refreshDigests(true);
             log("state_sync",{{"seq",h}});
             pendingLocalAckQcs.clear();
@@ -1144,6 +1172,7 @@ class Replica {
         return arborNoBatch;
     }
     void maybeRequestArborRound(Clock::time_point now) {
+        if(windowsEnabled()) return; // Independently timed PBFT windows supersede demand rounds.
         // A partial local business group must not manufacture empty rounds
         // while waiting. CST_ROUND_REQUEST raises desiredRound independently.
         // Admission can keep changing pending while consensus is in flight;
@@ -1254,6 +1283,9 @@ class Replica {
         log("cst_order_forwarded",{{"coordinator_seq",cert.at("proposal").at("body").at("seq")},{"destinations",destinations},{"forward",me},{"retry",retry}});
     }
     void requestRound(int round) {
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        if(windowsEnabled()) return;
+#endif
         desiredRound=std::max(desiredRound,round);
         if(!isForward()) return;
         for(int co:members.coordinators()) if(co!=shard)
@@ -1278,6 +1310,9 @@ class Replica {
         return true;
     }
     void queryRounds() {
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        if(windowsEnabled()) {queryWindowRounds();return;}
+#endif
         if(!members.multiLayer() || !isForward()) return;
         if(members.leaves.count(shard)) {
             if(pendingCst.empty() && stagedRecords.empty()) return;
@@ -1579,6 +1614,9 @@ class Replica {
                 state["participant_indices"]=value.at("cst_watermarks");stateDigest.markField("participant_indices");
                 if(value.contains("cst_round")) {
                     state["cst_round"]=value.at("cst_round");
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                    if(windowsEnabled()) windowLastBlock=Clock::now();
+#endif
                     state["cst_rounds"][std::to_string(value.at("cst_round").get<int>())]={{"seq",n},{"digest",cert.at("proposal").at("body").at("digest")},{"value",value}};
                     stateDigest.markEntry("cst_rounds",std::to_string(value.at("cst_round").get<int>()));
                 }
@@ -1592,7 +1630,13 @@ class Replica {
                 state["cst_indices"][std::to_string(origin)]=projection(root.at("proposal").at("body").at("value"),shard);
                 stateDigest.markEntry("cst_indices",std::to_string(origin));
                 state["last_cst_seq"]=root.at("proposal").at("body").at("value").at("cst_order_index");
-                if(members.multiLayer()) state["cst_round"]=root.at("proposal").at("body").at("value").at("cst_round");
+                if(members.multiLayer()) {
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                    if(windowsEnabled()) state["cst_round"]=std::max(state.at("cst_round").get<int>(),root.at("proposal").at("body").at("value").at("cst_round").get<int>());
+                    else
+#endif
+                    state["cst_round"]=root.at("proposal").at("body").at("value").at("cst_round");
+                }
                 pendingCst.erase(key);slotWitnesses[n]=witness;
                 log("cst_ordered_at_leaf",{{"coordinator_batch",key},{"digest",state["cst_batches"].at(key)}});
             }
@@ -1643,6 +1687,7 @@ class Replica {
         if(!stagedRecords.empty() || certificates.count(applied+1)) return;
         bool flowControlled=isCoordinator() && outstandingOrders.size()>=8;
         bool closeRound=isCoordinator() && members.multiLayer() && desiredRound>state.at("cst_round").get<int>();
+        if(windowsEnabled()) closeRound=windowEmptyDue(Clock::now()) && (pending.empty() || flowControlled);
         if(flowControlled && !closeRound) return;
         if(pending.empty() && pendingCst.empty() && !closeRound) return;
         bool crossShardOrder=isCoordinator() && !pending.empty() && !flowControlled;
@@ -1682,6 +1727,8 @@ class Replica {
             for(int leaf:members.descendants(shard)) watermark[std::to_string(leaf)]=state.at("participant_indices").value(std::to_string(leaf),0)+(ps.count(leaf)?1:0);
             value["cst_watermarks"]=watermark;
             if(members.multiLayer()) value["cst_round"]=state.at("cst_round").get<int>()+1;
+            if(windowsEnabled() && value.at("cst_round").get<int>()%orderingWindowBlocks()==0)
+                value["cst_window_manifest"]=buildWindowManifest(value,applied+1);
         }
         if(reqs.empty() && !pendingCst.empty()) {
             const auto& next=nextCstOrder();
@@ -1778,6 +1825,7 @@ class Replica {
             auto [it,inserted]=pending.emplace(id,e);
             if(!inserted && it->second.at("body").at("txs")!=b.at("txs")) {rejected++;return;}
             if(inserted) arborPendingAdded(id,e);
+            if(inserted && windowsEnabled() && isCoordinator()) windowPauseBlock=-1;
             if(inserted) for(const auto& tx:b.at("txs"))
                 if(!state["seen"].contains(tx.at("id").get<std::string>()))
                     pendingTx.emplace(tx.at("id"),std::make_pair(hash(tx.dump()),id));
@@ -1785,6 +1833,12 @@ class Replica {
 #endif
             return;
         }
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        if(type=="WINDOW_PAUSE") {
+            if(!handleWindowPause(e)) ++rejected;
+            return;
+        }
+#endif
         if(type=="PROBE") {
             if(!members.clientMessage(e) || b.at("source")!=identity(shard,me)) {rejected++;return;}
             std::string id=b.at("id"); int dst=b.at("dst_shard"),r=b.at("dst_replica");
@@ -1795,6 +1849,9 @@ class Replica {
         }
         if(!members.replicaMessage(e)) {rejected++;return;}
         int source=b.at("shard"),sender=b.at("from");
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        if(handleWindowQuery(e)) return;
+#endif
 #ifdef ARBOR_SAGUARO
         if(saguaroHandle(e)) return;
         if(type.rfind("CST_",0)==0 || type.rfind("SH_",0)==0) {rejected++;return;}
@@ -2211,6 +2268,7 @@ class Replica {
         sharperStatus(s);
 #else
         s["method"]="arbor";
+        orderingWindowStatus(s);
         s["future_preprepare_cache_entries"]=arborFutureProposals.size();
         s["future_preprepare_cache_bytes"]=arborFutureProposalBytes;
         s["future_preprepare_retries"]=arborFutureProposalRetries;
@@ -2234,6 +2292,10 @@ public:
         crossShardBatchSize=cfg.at("consensus").at("cross_shard_batch_size");
         crossShardBatchWaitMs=cfg.at("consensus").at("cross_shard_batch_wait_ms");
         checkpointEvery=cfg.at("consensus").at("checkpoint_batches");
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        if(orderingWindowBlocks()<0 || orderingWindowBlocks()>32 || windowEmptyIntervalMs()<1 || windowEmptyIntervalMs()>10000)
+            throw std::runtime_error("ordering_window_blocks must be 0..32 and empty_block_interval_ms 1..10000");
+#endif
 #ifdef ARBOR_SAGUARO
         saguaroInitialize();
 #endif
@@ -2276,9 +2338,12 @@ public:
             bool staged=!stagedRecords.empty();
             bool flowControlled=isCoordinator() && outstandingOrders.size()>=8;
             maybeRequestArborRound(now);
+            activateWindowWork(now);
             bool orderAvailable=members.leaves.count(shard) && !staged && !nextCstOrder().is_null();
             bool waiting=!staged && ((!flowControlled && !pending.empty()) || orderAvailable ||
                 (isCoordinator() && desiredRound>state.at("cst_round").get<int>()));
+            if(windowsEnabled()) waiting=!staged && ((!flowControlled && !pending.empty()) || orderAvailable ||
+                (windowEmptyDue(now) && (pending.empty() || flowControlled)));
             bool crossWork=staged || !outstandingOrders.empty() || !pendingLocalAckQcs.empty() || !completionResendNeeded.empty();
             if(crossWork && std::chrono::duration_cast<std::chrono::milliseconds>(now-lastForwardHeartbeat).count()>timeoutMs)
                 waiting=true;

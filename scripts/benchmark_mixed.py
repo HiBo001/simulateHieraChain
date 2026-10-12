@@ -85,6 +85,40 @@ def expectations(cfg, workload, method="arbor"):
     return expected
 
 
+def pause_idle_windows(run, cfg, timeout=30):
+    """Freeze background empty blocks only after the timed workload has finished.
+
+    This does not count as transaction completion, change the client metrics,
+    or bypass the subsequent replica convergence and queue checks. A normal
+    configured run continues making empty blocks until it is stopped.
+    """
+    m = cfg["consensus"].get("ordering_window_blocks", 0)
+    parent, leaves = c.topology(cfg)
+    coordinators = set(parent) - set(leaves)
+    if not m or len(coordinators) <= 1:
+        return {"required": False, "paused": True}
+    deadline = time.monotonic() + timeout
+    envelopes = {}
+    rows = c.statuses(run)
+    for sid in coordinators:
+        block = max(r.get("cst_round", 0) for r in rows if r["shard"] == sid)
+        final = ((block + m - 1) // m) * m
+        envelopes[sid] = c.signed({"type": "WINDOW_PAUSE", "run": cfg["run_id"],
+            "target": sid, "final_block": final}, cfg["client_private_key"], run)
+    while time.monotonic() < deadline:
+        for node in cfg["nodes"]:
+            if node["shard"] in coordinators:
+                c.send_frame(node["host"], node["port"], envelopes[node["shard"]])
+        time.sleep(.25)
+        rows = c.statuses(run)
+        peers = [r for r in rows if r["shard"] in coordinators]
+        if len(peers) == 4 * len(coordinators) and all(r.get("window_paused") is True for r in peers):
+            return {"required": True, "paused": True,
+                    "final_blocks": {str(sid): max(r["cst_round"] for r in peers if r["shard"] == sid)
+                                     for sid in coordinators}}
+    return {"required": True, "paused": False}
+
+
 def settlement_errors(cfg, expected, rows, method):
     parent, leaves = c.topology(cfg)
     wanted_nodes = {(sid, replica) for sid in parent for replica in range(4)}
@@ -235,9 +269,13 @@ def run(config_path, workload_path, output_dir, method, timeout=None, drain_time
                 client_rc = 124
         result = c.read(result_path) if result_path.is_file() else {}
         good_client = client_rc == 0 and result.get("executed_transactions") == expected["transactions"]
+        if good_client and method == "arbor":
+            report["window_idle_pause"] = pause_idle_windows(node_run, cfg, drain_timeout)
         drained, after = wait_settled(cfg, expected, node_run, method, drain_timeout if good_client else min(2, drain_timeout))
         c.write(output_dir / "status-after.json", after)
         errors = settlement_errors(cfg, expected, after, method)
+        if report.get("window_idle_pause", {}).get("paused") is False:
+            errors.append("连续空区块实验结束后暂停失败，不能确认最终副本收敛")
         if not drained:
             errors.append("等待副本排空/收敛超时")
         if client_rc != 0 or result.get("completed_requests") != expected["requests"] or result.get("requests") != expected["requests"]:

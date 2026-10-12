@@ -15,9 +15,10 @@ DIGEST_TEST = build/bin/test_state_digest
 SHARPER_RECOVERY_TEST = build/bin/test_sharper_recovery
 ARBOR_BATCHING_TEST = build/bin/test_arbor_batching
 PBFT_RECOVERY_TEST = build/bin/test_pbft_recovery
+ORDERING_WINDOW_TEST = build/bin/test_ordering_windows
 
 all: $(BIN) $(SAGUARO_BIN) $(SHARPER_BIN) $(AHL_BIN)
-$(BIN): source/main.cpp source/common.h source/network.h source/state_digest.h third_party/nlohmann/json.hpp
+$(BIN): source/main.cpp source/ordering_windows.inc source/common.h source/network.h source/state_digest.h third_party/nlohmann/json.hpp
 	mkdir -p build/bin
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) source/main.cpp $(LDFLAGS) $(LDLIBS) -o $@
 $(SAGUARO_BIN): baseline/saguaro/main.cpp baseline/saguaro/protocol.inc source/main.cpp source/common.h source/network.h source/state_digest.h third_party/nlohmann/json.hpp
@@ -49,7 +50,7 @@ $(PBFT_RECOVERY_TEST): tests/test_pbft_recovery.cpp baseline/saguaro/protocol.in
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) tests/test_pbft_recovery.cpp $(LDFLAGS) $(LDLIBS) -o $@
 test-pbft-recovery: $(PBFT_RECOVERY_TEST)
 	python3 -B tests/test_pbft_recovery.py
-$(ARBOR_BATCHING_TEST): tests/test_arbor_batching.cpp source/main.cpp source/common.h source/network.h source/state_digest.h third_party/nlohmann/json.hpp
+$(ARBOR_BATCHING_TEST): tests/test_arbor_batching.cpp source/ordering_windows.inc source/main.cpp source/common.h source/network.h source/state_digest.h third_party/nlohmann/json.hpp
 	mkdir -p build/bin
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) tests/test_arbor_batching.cpp $(LDFLAGS) $(LDLIBS) -o $@
 test-arbor-batching-unit: $(ARBOR_BATCHING_TEST)
@@ -62,7 +63,7 @@ $(NETWORK_TEST): tests/test_network.cpp source/common.h source/network.h third_p
 $(DIGEST_TEST): tests/test_state_digest.cpp source/common.h source/state_digest.h third_party/nlohmann/json.hpp
 	mkdir -p build/bin
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -Isource tests/test_state_digest.cpp $(LDFLAGS) $(LDLIBS) -o $@
-test: $(BIN) $(SAGUARO_BIN) $(SHARPER_BIN) $(AHL_BIN) $(NETWORK_TEST) $(DIGEST_TEST) $(SHARPER_RECOVERY_TEST) $(ARBOR_BATCHING_TEST) $(PBFT_RECOVERY_TEST)
+test: $(BIN) $(SAGUARO_BIN) $(SHARPER_BIN) $(AHL_BIN) $(NETWORK_TEST) $(DIGEST_TEST) $(SHARPER_RECOVERY_TEST) $(ARBOR_BATCHING_TEST) $(PBFT_RECOVERY_TEST) $(ORDERING_WINDOW_TEST)
 	$(NETWORK_TEST)
 	$(DIGEST_TEST)
 	python3 -B tests/test_pbft_recovery.py
@@ -86,6 +87,9 @@ test: $(BIN) $(SAGUARO_BIN) $(SHARPER_BIN) $(AHL_BIN) $(NETWORK_TEST) $(DIGEST_T
 	python3 -B tests/test_sharper.py
 	python3 -B tests/test_ahl_tools.py
 	python3 -B tests/test_ahl.py
+	python3 -B tests/test_ordering_windows.py
+	python3 -B tests/test_ordering_window_benchmark.py
+	python3 -B tests/test_baseline_compatibility.py
 benchmark: $(BIN)
 	python3 -B scripts/benchmark.py --skip-build
 check:
@@ -93,3 +97,11 @@ check:
 clean:
 	python3 -B scripts/clean.py
 .PHONY: all saguaro sharper ahl test-arbor-batching test-arbor-batching-unit test test-sharper test-sharper-recovery test-pbft-recovery test-ahl benchmark check clean
+
+$(ORDERING_WINDOW_TEST): tests/test_ordering_windows.cpp source/main.cpp source/ordering_windows.inc source/common.h source/network.h source/state_digest.h third_party/nlohmann/json.hpp
+	mkdir -p build/bin
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) tests/test_ordering_windows.cpp $(LDFLAGS) $(LDLIBS) -o $@
+test-ordering-windows: $(BIN) $(ORDERING_WINDOW_TEST)
+	python3 -B tests/test_ordering_windows.py
+	python3 -B tests/test_ordering_window_benchmark.py
+.PHONY: test-ordering-windows
