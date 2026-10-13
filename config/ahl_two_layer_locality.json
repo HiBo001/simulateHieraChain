@@ -106,7 +106,7 @@
     "batch_size": 1000,
     "batch_wait_ms": 10,
     "cross_shard_batch_size": 100,
-    "cross_shard_batch_wait_ms": 600,
+    "cross_shard_batch_wait_ms": 100,
     "view_timeout_ms": 2000,
     "checkpoint_batches": 16
   },

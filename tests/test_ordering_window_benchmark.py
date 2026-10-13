@@ -96,7 +96,7 @@ class OrderingWindowBenchmark(unittest.TestCase):
         self.assertNotEqual(context["actual_config_fingerprints"]["arbor"],
                             context["actual_config_fingerprints"]["saguaro"])
         self.assertEqual(context["protocol_difference_allowlist"],
-                         ["consensus.ordering_window_blocks", "consensus.empty_block_interval_ms"])
+                         ["consensus.ordering_window_blocks", "consensus.empty_block_interval_ms", "consensus.ancestor_streaming", "consensus.ancestor_order", "consensus.ancestor_lower_blocks_per_root", "consensus.ancestor_leaf_batch_blocks"])
         for section, field in (("consensus", "cross_shard_batch_size"),
                                ("consensus", "batch_wait_ms"), ("execution", "fib_iterations"),
                                ("network", "intra_shard_delay_ms")):

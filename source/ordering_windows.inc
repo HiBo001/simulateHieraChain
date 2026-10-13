@@ -30,6 +30,7 @@
         if(windowPauseBlock>=0 && block>=windowPauseBlock && block%orderingWindowBlocks()==0) return false;
         return std::chrono::duration_cast<std::chrono::milliseconds>(now-windowLastBlock).count()>=windowEmptyIntervalMs();
     }
+#include "ancestor_streaming.inc"
     json windowManifestEntry(const json& value,int seq,int leaf) const {
         return {{"block",value.at("cst_round")},{"seq",seq},{"index",value.at("cst_order_index")},
                 {"projection",projection(value,leaf)}, {"request_digest",hash(value.at("requests").dump())}};
@@ -121,6 +122,8 @@
         } catch(...) {return false;}
     }
     bool validWindowLeafOrder(const json& cert,const json& frontier) const {
+        LeafElapsedScope schedulerProfile(*this,leafSchedulerElapsedNs,leafSchedulerDepth);
+        LeafElapsedScope frontierProfile(*this,leafFrontierValidationElapsedNs,leafFrontierValidationDepth);
         try {
             if(!members.leaves.count(shard) || !validCoordinatorCertificate(cert) || !orderParticipants(cert).count(shard) ||
                state.at("cst_batches").contains(cstKey(cert))) return false;
@@ -164,7 +167,7 @@
     const json& nextWindowCstOrder() const {
         ++cstSelectionLookups;
         if(!cstSelectionDirty) return cstSelection;
-        ++cstSelectionRebuilds;cstSelection=nullptr;
+        ++cstSelectionRebuilds;cstSelection=nullptr;leafSelectionBlockedCoordinator=-1;
         std::map<std::tuple<int,int,int,int>,const json*> candidates;
         for(const auto& [key,message]:pendingCst) {
             if(state.at("cst_batches").contains(key)) continue;
@@ -184,6 +187,8 @@
                 cstSelection={{"certificate",*cert},{"frontier",frontier}};break;
             }
         }
+        if(cstSelection.is_null() && !candidates.empty())
+            leafSelectionBlockedCoordinator=leafProfileMissingCoordinator(std::get<0>(candidates.begin()->first)*orderingWindowBlocks(),true);
         cstSelectionDirty=false;return cstSelection;
     }
     bool activateWindowWork(Clock::time_point now) {
@@ -192,11 +197,13 @@
         if(certificates.count(head) || (slots.count(head) && !slots.at(head).proposal.is_null())) return false;
         const auto& next=nextCstOrder();
         if(next.is_null()) return false;
-        const auto key=cstKey(next.at("certificate"));
+        const auto key=next.at("certificate").is_null()
+            ? "stream-progress:"+std::to_string(streamCursor()+next.at("frontier").size())
+            : cstKey(next.at("certificate"));
         if(windowReadyHeadApplied==applied && windowReadyHeadKey==key) return false;
-        // Waiting for another coordinator's authenticated closing block is
-        // not a stalled local PBFT instance. Start that instance's deadline
-        // when its complete, deterministically next window order first becomes
+        // Waiting for the next authenticated ancestor prefix/window is not a
+        // stalled local PBFT instance. Start that instance's deadline
+        // when its deterministically next order or bounded progress first becomes
         // admissible. Replayed proofs, later empty blocks and active proposals
         // must never refresh the deadline for the same execution head.
         windowReadyHeadKey=key;windowReadyHeadApplied=applied;
@@ -223,6 +230,8 @@
         status["ordering_windows_enabled"]=windowsEnabled();
         status["window_pause_block"]=windowPauseBlock;
         status["window_work_timer_starts"]=windowWorkTimerStarts;
+        status["ancestor_streaming_enabled"]=ancestorStreamingEnabled();
+        if(ancestorStreamingEnabled() && members.leaves.count(shard)) status["ancestor_stream_cursor"]=streamCursor();
         const int block=state.at("cst_round");
         status["ordering_window"]=windowOf(block);
         status["window_paused"]=windowsEnabled() && isCoordinator() && windowPauseBlock>=0 &&
@@ -243,6 +252,7 @@
             if(!missing.empty()) broadcast(make("CST_ROUND_QUERY",{{"target",shard},{"rounds",missing},{"leaf",-1},{"after_index",-1}}));
             return;
         }
+        if(ancestorStreamingEnabled()) {queryStreamingRounds();return;}
         if(pendingCst.empty() && stagedRecords.empty()) return;
         std::set<int> windows;
         for(const auto& [key,message]:pendingCst) {
@@ -291,7 +301,7 @@
             if(!local) for(const auto& [block,closes]:roundCertificates) {
                 if(closes.count(shard) && orderParticipants(closes.at(shard)).count(leaf) &&
                    projection(closes.at(shard).at("proposal").at("body").at("value"),leaf)>after) {
-                    add(block);add(windowOf(block)*orderingWindowBlocks());
+                    add(block);if(!ancestorStreamingEnabled()) add(windowOf(block)*orderingWindowBlocks());
                 }
                 if(wanted.size()>=32) break;
             }

@@ -108,6 +108,25 @@ class LegacyBaselineCompatibility(unittest.TestCase):
                 baseline["execution"]["fib_iterations"] = 1
                 self.assertEqual(arbor, original, "baseline snapshots must not share mutable Arbor cost settings")
 
+    def test_bundle_opt_in_strips_all_six_arbor_fields_from_baselines(self):
+        raw = c.read(ROOT / "config/three_layer_lower_bundle.json")
+        before = copy.deepcopy(raw)
+        arbor = c.validate(raw)
+        legacy = c.validate(windows.baseline_config(raw))
+        self.assertEqual(len(c.ARBOR_WINDOW_FIELDS), 6)
+        self.assertTrue(set(c.ARBOR_WINDOW_FIELDS) <= set(arbor["consensus"]))
+        for method in ("saguaro", "sharper"):
+            with self.subTest(method=method):
+                selected = c.validate_method_config(arbor, method)
+                self.assertEqual(selected, legacy)
+                self.assertFalse(set(c.ARBOR_WINDOW_FIELDS) & set(selected["consensus"]))
+        ahl = c.validate(c.read(ROOT / "config/ahl_two_layer_locality.json"))
+        original_ahl = copy.deepcopy(ahl)
+        ahl["consensus"].update({key: arbor["consensus"][key] for key in c.ARBOR_WINDOW_FIELDS})
+        self.assertEqual(c.validate_method_config(ahl, "ahl"), original_ahl)
+        self.assertEqual(raw, before)
+        self.assertEqual(windows.baseline_config(raw), windows.baseline_config(before))
+
     def test_method_filtering_preserves_ahl_topology_constraint(self):
         raw = c.read(ROOT / "config/three_layer_locality.json")
         raw["consensus"].update(ordering_window_blocks=1, empty_block_interval_ms=200)

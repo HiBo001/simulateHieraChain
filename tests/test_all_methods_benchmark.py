@@ -73,6 +73,14 @@ class AllMethodsBenchmark(unittest.TestCase):
         self.assertEqual(self.run_suite(["--window-blocks", "0"]), 0)
         self.assertTrue(all("ordering_window_blocks" not in row["config"]["consensus"] for row in self.seen))
 
+    def test_streaming_flag_is_arbor_only_in_four_method_comparison(self):
+        self.assertEqual(self.run_suite(["--ancestor-streaming"]), 0)
+        for row in self.seen:
+            if row["method"] == "arbor":
+                self.assertTrue(row["config"]["consensus"]["ancestor_streaming"])
+            else:
+                self.assertNotIn("ancestor_streaming", row["config"]["consensus"])
+
     def test_failed_repeat_suppresses_entire_method_group_and_paired_ratio(self):
         def replay(*args, **kwargs):
             row = self.replay(*args, **kwargs)

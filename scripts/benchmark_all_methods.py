@@ -65,6 +65,8 @@ def prepare(args):
     reference = c.validate(reference_raw)
     arbor_raw = (windows.parameter_config(reference_raw, args.window_blocks, args.empty_ms)
                  if args.window_blocks else reference_raw)
+    if args.ancestor_streaming:
+        arbor_raw = dict(arbor_raw, consensus=dict(arbor_raw["consensus"], ancestor_streaming=True))
     raw = dict(arbor=arbor_raw, saguaro=reference_raw, sharper=reference_raw,
                ahl=windows.baseline_config(c.read(args.ahl_config)))
     configs = {method: c.validate(value) for method, value in raw.items()}
@@ -113,6 +115,7 @@ def save(folder, report):
             writer.writerow(dict(row, failure_reasons=json.dumps(row["failure_reasons"], ensure_ascii=False)))
     lines = ["# Arbor 与全部 baseline 性能测试", "", f"状态：{report['status']}", "",
         f"Arbor 窗口 m={report['settings']['window_blocks']}，空块间隔 {report['settings']['empty_ms']} ms；m=0 表示关闭窗口。",
+        f"固定祖先流式策略：{report['settings']['ancestor_streaming']}。",
         "负载为 100% 跨片；cross-cluster 是跨 cluster 比例，不是跨片交易占比。", "",
         "每个 ratio/rate/repeat 内四方法使用同一 unsigned 文件，顺序运行独立新集群；每轮种子加一。",
         "全部计划轮次 PASS 才显示该组中位数，失败或未完成保留空值。延时单位为秒。", "",
@@ -155,6 +158,7 @@ def main(argv=None):
     parser.add_argument("--three-shard-ratio", type=float, default=.10)
     parser.add_argument("--window-blocks", type=int, default=1, help="Arbor only: 默认 1；0 关闭新窗口")
     parser.add_argument("--empty-ms", type=int, default=200, help="Arbor only: 默认 200 ms")
+    parser.add_argument("--ancestor-streaming", action="store_true", help="Arbor only: 按祖先区块固定顺序流式执行")
     parser.add_argument("--timeout", type=float, help="默认 count/min(rates)+180 秒")
     parser.add_argument("--drain-timeout", type=float, default=60)
     parser.add_argument("--output-dir", type=Path, help="须为新目录")
@@ -163,7 +167,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     reference, raw, configs, costs = prepare(args)
     settings = {name: getattr(args, name) for name in ("profile", "count", "rates", "ratios", "repeat",
-        "batch", "seed", "three_shard_ratio", "window_blocks", "empty_ms", "timeout", "drain_timeout")}
+        "batch", "seed", "three_shard_ratio", "window_blocks", "empty_ms", "ancestor_streaming", "timeout", "drain_timeout")}
     settings["baseline_methods"] = list(METHODS[1:])
     cases = 4 * len(args.ratios) * len(args.rates) * args.repeat
     print(json.dumps(dict(settings=settings, expected_cases=cases), ensure_ascii=False, indent=2), flush=True)

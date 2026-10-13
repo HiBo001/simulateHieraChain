@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "build/bin/arbor_node"
 RUN_PROCESSES = {}
 METHODS = ("arbor", "saguaro", "sharper", "ahl")
-ARBOR_WINDOW_FIELDS = ("ordering_window_blocks", "empty_block_interval_ms")
+ARBOR_WINDOW_FIELDS = ("ordering_window_blocks", "empty_block_interval_ms", "ancestor_streaming", "ancestor_order", "ancestor_lower_blocks_per_root", "ancestor_leaf_batch_blocks")
 
 
 def binary_for_method(method="arbor"):
@@ -129,6 +129,32 @@ def validate(raw):
     for name, low, high in (("ordering_window_blocks", 0, 32), ("empty_block_interval_ms", 1, 10000)):
         if name in c["consensus"]:
             integer(c["consensus"][name], name, low, high)
+    if "ancestor_streaming" in c["consensus"]:
+        if type(c["consensus"]["ancestor_streaming"]) is not bool:
+            raise ValueError("ancestor_streaming 必须为布尔值")
+        if c["consensus"]["ancestor_streaming"] and (
+                c["consensus"].get("ordering_window_blocks", 0) < 1 or
+                len(set(parent) - set(topology(c)[1])) < 2):
+            raise ValueError("ancestor_streaming 需要多层拓扑与 ordering_window_blocks>=1")
+    if "ancestor_order" in c["consensus"]:
+        order = c["consensus"]["ancestor_order"]
+        if not isinstance(order, str) or order not in ("root_first", "lower_first"):
+            raise ValueError("ancestor_order 必须为 root_first 或 lower_first")
+        if order == "lower_first" and not c["consensus"].get("ancestor_streaming", False):
+            raise ValueError("lower_first 需要 ancestor_streaming=true")
+    if "ancestor_lower_blocks_per_root" in c["consensus"]:
+        ratio = integer(c["consensus"]["ancestor_lower_blocks_per_root"], "ancestor_lower_blocks_per_root", 1, 32)
+        if ratio > 1 and (not c["consensus"].get("ancestor_streaming", False) or
+                          c["consensus"].get("ancestor_order", "root_first") != "lower_first"):
+            raise ValueError("ancestor_lower_blocks_per_root>1 需要 lower_first 流式策略")
+    if "ancestor_leaf_batch_blocks" in c["consensus"]:
+        leaf_batch = integer(c["consensus"]["ancestor_leaf_batch_blocks"], "ancestor_leaf_batch_blocks", 1, 2)
+        if leaf_batch == 2 and (not c["consensus"].get("ancestor_streaming", False) or
+                               c["consensus"].get("ancestor_order", "root_first") != "lower_first" or
+                               c["consensus"].get("ancestor_lower_blocks_per_root", 1) != 2):
+            raise ValueError("ancestor_leaf_batch_blocks=2 需要 lower_first 流式策略与 ancestor_lower_blocks_per_root=2")
+        if leaf_batch == 2 and c["consensus"]["batch_size"] < 2 * c["consensus"]["cross_shard_batch_size"]:
+            raise ValueError("ancestor_leaf_batch_blocks=2 需要 batch_size>=2*cross_shard_batch_size")
     integer(c["execution"]["fib_iterations"], "fib_iterations", 1, 100000000)
     n = c["network"]
     for name in ["intra_shard_delay_ms", "default_inter_shard_delay_ms"]:
@@ -294,7 +320,7 @@ def statuses(run):
     return result
 
 
-def start(config, run=None, method="arbor"):
+def start(config, run=None, method="arbor", monitor=None):
     binary = binary_for_method(method)
     explicit_run = run is not None
     c = validate_method_config(validate(read(config)), method)
@@ -327,6 +353,8 @@ def start(config, run=None, method="arbor"):
         c["client_private_key"], c["client_public_key"] = keypair(keys, "client")
         c["nodes"] = []
         for s in c["shards"]:
+            if monitor:
+                monitor(run)
             for r in range(4):
                 sid = s["id"]
                 secret, public = keypair(keys, f"s{sid}-n{r}")
@@ -341,6 +369,8 @@ def start(config, run=None, method="arbor"):
         RUN_PROCESSES[str(run)] = processes
         try:
             for n in c["nodes"]:
+                if monitor:
+                    monitor(run)
                 with (Path(n["directory"]) / "node.log").open("w") as log:
                     p = subprocess.Popen([str(binary), "node", str(run / "config.json"), str(n["shard"]), str(n["replica"]), n["directory"]], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 processes.append(p)
@@ -348,6 +378,8 @@ def start(config, run=None, method="arbor"):
                 write(run / "manifest.json", manifest)
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
+                if monitor:
+                    monitor(run)
                 if any(p.poll() is not None for p in processes):
                     raise RuntimeError("有节点启动失败，请检查对应 node.log")
                 if all((Path(n["directory"]) / "status.json").exists() and read(Path(n["directory"]) / "status.json").get("ready") for n in manifest["nodes"]):
@@ -423,9 +455,9 @@ def load(run, count=100, rate=100, seed=1, prefix=None, shard=None, participants
     return rc, read(output)
 
 
-def send_frame(host, port, env):
+def send_frame(host, port, env, timeout=3):
     payload = json.dumps(env, ensure_ascii=False, separators=(",", ":")).encode()
-    with socket.create_connection((host, port), timeout=3) as s:
+    with socket.create_connection((host, port), timeout=timeout) as s:
         s.sendall(struct.pack("!I", len(payload)) + payload)
 
 

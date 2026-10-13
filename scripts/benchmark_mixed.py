@@ -14,6 +14,7 @@ import uuid
 import cluster as c
 import workload_locality as locality
 from benchmark import config_fingerprint, free_ports, METRICS, COUNTERS
+from benchmark_guard import GuardAbort
 
 
 def expectations(cfg, workload, method="arbor"):
@@ -85,7 +86,7 @@ def expectations(cfg, workload, method="arbor"):
     return expected
 
 
-def pause_idle_windows(run, cfg, timeout=30):
+def pause_idle_windows(run, cfg, timeout=30, guard=None):
     """Freeze background empty blocks only after the timed workload has finished.
 
     This does not count as transaction completion, change the client metrics,
@@ -106,9 +107,16 @@ def pause_idle_windows(run, cfg, timeout=30):
         envelopes[sid] = c.signed({"type": "WINDOW_PAUSE", "run": cfg["run_id"],
             "target": sid, "final_block": final}, cfg["client_private_key"], run)
     while time.monotonic() < deadline:
+        if guard:
+            guard.check(run)
         for node in cfg["nodes"]:
             if node["shard"] in coordinators:
-                c.send_frame(node["host"], node["port"], envelopes[node["shard"]])
+                if guard:
+                    guard.check(run)
+                    c.send_frame(node["host"], node["port"], envelopes[node["shard"]],
+                                 timeout=min(.25, max(.001, guard.deadline - time.monotonic())))
+                else:
+                    c.send_frame(node["host"], node["port"], envelopes[node["shard"]])
         time.sleep(.25)
         rows = c.statuses(run)
         peers = [r for r in rows if r["shard"] in coordinators]
@@ -184,10 +192,12 @@ def settlement_errors(cfg, expected, rows, method):
     return problems
 
 
-def wait_settled(cfg, expected, run, method, seconds):
+def wait_settled(cfg, expected, run, method, seconds, guard=None):
     deadline, consecutive, rows = time.monotonic() + seconds, 0, []
     while time.monotonic() < deadline:
         rows = c.statuses(run)
+        if guard:
+            guard.check(run, rows)
         consecutive = consecutive + 1 if not settlement_errors(cfg, expected, rows, method) else 0
         if consecutive >= 2:
             return True, rows
@@ -195,7 +205,7 @@ def wait_settled(cfg, expected, run, method, seconds):
     return False, rows
 
 
-def wait_client(proc, log_path, timeout):
+def wait_client(proc, log_path, timeout, guard=None, run=None):
     """Keep the complete log and expose new client progress every five seconds."""
     deadline = time.monotonic() + timeout
     # A separate read descriptor follows the file while Popen writes through
@@ -203,11 +213,13 @@ def wait_client(proc, log_path, timeout):
     buffer = ""
     with Path(log_path).open() as progress:
         while True:
+            if guard:
+                guard.check(run)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(proc.args, timeout)
             try:
-                result = proc.wait(timeout=min(5, remaining))
+                result = proc.wait(timeout=min(.25 if guard else 5, remaining))
             except subprocess.TimeoutExpired:
                 result = None
             buffer += progress.read()
@@ -217,13 +229,33 @@ def wait_client(proc, log_path, timeout):
                 lines.append(buffer)
                 buffer = ""
             for line in lines:
+                if guard:
+                    guard.progress(line)
                 if line.startswith("progress ") or line.startswith("completed="):
                     print(line, flush=True)
             if result is not None:
+                if guard:
+                    guard.finish_client()
+                    guard.check(run)
                 return result
 
 
-def run(config_path, workload_path, output_dir, method, timeout=None, drain_timeout=30):
+def profile_rows(rows):
+    return [{"shard": row["shard"], "replica": row["replica"], **row["leaf_profile"]}
+            for row in rows if isinstance(row.get("leaf_profile"), dict)]
+
+
+def profile_delta(before, after):
+    prior = {(row["shard"], row["replica"]): row.get("leaf_profile", {}) for row in before}
+    return [{"shard": row["shard"], "replica": row["replica"],
+             **{key: max(0, value - prior.get((row["shard"], row["replica"]), {}).get(key, 0))
+                for key, value in row["leaf_profile"].items()
+                if type(value) in (int, float) and key not in ("schema_version", "current_wait")}}
+            for row in after if isinstance(row.get("leaf_profile"), dict)]
+
+
+def run(config_path, workload_path, output_dir, method, timeout=None, drain_timeout=30, guard=None):
+    started = time.monotonic()
     raw, workload = c.read(config_path), c.read(workload_path)
     validated = c.validate_method_config(c.validate(raw), method)
     expected = expectations(validated, workload, method)
@@ -250,16 +282,30 @@ def run(config_path, workload_path, output_dir, method, timeout=None, drain_time
               "timeout_s": timeout, "client_result": str(result_path), "failure_reasons": []}
     node_run, proc = None, None
     try:
-        node_run = c.start(config, output_dir / "run", method=method)
+        if guard:
+            guard.check()
+            node_run = c.start(config, output_dir / "run", method=method, monitor=guard.check)
+        else:
+            node_run = c.start(config, output_dir / "run", method=method)
         cfg, before = c.read(node_run / "config.json"), c.statuses(node_run)
         c.write(output_dir / "status-before.json", before)
+        report["leaf_profile_before"] = profile_rows(before)
+        if guard:
+            guard.check(node_run, before)
+            report["startup_transport_errors"] = [{"shard": row["shard"], "replica": row["replica"],
+                **{field: row.get(field, 0) for field in guard.TRANSPORT_ERRORS}}
+                for row in before if any(row.get(field, 0) for field in guard.TRANSPORT_ERRORS)]
         print(f"压测 {method}: {expected['transactions']} 笔全跨片交易，参与分组 {expected['groups']}；结果目录 {output_dir}", flush=True)
         client_log = output_dir / "client.log"
         with client_log.open("w") as log:
             proc = subprocess.Popen([str(binary), "client", str(node_run / "config.json"), str(job), str(result_path)],
                                     stdout=log, stderr=subprocess.STDOUT)
             try:
-                client_rc = wait_client(proc, client_log, timeout + 15)
+                if guard:
+                    guard.begin_client(before)
+                    client_rc = wait_client(proc, client_log, timeout + 15, guard, node_run)
+                else:
+                    client_rc = wait_client(proc, client_log, timeout + 15)
             except subprocess.TimeoutExpired:
                 proc.terminate()
                 try:
@@ -268,11 +314,21 @@ def run(config_path, workload_path, output_dir, method, timeout=None, drain_time
                     proc.kill(); proc.wait(timeout=5)
                 client_rc = 124
         result = c.read(result_path) if result_path.is_file() else {}
+        if guard:
+            timed_after = c.statuses(node_run)
+            guard.check(node_run, timed_after)
+            c.write(output_dir / "status-client-finished.json", timed_after)
+            report["leaf_profile_at_client_finish"] = profile_rows(timed_after)
+            report["leaf_profile_delta"] = profile_delta(before, timed_after)
         good_client = client_rc == 0 and result.get("executed_transactions") == expected["transactions"]
         if good_client and method == "arbor":
-            report["window_idle_pause"] = pause_idle_windows(node_run, cfg, drain_timeout)
-        drained, after = wait_settled(cfg, expected, node_run, method, drain_timeout if good_client else min(2, drain_timeout))
+            report["window_idle_pause"] = pause_idle_windows(node_run, cfg, drain_timeout, guard=guard)
+        drained, after = wait_settled(cfg, expected, node_run, method, drain_timeout if good_client else min(2, drain_timeout), guard=guard)
         c.write(output_dir / "status-after.json", after)
+        report["leaf_profile_after"] = profile_rows(after)
+        report["leaf_profile_including_drain_delta"] = profile_delta(before, after)
+        if not guard:
+            report["leaf_profile_delta"] = profile_delta(before, after)
         errors = settlement_errors(cfg, expected, after, method)
         if report.get("window_idle_pause", {}).get("paused") is False:
             errors.append("连续空区块实验结束后暂停失败，不能确认最终副本收敛")
@@ -304,11 +360,24 @@ def run(config_path, workload_path, output_dir, method, timeout=None, drain_time
                       failure_reasons=errors, notes=notes, node_metrics=counters, client=result,
                       run_dir=str(node_run))
         report.update({field: result.get(field) if not errors else None for field in METRICS})
+        report["valid_performance_sample"] = not errors
         print(f"{report['status']} completed={result.get('executed_transactions', 0)}/{expected['transactions']} "
               f"completed_tps={report['completed_tps']} avg_latency_s={report['avg_latency_s']} "
               f"p95_s={report['p95_s']} network_failures={counters['network_failures']}", flush=True)
         for error in errors:
             print("  " + error)
+    except GuardAbort as error:
+        report.update(status="INVALID", valid_performance_sample=False, guard_evidence=guard.evidence)
+        report["failure_reasons"].append(str(error))
+        report.update({field: None for field in METRICS})
+        if node_run is not None:
+            after = c.statuses(node_run)
+            c.write(output_dir / "status-after.json", after)
+            report["leaf_profile_after"] = profile_rows(after)
+            report["leaf_profile_delta"] = profile_delta(before, after) if "before" in locals() else []
+        if result_path.is_file():
+            report["client"] = c.read(result_path)
+        print(f"INVALID {method}: {error}; stopping without retry", flush=True)
     except BaseException as error:
         report["failure_reasons"].append(f"{type(error).__name__}: {error}")
         raise
@@ -319,9 +388,10 @@ def run(config_path, workload_path, output_dir, method, timeout=None, drain_time
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill(); proc.wait(timeout=5)
-        c.write(output_dir / "summary.json", report)
         if node_run is not None:
             c.stop_run(node_run)
+        report["elapsed_wall_s"] = time.monotonic() - started
+        c.write(output_dir / "summary.json", report)
     return report
 
 

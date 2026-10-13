@@ -8,6 +8,8 @@
 
 跨片批处理参数也统一写在配置文件的 `consensus` 中：`cross_shard_batch_size` 限制一个协调 PBFT 批次的交易数，`cross_shard_batch_wait_ms` 限制等待凑批的时间。`--batch` 只控制客户端每个请求的交易数。
 
+当前默认性能输入 `three_layer_lower_first.json`、`three_layer_locality.json`、`ahl_two_layer_locality.json` 的 `cross_shard_batch_wait_ms` 统一为 100 ms，四种方法的跨片上限仍为 100 笔、普通提议等待仍为 10 ms、换主超时仍为 2000 ms。公平比较直接运行默认快速脚本，无需 Arbor 单独覆盖。历史 600 ms 输入保存为同名 `_wait600.json`，原始参数和其他字段均保留；详见 `docs/UNIFORM_BATCH_WAIT.md`。
+
 流水线协议已移除，`consensus.pipeline_window` 不再是有效配置项。迁移之前的配置时请删除该字段，即使其值为 `0` 也需要删除；启动器会明确报错，不会静默忽略该字段。已有运行目录包含旧配置时，请停止旧节点并用新的配置重新启动。
 
 完整跨片执行支持多层树和至少两个不重复的参与叶子。`three_layer.json` 包含 7 个分片（28 节点）；`four_layer.json` 是非均匀深度的四层树，包含 9 个分片（36 节点），叶子为 1、2、3、4、8：`1,2` 的 NCA 为 5，`1,3` 的 NCA 为 7，`1,8` 的 NCA 为 9。多协调者通过认证轮次封闭确定跨层顺序；这些控制槽不算业务交易。所有例子仍使用 JSON 定义拓扑，分片运行目录不放在 `config/` 内。
@@ -51,3 +53,9 @@ cluster 按叶子的直接父节点定义，故为 `{1,2,8}` 与 `{3,4,9}`。根
 两份新配置均保留旧 `three_layer_cross100.json` 的完整共识、执行及既有分片对延时：片内 1 ms，默认片间 20 ms，1↔2/3↔4 为 10 ms，1↔3 为 50 ms。新增同 cluster 的 1↔8、2↔8、3↔9、4↔9 为 10 ms，叶子 8↔5、9↔6 为 5 ms。AHL 删除与 5、6 相关的链路，共同保留分片之间的实际延时仍一致。base_port 分别为 19800、20000；比较脚本启动独立运行目录并管理测试端口。
 
 默认混合负载为 100% 跨片、90% 两方/10% 三方，其中只有 5% 跨 cluster。负载生成和四方法对比说明见 [../docs/WORKLOAD_LOCALITY.md](../docs/WORKLOAD_LOCALITY.md)。旧四叶配置保留供固定参与方测试和既有 workload 重放；在旧配置自动生成前三叶均匀 90/10 模式时应加 `--uniform`。
+
+`three_layer_layered.json` 是上一版 Arbor 1:1 全祖先屏障配置（m=1，关闭流式、低层优先和加权比例，空块间隔保持50 ms）。三层叶子等待自身 Root/Child 同编号区块收齐后 Root→Child 分别提交。baseline 的原配置不含这些字段，启动 baseline 时也会剔除 Arbor 专用参数。
+
+当前使用 `three_layer_lower_first.json`：m=1、ancestor_streaming=true、ancestor_order=lower_first、比例默认1。叶子的最低协调层认证区块一到齐即可提交，再逐层向上，Root完成后进入下一轮；不等待全部祖先同编号区块一起到齐。
+
+`three_layer_lower_bundle.json` 为显式两低层区块合并实验配置：`ancestor_leaf_batch_blocks=2`、比例2。每个低层祖先连续两块在一次叶子PBFT纳入，Root仍单块。该配置本轮正确性通过但TPS下降，普通Arbor仍用 `three_layer_lower_first.json`；详见 `docs/TWO_BLOCK_BUNDLE.md`。

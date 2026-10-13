@@ -1,6 +1,7 @@
 #include "network.h"
 #include "state_digest.h"
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cmath>
 #include <csignal>
@@ -113,6 +114,9 @@ struct Membership {
 // A bounded PBFT sequence window, batching, stable checkpoints and certified
 // view changes. PREPARE votes are from backups only (2f); COMMIT needs 2f+1.
 class Replica {
+#ifdef ARBOR_BASELINE_POLICY_TESTS
+    friend struct BaselinePolicyTest;
+#endif
 #ifdef ARBOR_SHARPER_TESTS
     friend struct SharPerProtocolTest;
 #endif
@@ -226,6 +230,7 @@ class Replica {
     Clock::time_point pbftLastNewViewRetry=Clock::time_point{};
     std::map<int,std::map<int,std::string>> pbftVcFingerprints;
     int window=64;
+#include "leaf_profile.inc"
 #if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
 #include "ordering_windows.inc"
 #endif
@@ -363,8 +368,14 @@ class Replica {
         } catch (...) { return false; }
     }
     bool validOrderClose(const json& c) const {
+        LeafElapsedScope schedulerProfile(*this,leafSchedulerElapsedNs,leafSchedulerDepth);
+        LeafElapsedScope qcProfile(*this,leafQcValidationElapsedNs,leafQcValidationDepth);
+        if(members.leaves.count(shard)) ++leafQcValidationCalls;
         try {
-            auto fingerprint=hash(c.dump());if(checkedCloses.count(fingerprint)) return true;
+            auto fingerprint=hash(c.dump());if(checkedCloses.count(fingerprint)) {
+                if(members.leaves.count(shard)) ++leafQcCacheHits;return true;
+            }
+            if(members.leaves.count(shard)) ++leafQcFullValidations;
             const auto& b=c.at("proposal").at("body");int origin=b.at("shard");
             if(!members.coordinators().count(origin) || !validForeignCertificate(c,origin)) return false;
             const auto& value=b.at("value");const auto& requests=value.at("requests");
@@ -403,6 +414,7 @@ class Replica {
         } catch(...) { return false; }
     }
     bool validCoordinatorCertificate(const json& c) const {
+        LeafElapsedScope schedulerProfile(*this,leafSchedulerElapsedNs,leafSchedulerDepth);
         try {
             auto fingerprint=hash(c.dump());
             if(checkedOrders.count(fingerprint)) return true;
@@ -412,7 +424,10 @@ class Replica {
         } catch(...) {return false;}
     }
     bool validLeafOrder(const json& cert,const json& frontier) const {
+        LeafElapsedScope schedulerProfile(*this,leafSchedulerElapsedNs,leafSchedulerDepth);
+        LeafElapsedScope frontierProfile(*this,leafFrontierValidationElapsedNs,leafFrontierValidationDepth);
 #if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        if(ancestorStreamingEnabled()) return validStreamFrontier(frontier,&cert);
         if(windowsEnabled()) return validWindowLeafOrder(cert,frontier);
 #endif
         try {
@@ -441,13 +456,16 @@ class Replica {
         } catch(...) {return false;}
     }
     const json& nextCstOrder() const {
+        LeafElapsedScope schedulerProfile(*this,leafSchedulerElapsedNs,leafSchedulerDepth);
+        LeafElapsedScope selectionProfile(*this,leafSelectionElapsedNs,leafSelectionDepth);
 #if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        if(ancestorStreamingEnabled()) return nextStreamingCstOrder();
         if(windowsEnabled()) return nextWindowCstOrder();
 #endif
         ++cstSelectionLookups;
         if(!cstSelectionDirty) return cstSelection;
         ++cstSelectionRebuilds;
-        cstSelection=nullptr;
+        cstSelection=nullptr;leafSelectionBlockedCoordinator=-1;
         std::map<std::pair<int,int>,const json*> candidates;
         for(const auto& [key,message]:pendingCst) {
             if(state.at("cst_batches").contains(key)) continue;
@@ -472,6 +490,8 @@ class Replica {
                 break;
             }
         }
+        if(cstSelection.is_null() && members.multiLayer() && !candidates.empty())
+            leafSelectionBlockedCoordinator=leafProfileMissingCoordinator(candidates.begin()->first.first,false);
         cstSelectionDirty=false;
         return cstSelection;
     }
@@ -642,6 +662,7 @@ class Replica {
                 if(it.key()!="requests" && it.key()!="cst_order_index" && it.key()!="cst_orders" && it.key()!="cst_watermarks" && it.key()!="cst_round" && it.key()!="cst_frontier"
 #if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
                    && !(windowsEnabled() && isCoordinator() && it.key()=="cst_window_manifest")
+                   && !(ancestorStreamingEnabled() && members.leaves.count(shard) && it.key()=="cst_stream_progress")
 #endif
                 ) return false;
             if(value.contains("cst_order_index")) {
@@ -666,16 +687,38 @@ class Replica {
 #endif
             } else if(value.contains("cst_watermarks") || value.contains("cst_round")) return false;
             if(value.contains("cst_orders")) {
-                if(!members.leaves.count(shard) || !value.at("cst_orders").is_array() || value.at("cst_orders").size()!=1 || !value.at("requests").empty()) return false;
+                if(!members.leaves.count(shard) || !value.at("cst_orders").is_array() || value.at("cst_orders").empty() || !value.at("requests").empty()) return false;
                 json frontier=value.value("cst_frontier",json::array());
-                if(!validLeafOrder(value.at("cst_orders")[0],frontier)) return false;
-                for(const auto& req:value.at("cst_orders")[0].at("proposal").at("body").at("value").at("requests"))
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                if(streamLeafBatchEnabled()) {
+                    if(!validStreamBatchFrontier(frontier,value.at("cst_orders"))) return false;
+                } else
+#endif
+                if(value.at("cst_orders").size()!=1 || !validLeafOrder(value.at("cst_orders")[0],frontier)) return false;
+                std::map<std::string,std::string> orderedIds;
+                for(const auto& order:value.at("cst_orders"))
+                for(const auto& req:order.at("proposal").at("body").at("value").at("requests"))
                     for(const auto& tx:req.at("body").at("txs")) {
                         auto id=tx.at("id").get<std::string>();
-                        if(state.at("cst_seen").contains(id) && state.at("cst_seen").at(id).at("tx_digest")!=hash(tx.dump())) return false;
+                        const auto digest=hash(tx.dump());
+                        if((state.at("cst_seen").contains(id) && state.at("cst_seen").at(id).at("tx_digest")!=digest) ||
+                           (orderedIds.count(id) && orderedIds.at(id)!=digest)) return false;
+                        orderedIds[id]=digest;
                         if(touches(tx,shard)) ++n;
                     }
-            } else if(value.contains("cst_frontier")) return false;
+            } else if(value.contains("cst_frontier")) {
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                if(!ancestorStreamingEnabled() || !members.leaves.count(shard) ||
+                   !value.value("cst_stream_progress",false) || !value.at("requests").empty() ||
+                   !validStreamFrontier(value.at("cst_frontier"))) return false;
+#else
+                return false;
+#endif
+            }
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+            if(value.contains("cst_stream_progress") && (!value.contains("cst_frontier") ||
+                value.contains("cst_orders") || value.at("cst_stream_progress")!=true)) return false;
+#endif
             return n<=(isCoordinator() && !value.at("requests").empty()
                         ?crossShardBatchSize:batchSize);
         } catch (...) { return false; }
@@ -852,6 +895,7 @@ class Replica {
         if(restored) {
             state=s.at("state"); applied=h;
 #if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+            leafCstOutcomeCache.clear();
             if(windowsEnabled() && isCoordinator()) windowLastBlock=Clock::now();
 #endif
             refreshDigests(true);
@@ -1355,7 +1399,11 @@ class Replica {
             sendShard(leaf,make("CST_PREPARED_QC",{{"target",leaf},{"proof",proof}}));
         log("cst_prepared_forwarded",{{"batch_key",key},{"forward",me},{"signers",proof.at("votes").size()}});
     }
-    void stageCst(const json& cert) {
+    void stageCst(const json& cert
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                  ,const json* kvOverlay=nullptr,const json* seenOverlay=nullptr
+#endif
+                 ) {
         auto key=cstKey(cert);if(stagedRecords.count(key)) return;
         auto before=Clock::now();
         json record={{"shard",shard},{"batch_key",key},
@@ -1365,17 +1413,29 @@ class Replica {
             for(const auto& tx:request.at("body").at("txs")) {
                 if(!touches(tx,shard)) continue;
                 auto access=accessFor(tx,shard);auto localKey=access.at("key").get<std::string>();
-                std::string id=tx.at("id");bool duplicate=state["cst_seen"].contains(id);
-                if(duplicate && state["cst_seen"].at(id).at("tx_digest")!=hash(tx.dump()))
+                std::string id=tx.at("id");
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                const json& seen=seenOverlay && seenOverlay->contains(id)?*seenOverlay:state.at("cst_seen");
+#else
+                const json& seen=state.at("cst_seen");
+#endif
+                bool duplicate=seen.contains(id);
+                if(duplicate && seen.at(id).at("tx_digest")!=hash(tx.dump()))
                     throw std::runtime_error("cross-shard transaction ID reused with different content");
-                if(!duplicate && !record["reads"].contains(localKey))
+                if(!duplicate && !record["reads"].contains(localKey)) {
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                    if(kvOverlay && kvOverlay->contains(localKey)) record["reads"][localKey]=kvOverlay->at(localKey);
+                    else
+#endif
                     record["reads"][localKey]=state["kv"].contains(localKey)?state["kv"].at(localKey):initialAccount();
+                }
                 record["writes"].push_back({{"id",tx.at("id")},{"tx_digest",hash(tx.dump())},
                     {"key",localKey},{"value",access.at("value")},
                     {"fib",duplicate?expectedFib:fibonacci()},{"duplicate",duplicate}});
             }
         stagedRecords[key]=record;
-        executionNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-before).count();
+        const auto stageNs=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-before).count();
+        executionNs+=stageNs;leafTxnExecutionElapsedNs+=stageNs;
         log("cst_staged",{{"batch_key",key},{"transactions",record["writes"].size()}});
         sendPrepared(key);
     }
@@ -1412,7 +1472,14 @@ class Replica {
         for(int leaf:orderParticipants(stagedRecords.at(key).at("order_certificate"))) if(leaf!=shard)
             sendShard(leaf,make("CST_DEPENDENCY_QUERY",{{"target",leaf},{"batch_keys",json::array({key})}}));
     }
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+#include "leaf_bundle_execution.inc"
+#endif
     void finalizeCst(const json& witness) {
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+        applyCstExecutionOutcome(witness,cstExecutionOutcome(witness));
+#else
+        LeafElapsedScope txnProfile(*this,leafTxnExecutionElapsedNs,leafTxnExecutionDepth);
         auto key=witness.at("batch_key").get<std::string>();auto mine=witnessRecord(witness,shard);
         if(recordPayload(mine)!=recordPayload(stagedRecords.at(key))) throw std::runtime_error("local execution record differs from certified dependency");
         std::map<int,json> working;std::map<std::string,bool> flags;
@@ -1454,6 +1521,7 @@ class Replica {
         if(!ackProofs.count(key) || !ackProofs.at(key).count(shard)) pendingLocalAckQcs.insert(key);
         for(auto it=preparedVotes.begin();it!=preparedVotes.end();) it=it->first.rfind(key+"|",0)==0?preparedVotes.erase(it):std::next(it);
         log("cst_executed",{{"batch_key",key},{"transactions",localWrites.size()}});
+#endif
     }
     void sendAck(const std::string& key) {
         if(!state["cst_finalized"].contains(key)) return;
@@ -1542,6 +1610,7 @@ class Replica {
     }
     // Shared application execution keeps the comparison workload identical.
     void applyClientRequests(const json& requests,int n) {
+        LeafElapsedScope txnProfile(*this,leafTxnExecutionElapsedNs,leafTxnExecutionDepth);
         for(const auto& req:requests) {
             const auto& rb=req.at("body"); std::string rid=rb.at("id");
             auto requestHash=hash(rb.at("txs").dump());
@@ -1587,11 +1656,27 @@ class Replica {
             // Its replicated state advances only after execution has finished.
             json witness=nullptr;
 #if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+            json allWitnesses=json::array(),outcomes=json::array();
             if(value.contains("cst_orders")) {
-                const auto& root=value.at("cst_orders")[0];auto key=cstKey(root);
-                stageCst(root);witness=availableWitness(key);
-                if(witness.is_null() || !validExecutionWitness(witness) ||
-                   recordPayload(witnessRecord(witness,shard))!=recordPayload(stagedRecords.at(key))) break;
+                json kvOverlay=json::object(),seenOverlay=json::object();bool ready=true;
+                for(const auto& order:value.at("cst_orders")) {
+                    const auto key=cstKey(order);
+                    stageCst(order,&kvOverlay,&seenOverlay);
+                    const auto one=availableWitness(key);
+                    if(one.is_null() || !validExecutionWitness(one) ||
+                       recordPayload(witnessRecord(one,shard))!=recordPayload(stagedRecords.at(key))) {ready=false;break;}
+                    if(!leafCstOutcomeCache.count(key)) {
+                        const auto previewStart=Clock::now();
+                        leafCstOutcomeCache[key]=cstExecutionOutcome(one);
+                        executionNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-previewStart).count();
+                    }
+                    const auto& outcome=leafCstOutcomeCache.at(key);
+                    for(auto it=outcome.at("kv").begin();it!=outcome.at("kv").end();++it) kvOverlay[it.key()]=it.value();
+                    for(auto it=outcome.at("seen").begin();it!=outcome.at("seen").end();++it) seenOverlay[it.key()]=it.value();
+                    allWitnesses.push_back(one);outcomes.push_back(outcome);
+                }
+                if(!ready) break;
+                if(allWitnesses.size()==1) witness=allWitnesses[0];
             }
 #endif
             auto before=Clock::now();
@@ -1622,32 +1707,45 @@ class Replica {
                 }
             }
             if(value.contains("cst_orders")) {
-                const auto& root=value.at("cst_orders")[0];auto key=cstKey(root);
-                finalizeCst(witness);
-                state["cst_batches"][key]=root.at("proposal").at("body").at("digest");
-                stateDigest.markEntry("cst_batches",key);
-                int origin=root.at("proposal").at("body").at("shard");
-                state["cst_indices"][std::to_string(origin)]=projection(root.at("proposal").at("body").at("value"),shard);
-                stateDigest.markEntry("cst_indices",std::to_string(origin));
-                state["last_cst_seq"]=root.at("proposal").at("body").at("value").at("cst_order_index");
-                if(members.multiLayer()) {
-#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
-                    if(windowsEnabled()) state["cst_round"]=std::max(state.at("cst_round").get<int>(),root.at("proposal").at("body").at("value").at("cst_round").get<int>());
-                    else
-#endif
-                    state["cst_round"]=root.at("proposal").at("body").at("value").at("cst_round");
+                size_t orderIndex=0;
+                for(const auto& root:value.at("cst_orders")) {
+                    const auto key=cstKey(root);
+                    applyCstExecutionOutcome(allWitnesses.at(orderIndex),outcomes.at(orderIndex));
+                    ++orderIndex;leafCstOutcomeCache.erase(key);
+                    state["cst_batches"][key]=root.at("proposal").at("body").at("digest");
+                    stateDigest.markEntry("cst_batches",key);
+                    int origin=root.at("proposal").at("body").at("shard");
+                    state["cst_indices"][std::to_string(origin)]=projection(root.at("proposal").at("body").at("value"),shard);
+                    stateDigest.markEntry("cst_indices",std::to_string(origin));
+                    state["last_cst_seq"]=root.at("proposal").at("body").at("value").at("cst_order_index");
+                    if(members.multiLayer()) {
+    #if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                        if(windowsEnabled()) state["cst_round"]=std::max(state.at("cst_round").get<int>(),root.at("proposal").at("body").at("value").at("cst_round").get<int>());
+                        else
+    #endif
+                        state["cst_round"]=root.at("proposal").at("body").at("value").at("cst_round");
+                    }
+                    pendingCst.erase(key);
+                    log("cst_ordered_at_leaf",{{"coordinator_batch",key},{"digest",state["cst_batches"].at(key)}});
                 }
-                pendingCst.erase(key);slotWitnesses[n]=witness;
-                log("cst_ordered_at_leaf",{{"coordinator_batch",key},{"digest",state["cst_batches"].at(key)}});
+                slotWitnesses[n]=allWitnesses.size()==1?allWitnesses[0]:allWitnesses;
             }
 #endif
             state["chain"]=hash(state["chain"].get<std::string>()+std::to_string(n)+value.dump());
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+            if(ancestorStreamingEnabled() && (value.contains("cst_orders") || value.contains("cst_stream_progress")))
+                applyStreamFrontier(value.at("cst_frontier"));
+#endif
             applied=n; state["seq"]=n;
             cstSelectionDirty=true;
             refreshDigests();
             executionNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-before).count();
+            leafProfileAppliedSlot(value);
             json entry={{"seq",n},{"value_digest",hash(value.dump())},{"state_digest",cachedStateDigest},{"certificate",cert}};
             if(!witness.is_null()) entry["execution_witness"]=witness;
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+            else if(allWitnesses.size()>1) entry["execution_witnesses"]=allWitnesses;
+#endif
             journal<<entry.dump()<<'\n';journal.flush();
 #ifdef ARBOR_SAGUARO
             saguaroAfterApply(value,cert,n);
@@ -1657,7 +1755,7 @@ class Replica {
             if(!members.leaves.count(shard)) {
                 forwardCstOrder(cert,value);
                 if(value.contains("cst_order_index")) maybeCompleteBatch(cstKey(cert));
-            } else if(value.contains("cst_orders")) sendAck(cstKey(value.at("cst_orders")[0]));
+            } else if(value.contains("cst_orders")) for(const auto& order:value.at("cst_orders")) sendAck(cstKey(order));
 #endif
             lastProgress=Clock::now();
             if(n%checkpointEvery==0) {
@@ -1733,11 +1831,13 @@ class Replica {
         if(reqs.empty() && !pendingCst.empty()) {
             const auto& next=nextCstOrder();
             if(!next.is_null()) {
-                value["cst_orders"]=json::array({next.at("certificate")});
+                if(next.at("certificate").is_null()) value["cst_stream_progress"]=true;
+                else value["cst_orders"]=next.value("certificates",json::array({next.at("certificate")}));
                 if(members.multiLayer()) value["cst_frontier"]=next.at("frontier");
             }
         }
-        if(reqs.empty() && !value.contains("cst_orders") && !value.contains("cst_watermarks")) return;
+        if(reqs.empty() && !value.contains("cst_orders") && !value.contains("cst_watermarks") &&
+           !value.contains("cst_stream_progress")) return;
         if(isCoordinator() && value.contains("cst_round")) requestRound(value.at("cst_round"));
         broadcast(make("PREPREPARE",{{"seq",applied+1},{"digest",hash(value.dump())},{"value",value}}));
         if(!proposedGroup.empty()) arborLastBatchGroup=proposedGroup;
@@ -2171,7 +2271,13 @@ class Replica {
             for(const auto& [n,c]:certificates) if(n>start) {
                 if(n>applied) waiting++;
                 cs.push_back(c);
-                if(slotWitnesses.count(n)) witnesses.push_back({{"seq",n},{"witness",slotWitnesses.at(n)}});
+                if(slotWitnesses.count(n)) {
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                    if(slotWitnesses.at(n).is_array()) witnesses.push_back({{"seq",n},{"witnesses",slotWitnesses.at(n)}});
+                    else
+#endif
+                    witnesses.push_back({{"seq",n},{"witness",slotWitnesses.at(n)}});
+                }
             }
             if(cs.empty() && start>=applied && b.value("stable_seq",0)>=stableSeq) return;
             json checkpoint=b.value("stable_seq",0)>=stableSeq ?
@@ -2197,17 +2303,39 @@ class Replica {
             if(b.contains("execution_witnesses")) {
                 if(!b.at("execution_witnesses").is_array() || b.at("execution_witnesses").size()>size_t(window)) {rejected++;return;}
                 for(const auto& item:b.at("execution_witnesses")) {
-                    int n=item.at("seq");const auto& witness=item.at("witness");
+                    int n=item.at("seq");
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                    if(item.contains("witness")==item.contains("witnesses") || !incoming.count(n)) {rejected++;return;}
+                    const auto list=item.contains("witness")?json::array({item.at("witness")}):item.at("witnesses");
+                    const auto& value=incoming.at(n).at("proposal").at("body").at("value");
+                    if(!list.is_array() || !value.contains("cst_orders") || list.size()!=value.at("cst_orders").size() ||
+                       list.empty() || !witnesses.emplace(n,list).second) {rejected++;return;}
+                    for(size_t i=0;i<list.size();++i) {
+                        const auto& one=list.at(i);const auto& order=value.at("cst_orders").at(i);
+                        if(!validExecutionWitness(one) || one.at("batch_key")!=cstKey(order) ||
+                           witnessRecord(one,shard).at("order_digest")!=order.at("proposal").at("body").at("digest")) {rejected++;return;}
+                    }
+#else
+                    const auto& witness=item.at("witness");
                     if(!incoming.count(n) || !validExecutionWitness(witness) || !witnesses.emplace(n,witness).second) {rejected++;return;}
                     const auto& value=incoming.at(n).at("proposal").at("body").at("value");
                     if(!value.contains("cst_orders") || value.at("cst_orders").size()!=1 ||
                        witness.at("batch_key")!=cstKey(value.at("cst_orders")[0]) ||
                        witnessRecord(witness,shard).at("order_digest")!=value.at("cst_orders")[0].at("proposal").at("body").at("digest")) {rejected++;return;}
+#endif
                 }
             }
             installStable(b.at("stable"));
             for(const auto& [n,c]:incoming) if(n>applied && n<=stableSeq+window) {
-                if(witnesses.count(n) && !importWitness(witnesses.at(n))) {rejected++;continue;}
+                if(witnesses.count(n)) {
+#if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
+                    bool imported=true;
+                    for(const auto& one:witnesses.at(n)) if(!importWitness(one)) {imported=false;break;}
+                    if(!imported) {rejected++;continue;}
+#else
+                    if(!importWitness(witnesses.at(n))) {rejected++;continue;}
+#endif
+                }
                 certificates.emplace(n,c);preparedHistory[n]=c;
             }
             applyReady();return;
@@ -2269,10 +2397,16 @@ class Replica {
 #else
         s["method"]="arbor";
         orderingWindowStatus(s);
+        s["ancestor_order"]=streamAncestorOrder();
+        s["ancestor_leaf_batch_blocks"]=streamLeafBatchBlocks();
+        s["ancestor_lower_blocks_per_root"]=streamLowerBlocksPerRoot();
+        if(ancestorStreamingEnabled() && members.leaves.count(shard))
+            s["ancestor_coordinator_order"]=streamAncestors();
         s["future_preprepare_cache_entries"]=arborFutureProposals.size();
         s["future_preprepare_cache_bytes"]=arborFutureProposalBytes;
         s["future_preprepare_retries"]=arborFutureProposalRetries;
 #endif
+        leafProfileStatus(s);
         writeJson(dir+"/status.json",s);
     }
 #ifdef ARBOR_SAGUARO
@@ -2295,6 +2429,31 @@ public:
 #if !defined(ARBOR_SAGUARO) && !defined(ARBOR_SHARPER)
         if(orderingWindowBlocks()<0 || orderingWindowBlocks()>32 || windowEmptyIntervalMs()<1 || windowEmptyIntervalMs()>10000)
             throw std::runtime_error("ordering_window_blocks must be 0..32 and empty_block_interval_ms 1..10000");
+        if(cfg.at("consensus").contains("ancestor_streaming") &&
+           !cfg.at("consensus").at("ancestor_streaming").is_boolean())
+            throw std::runtime_error("ancestor_streaming must be boolean");
+        if(cfg.at("consensus").value("ancestor_streaming",false) && !windowsEnabled())
+            throw std::runtime_error("ancestor_streaming requires multilayer ordering windows");
+        if(cfg.at("consensus").contains("ancestor_order") &&
+           !cfg.at("consensus").at("ancestor_order").is_string())
+            throw std::runtime_error("ancestor_order must be root_first or lower_first");
+        const auto ancestorOrder=streamAncestorOrder();
+        if(ancestorOrder!="root_first" && ancestorOrder!="lower_first")
+            throw std::runtime_error("ancestor_order must be root_first or lower_first");
+        if(ancestorOrder=="lower_first" && !ancestorStreamingEnabled())
+            throw std::runtime_error("lower_first requires ancestor_streaming");
+        const auto lowerRatio=cfg.at("consensus").value("ancestor_lower_blocks_per_root",json(1));
+        if(!lowerRatio.is_number_integer() || lowerRatio<1 || lowerRatio>32)
+            throw std::runtime_error("ancestor_lower_blocks_per_root must be integer 1..32");
+        if(lowerRatio.get<int>()>1 && (ancestorOrder!="lower_first" || !ancestorStreamingEnabled()))
+            throw std::runtime_error("ancestor_lower_blocks_per_root > 1 requires lower_first ancestor_streaming");
+        const auto leafBlocksValue=cfg.at("consensus").value("ancestor_leaf_batch_blocks",json(1));
+        if(!leafBlocksValue.is_number_integer()) throw std::runtime_error("ancestor_leaf_batch_blocks must be integer 1 or 2");
+        const auto leafBlocks=streamLeafBatchBlocks();
+        if((leafBlocks!=1 && leafBlocks!=2) || (leafBlocks==2 &&
+           (!ancestorStreamingEnabled() || streamAncestorOrder()!="lower_first" || streamLowerBlocksPerRoot()!=2 ||
+            batchSize<2*crossShardBatchSize)))
+            throw std::runtime_error("ancestor_leaf_batch_blocks=2 requires lower_first ratio=2 and leaf batch_size>=2*cross_shard_batch_size");
 #endif
 #ifdef ARBOR_SAGUARO
         saguaroInitialize();
@@ -2423,6 +2582,7 @@ public:
             retryArborFutureProposals(Clock::now());
 #endif
             propose();
+            leafProfileAccountWait(leafProfileWaitState(),Clock::now());
             if(std::chrono::duration_cast<std::chrono::milliseconds>(now-lastStatus).count()>100) {status();lastStatus=now;}
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }

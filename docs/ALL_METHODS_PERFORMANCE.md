@@ -4,6 +4,8 @@
 
 默认测试新增窗口机制下的 Arbor：`ordering_window_blocks=1`、`empty_block_interval_ms=200`。这是明确的实验参数，不代表最优参数。`--window-blocks 0` 测试关闭窗口的 Arbor。三个 baseline 始终使用原配置，不包含这两个 Arbor 参数。
 
+新增 `--ancestor-streaming` 可测试按固定祖先顺序逐块执行的 Arbor，例如 `--profile rate --ancestor-streaming --empty-ms 50`。该参数只进入 Arbor，三个 baseline 仍使用原配置。新旧策略的直接配对实验使用 `scripts/benchmark_streaming.py`，详见 [ANCESTOR_STREAMING.md](ANCESTOR_STREAMING.md)。
+
 ## 直接运行
 
 ```bash

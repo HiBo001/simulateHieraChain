@@ -2,11 +2,11 @@
 
 ## 1. 复现定义与代码复用
 
-本项目的 AHL 定义为“两层拓扑上的 Saguaro 2PC”：所有业务叶子直接隶属唯一上层分片，所有跨片事务由这个上层协调。用户明确要求与 Arbor 比较时保留 Arbor 的多层结构，AHL 改为两层。实现不引入其他同名系统的协议或安全假设。
+本项目的 AHL 定义为“两层拓扑、唯一 reference committee 协调的 2PC/2PL 工程基线”：所有业务叶子直接隶属唯一上层分片，所有跨片事务由这个上层协调。用户明确要求与 Arbor 比较时保留 Arbor 的多层结构，AHL 改为两层。实现不引入其他同名系统的协议或安全假设。
 
-`baseline/ahl/main.cpp` 定义 `ARBOR_AHL` 和 `ARBOR_SAGUARO` 后使用公共运行框架；`baseline/ahl/protocol.inc` 包含 `baseline/saguaro/protocol.inc`。AHL 复用 Saguaro 的同一份准备、决定、锁、去重、重传和恢复代码。以后修复 2PC 公共实现时两种方法同时受益，不维护两个容易偏离的协议副本。
+`baseline/ahl/main.cpp` 定义 `ARBOR_AHL` 和 `ARBOR_SAGUARO` 后使用公共运行框架；`baseline/ahl/protocol.inc` 包含 `baseline/saguaro/protocol.inc`。AHL 复用准备、决定、锁、去重、重传和恢复框架，但并发策略独立选择 key 级 2PL。Saguaro 的参与分片集合相交限制及跨 NCA 超时 ABORT 不应用于 AHL。共享框架不再表示两者使用相同的冲突准入规则。
 
-AHL 特有的实现只涉及方法标识、拓扑校验、唯一上层路由和对比工具的双配置支持。Arbor、Saguaro 和 SharPer 的原有方法选择保持独立。
+AHL 特有的实现包括并发策略选择、方法标识、拓扑校验、唯一上层路由和对比工具的双配置支持。Arbor、Saguaro 和 SharPer 的原有方法选择保持独立。
 
 ## 2. 拓扑、参与方与请求路由
 
@@ -42,11 +42,11 @@ PREPARE 在本地 PBFT 顺序中取得读写 key 的锁，保存实际使用的�
 
 准备期间片内交易也必须尊重锁。FINISH 释放锁之前不能让另一个冲突事务改变准备读取的状态。收到正常重传时复用已保存的记录，不能再次执行同一个已准备事务；收到 ABORT 后的新尝试使用新的批次标识，重新读取已提交状态并计算。
 
-上层最多保留八个未完成业务批次，和共享 Saguaro 调度一致。其访问 key 索引跳过与当前在途批次冲突的请求，允许独立 key 的事务继续选批；索引在收齐叶子最终 ACK 后释放。各片本地 PBFT 仍一次只发起一个新共识批次，远端等待不永久占用这个本地槽位。本版本不加入投机执行或重做流水线。
+上层最多保留八个未完成业务批次，保留原来的工程上限。其访问 key 索引跳过与当前在途批次冲突的请求，允许独立 key 的事务继续选批；索引在收齐叶子最终 ACK 后释放。各片本地 PBFT 仍一次只发起一个新共识批次，远端等待不永久占用这个本地槽位。本版本不加入投机执行或重做流水线。
 
 `cross_shard_batch_size` 限制一个跨片业务批次的交易数，`cross_shard_batch_wait_ms` 控制未凑满时的合批等待；具有相同参与集合的客户端请求可合入一个业务批次。一次 INIT 批量里的交易随后一起走 PREPARE、DECIDE 和 FINISH，并未省去 2PC 阶段。客户端 `--batch` 控制请求内交易数；普通片内共识使用 `batch_size` 和 `batch_wait_ms`。
 
-参与方不能无期限等待另一事务的锁释放；遇到冲突时返回 NO，上层记录 ABORT，所有参与方完成 FINISH 释放锁后再退避重试原请求。AHL 只有一个上层，因此没有不同 NCA 之间的锁争用，但仍保留同一套冲突、失败和重试实现。ABORT 及重试成本计入客户端总延时，不计为成功交易。
+参与方不能无期限等待另一事务的锁释放；遇到冲突时返回 NO，上层记录 ABORT，所有参与方完成 FINISH 释放锁后再退避重试原请求。AHL 只有一个上层，因此没有不同 NCA 之间的锁争用；保留原有 key 冲突、失败和重试实现，不使用 Saguaro 新增的参与集合等待或超时决定规则。ABORT 及重试成本计入客户端总延时，不计为成功交易。
 
 ## 5. 去重、恢复与工程范围
 
@@ -86,3 +86,7 @@ INIT、准备记录、锁、DECIDE 和历史去重信息进入状态摘要与检
 ## 7. 验证入口
 
 构建与命令详见 [README.md](README.md)。`make test-ahl` 运行 AHL 工具和真实集群回归，`make test` 运行包括既有方法的完整回归。测试结果报告应分别列出拓扑拒绝、共享负载重映射、两方/三方正常完成、去重、阶段 PBFT 证据、forward 故障与状态追赶等实际执行的用例，不以设计描述替代测试证据。
+
+## 并发策略回归
+
+`make test-baseline-policies` 为 Saguaro 与 AHL 分别编译真实认证记录的内存测试。覆盖独立 key/重合参与集合、key 冲突、决定与 ACK 的释放边界、复制状态重建及超时 ABORT 隔离；不启动 TCP 或注入性能测试故障。短测结果见 [../../docs/BASELINE_DOMAIN_REPAIR.md](../../docs/BASELINE_DOMAIN_REPAIR.md)。

@@ -1,8 +1,10 @@
 # Arbor 仿真系统：PBFT 与跨片执行
 
+当前 Arbor 使用低到高 1:1 逐层流式提交：`config/three_layer_lower_first.json`。叶子只处理自身祖先，最低协调层同编号区块认证到齐即可提交，随后中层、Root，完成后进入下一轮最低层；不等待所有祖先同编号区块同时到齐。三协调层例如 `Layer3₁ → Layer2₁ → Layer1₁ → Layer3₂`。短测入口见 [docs/LAYER_IMMEDIATE.md](docs/LAYER_IMMEDIATE.md)。
+
 每个分片固定 4 个独立 C++ 进程，通过 TCP 和真实签名运行 PBFT。跨片交易支持多层树和两个以上参与叶子：最近公共祖先（NCA）通过 PBFT 排序，将认证订单直接发给参与叶子；每个叶子通过一次 PBFT 纳入本片顺序，交换依赖证明后执行并写入。叶子 forward 汇总完成 ACK QC，NCA 收齐所有参与叶子的证明后直接回复客户端。交易执行实际计算 Fibonacci。
 
-叶子按批次顺序处理，等待当前批次依赖并完成执行后再处理下一批。多协调者拓扑使用按需开启的认证轮次：各协调者通过 PBFT 封闭本轮订单，叶子收齐其所有祖先的封闭证书后，按 `(round, coordinator_id)` 顺序处理适用订单，避免不同层级订单形成相互等待。当前没有逐交易推测执行、多版本历史或重做路径。详细说明见 [docs/MULTILAYER_DESIGN.md](docs/MULTILAYER_DESIGN.md) 和 [当前实现设计](docs/CURRENT_IMPLEMENTATION_DESIGN.md)。
+叶子按批次顺序处理，等待当前批次依赖并完成执行后再处理下一批。当前低层优先配置按自身祖先链固定循环，每层每轮一个认证区块，最低协调层先提交；当前层执行完成后才提交下一层，缺当前层不能越过它或提前进入下一轮。当前没有逐交易推测执行、多版本历史或重做路径。详细说明见 [docs/MULTILAYER_DESIGN.md](docs/MULTILAYER_DESIGN.md) 和 [当前实现设计](docs/CURRENT_IMPLEMENTATION_DESIGN.md)。
 
 支持 macOS / Linux 本机多进程运行。构建依赖 C++17 编译器、Python 3.9+、OpenSSL 3 开发库和 zlib 开发库（macOS SDK 已提供 zlib）；不依赖 FISCO、Python 第三方包或额外 JSON 包安装。nlohmann/json 3.11.3 单头文件及 MIT 许可证已放入 `third_party/nlohmann/`。
 
@@ -342,3 +344,15 @@ python3 -B baseline/compare_mixed.py --baseline ahl \
 ```
 
 此局部性比较中 Arbor 为 9 片/36 节点，AHL 为 7 片/28 节点。结果保存两份配置、共同负载 SHA256、完成 TPS 与秒制延时，失败轮次不算成功比值。固定参与分片也可用 `baseline/compare.py --baseline ahl --baseline-config ...`。具体流程与测试说明见 [baseline/ahl/README.md](baseline/ahl/README.md)、[baseline/ahl/DESIGN.md](baseline/ahl/DESIGN.md)；执行 `make test-ahl` 运行 AHL 回归。
+
+### 服务器短周期开发验证
+
+`python3 -B scripts/benchmark_quick.py --skip-build --budget 300` 当前默认先验证200笔，再测试单组1000笔：Arbor低到高1:1和三个baseline，双块合并不在默认测试中启用。配置 `config/three_layer_lower_first.json` 开启 `ancestor_streaming=true`、`ancestor_order=lower_first`、m=1（比例默认1）。最低协调层区块到齐即可进入本地提交；随后逐层向上，每层一块；等Root完成后才进入下一轮最低层。每次有业务的协调块分别提交，不合并多层交易，也不等待其他分支的协调者。
+
+当前四种方法的默认性能配置统一使用 `cross_shard_batch_wait_ms=100`，Arbor 仍为 1:1。该参数控制跨片交易进入 PBFT 前的打包等待；普通提议等待仍为 10 ms，换主超时仍为 2000 ms。直接运行默认短测试即可，无需 Arbor 单独覆盖参数。统一参数的测试结果与复现见 [公平批次等待对比](docs/UNIFORM_BATCH_WAIT.md)。原 600 ms 配置保存为同名 `_wait600.json`，此前仅 Arbor 降到 100 ms 的结果保留在 [历史批次等待实验](docs/ARBOR_BATCH_WAIT.md)。
+
+Saguaro使用现有NCA 2PC，AHL使用现有两层2PC，SharPer保持现有直接参与片协议；baseline剔除全部Arbor专用排序字段。本轮没有改动baseline或增加优化。最新规则和Saguaro/SharPer排名原因见[逐层立即提交及测试](docs/LAYER_IMMEDIATE.md)。
+
+异常换主、节点错误或15秒无完成进展立即停测，无效TPS留空；不注入故障、不重试、不自动开展万笔实验。上一版“收齐全部祖先后Root→低层”的配置 `three_layer_layered.json` 和结果见[历史m=1屏障](docs/LAYERED_RESTORE.md)。旧Root优先流式、2:1和10:1仅保留为显式历史实验。
+
+两个低层区块合并可显式使用 `config/three_layer_lower_bundle.json`（`ancestor_leaf_batch_blocks=2`，需要低层优先2:1）。本轮确实减少叶子PBFT次数，但Root长尾使整体TPS下降，普通运行保持原1:1。测量、恢复语义和复现见[双块合并实验](docs/TWO_BLOCK_BUNDLE.md)。默认快速测试只测原1:1和三个baseline；显式 `--cases lower_first lower_bundle saguaro sharper ahl` 才会加入双块实验。

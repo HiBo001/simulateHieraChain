@@ -32,7 +32,7 @@ import compare
 import compare_mixed
 import workload_locality as locality
 
-WINDOW_FIELDS = ("ordering_window_blocks", "empty_block_interval_ms")
+WINDOW_FIELDS = c.ARBOR_WINDOW_FIELDS
 BASELINES = ("saguaro", "sharper", "ahl")
 
 
@@ -107,7 +107,7 @@ def baseline_config(raw):
 
 
 def common_cost_config(cfg):
-    """Normalize ONLY the two explicitly Arbor-specific protocol settings.
+    """Normalize only the explicitly Arbor-specific protocol settings.
 
     All remaining PBFT/execution/network fields and real runtime fingerprints
     stay intact. Normalization is for comparison validation, not replay.
@@ -126,7 +126,7 @@ def validate_costs(arbor_cfg, baseline_cfg, method):
                 protocol_difference_allowlist=["consensus." + name for name in WINDOW_FIELDS],
                 actual_config_fingerprints={"arbor": b.config_fingerprint(arbor_cfg),
                                             method: b.config_fingerprint(baseline_cfg)},
-                actual_arbor_window={name: arbor_cfg["consensus"][name] for name in WINDOW_FIELDS},
+                actual_arbor_window={name: arbor_cfg["consensus"].get(name, False) for name in WINDOW_FIELDS},
                 baseline_window_mode=False)
 
 
@@ -339,6 +339,7 @@ def main(argv=None):
     parser.add_argument("--batch", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--baseline-methods", type=baseline_methods, default=list(BASELINES))
+    parser.add_argument("--ancestor-streaming", action="store_true", help="Arbor only: 固定祖先顺序逐块执行")
     parser.add_argument("--confirm-top", type=int, default=0, help="0: sweep only; N: one-round screen then independent-seed repeated confirmation of N candidates")
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--drain-timeout", type=float, default=60)
@@ -359,6 +360,8 @@ def main(argv=None):
     if not b.finite_number(args.timeout, True) or not b.finite_number(args.drain_timeout, True):
         raise ValueError("timeout 和 drain-timeout 必须为有限正数")
     source = c.read(args.config)
+    if args.ancestor_streaming:
+        source.setdefault("consensus", {})["ancestor_streaming"] = True
     reference = c.validate(baseline_config(source))
     parent, leaves = c.topology(reference)
     root = next(sid for sid in parent if parent[sid] is None)
